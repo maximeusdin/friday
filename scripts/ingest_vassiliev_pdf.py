@@ -11,7 +11,7 @@ from psycopg2.extras import Json
 import fitz  # PyMuPDF
 
 
-PIPELINE_VERSION = "v0_vassiliev_pages_by_pxx"
+PIPELINE_VERSION = "v2_line_level_dict"
 
 
 DB_HOST = os.getenv("DB_HOST", "localhost")
@@ -148,42 +148,84 @@ def normalize_label(label: str) -> str:
     return re.sub(r"\s+", "", label.strip())
 
 
+PXX_LINE_RE = re.compile(r"^\s*(p\.\s*\d+)\s*$")
+
 def extract_pxx_pages(pdf_path: Path) -> list[dict]:
     """
+    Layout-aware, line-level extraction:
+      - iterates lines (not blocks)
+      - detects marker lines like 'p.71'
+      - assigns subsequent lines until next marker line
     Returns list of dicts:
       logical_page_label, pdf_page_number, raw_text
-    raw_text includes the p.xx marker line and everything until the next p.xx marker.
     """
     out: list[dict] = []
-
     doc = fitz.open(str(pdf_path))
     try:
         for pdf_idx in range(len(doc)):
-            text = doc[pdf_idx].get_text("text") or ""
-            matches = list(PXX_RE.finditer(text))
-            if not matches:
+            page = doc[pdf_idx]
+            d = page.get_text("dict")
+            lines = []
+
+            # Collect (y0, x0, text) for each line
+            for block in d.get("blocks", []):
+                if block.get("type") != 0:
+                    continue  # non-text block
+                for line in block.get("lines", []):
+                    spans = line.get("spans", [])
+                    if not spans:
+                        continue
+                    # Combine spans into the visual line text (preserve as-is)
+                    text = "".join(s.get("text", "") for s in spans)
+                    if not text or not text.strip():
+                        continue
+
+                    x0, y0, x1, y1 = line.get("bbox", [0, 0, 0, 0])
+                    lines.append((float(y0), float(x0), text))
+
+            if not lines:
                 continue
 
-            for i, m in enumerate(matches):
-                start = m.start()
-                end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+            # Sort top-to-bottom, then left-to-right
+            lines.sort(key=lambda t: (t[0], t[1]))
 
-                label_raw = m.group(1)
-                label = normalize_label(label_raw)
+            # Find indices of marker lines
+            marker_idxs = []
+            marker_labels = []
+            for i, (_, __, txt) in enumerate(lines):
+                m = PXX_LINE_RE.match(txt.strip())
+                if m:
+                    label = normalize_label(m.group(1))  # your existing helper
+                    marker_idxs.append(i)
+                    marker_labels.append(label)
 
-                segment = text[start:end]
+            if not marker_idxs:
+                continue
+
+            # Segment lines between markers
+            for k, start_i in enumerate(marker_idxs):
+                end_i = marker_idxs[k + 1] if k + 1 < len(marker_idxs) else len(lines)
+                label = marker_labels[k]
+
+                # Include the marker line and all following lines up to (not including) next marker
+                segment_lines = [lines[j][2] for j in range(start_i, end_i)]
+
+                # Join with newlines; do not strip internal whitespace
+                raw_text = "\n".join(segment_lines)
 
                 out.append(
                     {
                         "logical_page_label": label,
-                        "pdf_page_number": pdf_idx + 1,  # 1-indexed
-                        "raw_text": segment,
+                        "pdf_page_number": pdf_idx + 1,
+                        "raw_text": raw_text,
                     }
                 )
     finally:
         doc.close()
 
     return out
+
+
 
 
 def main():
