@@ -1,0 +1,21 @@
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    container_name: neh_postgres
+    environment:
+      POSTGRES_USER: neh
+      POSTGRES_PASSWORD: neh
+      POSTGRES_DB: neh
+    ports:
+      - "5432:5432"
+    volumes:
+      - neh_pgdata:/var/lib/postgresql/data
+      - ./db:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U neh -d neh"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  neh_pgdata:
