@@ -3,13 +3,6 @@
 -- Make sure pgvector is available (harmless if already enabled)
 CREATE EXTENSION IF NOT EXISTS vector;
 
--- Optional: re-run friendly reset (safe during early dev)
-DROP TABLE IF EXISTS chunk_pages;
-DROP TABLE IF EXISTS chunks;
-DROP TABLE IF EXISTS pages;
-DROP TABLE IF EXISTS documents;
-DROP TABLE IF EXISTS collections;
-
 -- collections
 CREATE TABLE collections (
   id BIGSERIAL PRIMARY KEY,

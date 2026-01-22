@@ -9,8 +9,14 @@ services:
     ports:
       - "5432:5432"
     volumes:
-      - neh_pgdata:/var/lib/postgresql/data
+      # IMPORTANT: attach the existing volume with real data
+      - friday_neh_pgdata:/var/lib/postgresql/data
+
+      # Init scripts (safe: only run if DB is empty)
       - ./db:/docker-entrypoint-initdb.d
+
+      # App code mount (unchanged)
+      - .:/app
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U neh -d neh"]
       interval: 5s
@@ -18,4 +24,5 @@ services:
       retries: 20
 
 volumes:
-  neh_pgdata:
+  friday_neh_pgdata:
+    external: true

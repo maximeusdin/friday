@@ -1,0 +1,6 @@
+retrieval_run_id,chunk_id,rank,semantic_terms,method
+233,22095,1,"[""silvehmaster"", ""on"", ""august"", ""special"", ""agents"", ""gallant""]",query_terms+chunk_keywords_v1
+233,31220,2,"[""silvehmaster"", ""november"", ""odessa"", ""russia"", ""he"", ""united""]",query_terms+chunk_keywords_v1
+233,31222,3,"[""silvehmaster"", ""vh"", ""street"", ""stru"", ""this"", ""silvermaster""]",query_terms+chunk_keywords_v1
+233,26322,4,"[""silvehmaster"", ""uarch"", ""the"", ""charles"", ""civil"", ""service""]",query_terms+chunk_keywords_v1
+233,31223,5,"[""silvehmaster"", ""kri"", ""aaaoi"", ""panied"", ""he"", ""likewise""]",query_terms+chunk_keywords_v1

@@ -1,16 +1,59 @@
+#!/usr/bin/env python3
+"""
+Ingest Venona cable PDFs into Postgres using MESSAGE-LEVEL pages (one row per message/cable).
+
+- Messages are detected by:
+    * Presence of "USSR Ref. No" anywhere on the page, OR
+    * A tight cluster of From/To/No lines near the top.
+
+- Messages may span multiple PDF pages. We concatenate lines until the next message start.
+
+- pages table:
+    * 1 row per message
+    * page_seq = message index within document (1..N)
+    * pdf_page_number = start PDF page (1-indexed)
+    * logical_page_label = derived from USSR Ref No or From/To/No (deduped with __dupN)
+
+- page_metadata table:
+    * Stores derived, rerunnable metadata (raw_text is NEVER mutated)
+    * pipeline_versioned via META_PIPELINE_VERSION
+
+Metadata extracted (best-effort, missing allowed):
+    - USSR Ref. No
+    - From (routing)
+    - To (routing)  [can be multiple]
+    - Cable number(s) (header No token; stored as cable_nos array + cable_no primary)
+    - Date (message date from header No remainder or standalone date line; supports "10th Oct. 40")
+    - Reissue / Extract flags
+    - Issued date, Copy No (common in London volumes)
+    - MB code (GRU volumes sometimes)
+    - Signature-like "No. #### NAME" lines (captured, but not confused with cable No)
+
+Requires:
+    - tables from 002_schema.sql
+    - page_metadata table with UNIQUE(page_id, pipeline_version)
+"""
+
 import os
 import re
 import sys
+import json
 import hashlib
 import argparse
+import datetime
+import unicodedata
 from pathlib import Path
+from typing import Optional, List, Dict, Tuple, Any
 
 import psycopg2
 from psycopg2.extras import Json
 
 import fitz  # PyMuPDF
 
-PIPELINE_VERSION = "v0_venona_cables_state_machine"
+
+PIPELINE_VERSION = "v3_message_pages_with_metadata"
+META_PIPELINE_VERSION = "meta_v3_venona_headers"
+
 
 DB_HOST = os.getenv("DB_HOST", "localhost")
 DB_PORT = int(os.getenv("DB_PORT", "5432"))
@@ -25,6 +68,9 @@ def connect():
     )
 
 
+# ----------------------------
+# Ingest runs bookkeeping
+# ----------------------------
 def ensure_ingest_runs_table(cur):
     cur.execute(
         """
@@ -102,7 +148,10 @@ def mark_failed_best_effort(source_key: str, sha: str, err: str):
         pass
 
 
-def upsert_collection(cur, slug: str, title: str, description: str | None = None) -> int:
+# ----------------------------
+# DB helpers
+# ----------------------------
+def upsert_collection(cur, slug: str, title: str, description: Optional[str] = None) -> int:
     cur.execute(
         """
         INSERT INTO collections (slug, title, description)
@@ -114,10 +163,17 @@ def upsert_collection(cur, slug: str, title: str, description: str | None = None
         """,
         (slug, title, description),
     )
-    return cur.fetchone()[0]
+    return int(cur.fetchone()[0])
 
 
-def upsert_document(cur, collection_id: int, source_name: str, volume: str | None, source_ref: str | None, metadata: dict) -> int:
+def upsert_document(
+    cur,
+    collection_id: int,
+    source_name: str,
+    volume: Optional[str],
+    source_ref: Optional[str],
+    metadata: dict,
+) -> int:
     cur.execute(
         """
         INSERT INTO documents (collection_id, source_name, volume, source_ref, metadata)
@@ -129,36 +185,187 @@ def upsert_document(cur, collection_id: int, source_name: str, volume: str | Non
         """,
         (collection_id, source_name, volume, source_ref, Json(metadata)),
     )
-    return cur.fetchone()[0]
+    return int(cur.fetchone()[0])
 
 
 def delete_pages_for_document(cur, document_id: int):
+    # If your page_metadata has FK ON DELETE CASCADE to pages, this is enough.
+    # If it's RESTRICT, delete page_metadata first (see comment in main()).
     cur.execute("DELETE FROM pages WHERE document_id=%s", (document_id,))
 
 
-# --- Parsing helpers ---
+def page_metadata_table_exists(cur) -> bool:
+    cur.execute(
+        """
+        SELECT EXISTS (
+          SELECT 1
+          FROM information_schema.tables
+          WHERE table_schema = 'public'
+            AND table_name = 'page_metadata'
+        )
+        """
+    )
+    return bool(cur.fetchone()[0])
 
-# USSR Ref. No formatting varies ("USSR Ref. No:" vs "USSR Ref No:")
-USSR_REF_RE = re.compile(r"(?i)\bUSSR\s+Ref\.?\s*No\.?\s*:\s*([A-Za-z0-9/\-]+)")
 
-# Venona header lines vary: colon or dash/en-dash
+def upsert_page_metadata(cur, page_id: int, pipeline_version: str, meta_raw: dict):
+    cur.execute(
+        """
+        INSERT INTO page_metadata (page_id, pipeline_version, meta_raw)
+        VALUES (%s, %s, %s)
+        ON CONFLICT (page_id, pipeline_version) DO UPDATE
+        SET meta_raw = EXCLUDED.meta_raw,
+            extracted_at = now()
+        """,
+        (page_id, pipeline_version, Json(meta_raw)),
+    )
+
+
+# ----------------------------
+# Parsing helpers
+# ----------------------------
+
+# Strong message start signal
+USSR_REF_ANY_RE = re.compile(r"(?i)\bUSSR\s+Ref\.?\s*No\.?\s*:\s*([A-Za-z0-9/()\-]+)")
+
+# Routing header
 FROM_RE = re.compile(r"(?i)^\s*From\s*[:\-–]\s*(.+?)\s*$")
 TO_RE   = re.compile(r"(?i)^\s*To\s*[:\-–]\s*(.+?)\s*$")
 
-# "No:" / "No.:" / "No." variants; content may include commas
-NO_RE   = re.compile(r"(?i)^\s*No\.?\s*:?\s*(.+?)\s*$")
+# Generic No line (used for start detection window)
+NO_LINE_RE = re.compile(r"(?i)^\s*No\.?\s*:?\s*(.+?)\s*$")
 
-# Cover pages / non-message pages often contain these; used only to reduce false positives.
-FRONT_MATTER_HINT_RE = re.compile(r"(?i)\b(venona|arranged by|john earl haynes|national archives|introduction|contents|table of contents)\b")
+# Header "No" line (cable number + optional remainder/date)
+# Allow alnum token (some variants include slashes, etc.)
+NO_HDR_RE = re.compile(r"(?i)^\s*No\.?\s*:?\s*([A-Za-z0-9/\-]{1,20})(?:\s+(.*?))?\s*$")
 
-# Page header artifacts that appear mid-message; do NOT trigger splits
-PAGE_NUMBER_ARTIFACT_RE = re.compile(r"^\s*-\s*\d+\s*-\s*$")
+# Issued / Copy No patterns common in some volumes
+ISSUED_RE = re.compile(r"(?i)^\s*Issued\s*:?\s*(?:/)?\s*([0-9]{1,2})\s*/\s*([0-9]{1,2})\s*/\s*([0-9]{2,4})\s*$")
+COPYNO_RE = re.compile(r"(?i)^\s*Copy\s*No\.?\s*:?\s*([0-9]{1,6})\s*$")
+
+# Reissue / extract
+REISSUE_RE = re.compile(r"(?i)\b(?:(\d+)\s*(?:st|nd|rd|th)\s*)?RE[\- ]?ISSUE\b")
+EXTRACT_RE = re.compile(r"(?i)\bEXTRACT\b")
+
+# Front matter hint
+FRONT_MATTER_HINT_RE = re.compile(
+    r"(?i)\b(venona|arranged by|john earl haynes|national archives|introduction|contents|table of contents)\b"
+)
+
+# Signature-ish lines later in messages (avoid confusing with header No)
+NO_SIG_RE = re.compile(r"(?i)^\s*No\.?\s*([0-9]{1,6})\s+([A-ZĀĒĪŌŪA-Z’'\-]+)\b(.*)?$")
+
+# Numeric date fallback (dd/mm/yy or dd/mm/yyyy)
+NUMERIC_DATE_RE = re.compile(r"^\s*(\d{1,2})/(\d{1,2})/(\d{2,4})\s*$")
+
+MONTHS = {
+    "jan": 1, "january": 1,
+    "feb": 2, "february": 2,
+    "mar": 3, "march": 3,
+    "apr": 4, "april": 4,
+    "may": 5,
+    "jun": 6, "june": 6,
+    "jul": 7, "july": 7,
+    "aug": 8, "august": 8,
+    "sep": 9, "sept": 9, "september": 9,
+    "oct": 10, "october": 10,
+    "nov": 11, "november": 11,
+    "dec": 12, "december": 12,
+}
+
+def _clean_ascii(s: str) -> str:
+    s = unicodedata.normalize("NFKD", s)
+    s = s.replace("’", "'").replace("“", '"').replace("”", '"')
+    return s.strip()
 
 
-def page_lines_in_reading_order(page: fitz.Page) -> list[str]:
+def strip_bracket_footnotes(s: str) -> str:
+    s = re.sub(r"\[[^\]]+\]", "", s)
+    s = re.sub(r"\s+", " ", s)
+    return _clean_ascii(s).strip(" .;:")
+
+
+def split_addressees(s: str) -> List[str]:
+    s = strip_bracket_footnotes(s).rstrip(".")
+    parts = [p.strip() for p in s.split(",") if p.strip()]
+    return [p for p in parts if p]
+
+
+def parse_numeric_date(s: str) -> Tuple[str, Optional[str]]:
+    raw = _clean_ascii(s)
+    m = NUMERIC_DATE_RE.match(raw)
+    if not m:
+        return raw, None
+    d, mo, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    if y < 100:
+        y = 1900 + y
+    try:
+        return raw, datetime.date(y, mo, d).isoformat()
+    except ValueError:
+        return raw, None
+
+
+def parse_textual_date(s: str) -> Tuple[str, Optional[str]]:
+    """
+    Supports:
+      - '16 Sept.45'
+      - '17 July 40'
+      - '24 March 1942'
+      - '10th Oct. 40'
+      - '21st September 1945'
+    Returns (raw, iso_or_none)
+    """
+    raw = _clean_ascii(s)
+    t = raw.lower()
+
+    # Normalize punctuation/spaces
+    t = t.replace(".", " ")
+    t = re.sub(r"[,\s]+", " ", t).strip()
+
+    # Remove ordinals: 10th -> 10
+    t = re.sub(r"\b(\d{1,2})(st|nd|rd|th)\b", r"\1", t)
+
+    parts = t.split()
+    if len(parts) < 3:
+        return raw, None
+
+    # Expect: day month year
+    try:
+        day = int(parts[0])
+    except ValueError:
+        return raw, None
+
+    mon = MONTHS.get(parts[1], MONTHS.get(parts[1][:3], None))
+    if not mon:
+        return raw, None
+
+    try:
+        year = int(parts[2])
+    except ValueError:
+        return raw, None
+
+    if year < 100:
+        year = 1900 + year
+
+    try:
+        iso = datetime.date(year, mon, day).isoformat()
+    except ValueError:
+        iso = None
+    return raw, iso
+
+
+def parse_any_date(s: str) -> Tuple[str, Optional[str]]:
+    raw = _clean_ascii(s)
+    _, iso = parse_numeric_date(raw)
+    if iso:
+        return raw, iso
+    return parse_textual_date(raw)
+
+
+def page_lines_in_reading_order(page: fitz.Page) -> List[str]:
     """
     Extract lines in a stable reading order using get_text('dict').
-    We join spans for each line and sort by (y, x).
+    Join spans for each line and sort by (y, x).
     """
     d = page.get_text("dict")
     lines = []
@@ -181,59 +388,52 @@ def page_lines_in_reading_order(page: fitz.Page) -> list[str]:
 def normalize_label(s: str, max_len: int = 110) -> str:
     s = s.strip()
     s = re.sub(r"\s+", " ", s)
-    # Keep safe-ish characters for readability
-    s = re.sub(r"[^A-Za-z0-9 .:_\-/,#()]", "", s)
+    s = re.sub(r"[^A-Za-z0-9 .:_\-/,#()|]", "", s)
     if len(s) > max_len:
         s = s[: max_len - 3] + "..."
     return s or "message"
 
 
-def detect_message_start(lines: list[str]) -> bool:
+def detect_message_start(lines: List[str]) -> bool:
     """
     Conservative start detection:
-      - If page contains USSR Ref. No, that's a strong signal.
-      - Else: require From + To + No within a small window.
+      - If page contains USSR Ref. No anywhere, that's a strong signal.
+      - Else: require From + To + No within a small window near top.
     """
     joined = "\n".join(lines)
-    if USSR_REF_RE.search(joined):
+    if USSR_REF_ANY_RE.search(joined):
         return True
 
-    # Sliding window to find From/To/No cluster close together
     idx_from = idx_to = idx_no = None
-    for i, ln in enumerate(lines[:80]):  # don't scan entire huge pages
-        if idx_from is None and FROM_RE.match(ln.strip()):
+    for i, ln in enumerate(lines[:90]):
+        s = ln.strip()
+        if idx_from is None and FROM_RE.match(s):
             idx_from = i
-        if idx_to is None and TO_RE.match(ln.strip()):
+        if idx_to is None and TO_RE.match(s):
             idx_to = i
-        if idx_no is None and NO_RE.match(ln.strip()):
-            # guard against false "No." in body by requiring it's near top
+        if idx_no is None and NO_LINE_RE.match(s):
             idx_no = i
         if idx_from is not None and idx_to is not None and idx_no is not None:
-            # cluster must be reasonably close
             span = max(idx_from, idx_to, idx_no) - min(idx_from, idx_to, idx_no)
-            if span <= 15 and min(idx_from, idx_to, idx_no) <= 40:
+            if span <= 15 and min(idx_from, idx_to, idx_no) <= 45:
                 return True
-
     return False
 
 
-def extract_label_from_header(lines: list[str]) -> tuple[str | None, dict]:
+def extract_label_from_header(lines: List[str]) -> Tuple[Optional[str], dict]:
     """
-    Try to build a stable logical label + header metadata from the first ~80 lines.
-    Returns (label, header_meta).
+    Build a stable logical label + minimal header_meta for labeling.
     """
     header_meta: dict = {}
+    joined = "\n".join(lines[:140])
 
-    joined = "\n".join(lines[:120])
-    mref = USSR_REF_RE.search(joined)
+    mref = USSR_REF_ANY_RE.search(joined)
     if mref:
         header_meta["ussr_ref_no"] = mref.group(1)
-        # Prefer USSR Ref No as label
         return f"USSRRef:{mref.group(1)}", header_meta
 
-    # Otherwise capture From/To/No (best-effort)
     frm = to = no = None
-    for ln in lines[:120]:
+    for ln in lines[:140]:
         s = ln.strip()
         mf = FROM_RE.match(s)
         if mf and frm is None:
@@ -241,9 +441,8 @@ def extract_label_from_header(lines: list[str]) -> tuple[str | None, dict]:
         mt = TO_RE.match(s)
         if mt and to is None:
             to = mt.group(1).strip()
-        mn = NO_RE.match(s)
+        mn = NO_LINE_RE.match(s)
         if mn and no is None:
-            # This may include date too; keep as-is
             no = mn.group(1).strip()
         if frm and to and no:
             break
@@ -268,15 +467,186 @@ def extract_label_from_header(lines: list[str]) -> tuple[str | None, dict]:
     return None, header_meta
 
 
+def extract_venona_metadata_from_message(raw_text: str) -> dict:
+    """
+    Extract best-effort metadata from the message text (no mutation).
+    """
+    lines = [ln for ln in raw_text.splitlines() if ln.strip()]
+    header_zone = lines[:160]
+
+    meta: Dict[str, Any] = {
+        "ussr_ref_no": None,
+        "issued_date_raw": None,
+        "issued_date_iso": None,
+        "copy_no": None,
+        "reissue_raw": None,
+        "reissue_ordinal": None,
+        "extract_flag": False,
+        "mb_code": None,
+
+        "from": None,
+        "to": [],              # routing To(s)
+        "to_addressees": [],   # addressee To line(s), not routing
+
+        "cable_no": None,
+        "cable_nos": [],
+        "cable_no_raw": None,
+
+        "message_date_raw": None,
+        "message_date_iso": None,
+
+        "signature_no_lines": []
+    }
+
+    joined = "\n".join(header_zone)
+
+    # USSR Ref No
+    m = USSR_REF_ANY_RE.search(joined)
+    if m:
+        meta["ussr_ref_no"] = m.group(1)
+
+    # MB code (GRU-style)
+    mbm = re.search(r"(?i)\bMB\s*([0-9]{1,6}\s*/\s*[0-9]{1,6})\b", joined)
+    if mbm:
+        meta["mb_code"] = "MB " + mbm.group(1).replace(" ", "")
+
+    # Issued / Copy / Reissue / Extract flags
+    for ln in header_zone:
+        s = ln.strip()
+
+        mi = ISSUED_RE.match(s)
+        if mi and meta["issued_date_raw"] is None:
+            d, mth, y = int(mi.group(1)), int(mi.group(2)), int(mi.group(3))
+            meta["issued_date_raw"] = s.split(":", 1)[-1].strip()
+            if y < 100:
+                y = 1900 + y
+            try:
+                meta["issued_date_iso"] = datetime.date(y, mth, d).isoformat()
+            except ValueError:
+                meta["issued_date_iso"] = None
+
+        mc = COPYNO_RE.match(s)
+        if mc and meta["copy_no"] is None:
+            meta["copy_no"] = mc.group(1)
+
+        mr = REISSUE_RE.search(s)
+        if mr and meta["reissue_raw"] is None:
+            meta["reissue_raw"] = _clean_ascii(s)
+            if mr.group(1):
+                try:
+                    meta["reissue_ordinal"] = int(mr.group(1))
+                except ValueError:
+                    meta["reissue_ordinal"] = None
+
+        if EXTRACT_RE.search(s):
+            meta["extract_flag"] = True
+
+    # Routing From/To and header No/date parsing
+    for ln in header_zone:
+        s = ln.strip()
+
+        mf = FROM_RE.match(s)
+        if mf and meta["from"] is None:
+            meta["from"] = strip_bracket_footnotes(mf.group(1))
+
+        mt = TO_RE.match(s)
+        if mt:
+            dest = strip_bracket_footnotes(mt.group(1))
+            if dest and dest not in meta["to"]:
+                meta["to"].append(dest)
+            # IMPORTANT: don't treat routing "To:" line as addressee line too
+            continue
+
+        # Header No line: cable token + remainder (often date)
+        mn = NO_HDR_RE.match(s)
+        if mn and meta["cable_no"] is None:
+            token = strip_bracket_footnotes(mn.group(1))
+            rest = (mn.group(2) or "").strip()
+
+            meta["cable_no"] = token
+            meta["cable_nos"] = [token]
+            meta["cable_no_raw"] = (token + (" " + rest if rest else "")).strip()
+
+            # Try parse date from remainder
+            if rest:
+                raw, iso = parse_any_date(rest)
+                if iso:
+                    meta["message_date_raw"] = raw
+                    meta["message_date_iso"] = iso
+
+    # Standalone message date line (e.g., after No: 582 then "24 March 1942")
+    if meta["message_date_raw"] is None:
+        for ln in header_zone[:80]:
+            raw, iso = parse_any_date(ln.strip())
+            if iso:
+                meta["message_date_raw"] = raw
+                meta["message_date_iso"] = iso
+                break
+
+    # Addressee "To ..." lines inside header/body (not routing)
+    # Heuristic: scan header_zone for lines that begin with "To" but are NOT routing "To: DEST"
+    for ln in header_zone:
+        s = ln.strip()
+        if not s.lower().startswith("to"):
+            continue
+        if TO_RE.match(s):  # routing already handled
+            continue
+        # E.g., "To IGOR'.", "To SERGEJ, IGOR’ ..."
+        # Avoid things like "TO:" empty weirdness
+        after = re.sub(r"(?i)^\s*To\s*:?\s*", "", s).strip()
+        if not after:
+            continue
+        addrs = split_addressees(after)
+        for a in addrs:
+            if a and (a not in meta["to_addressees"]) and (a not in meta["to"]):
+                meta["to_addressees"].append(a)
+
+    # Signature-ish No lines later (store but don't confuse with header cable No)
+    scan_zone = lines[:280]
+    for idx, ln in enumerate(scan_zone):
+        ms = NO_SIG_RE.match(ln.strip())
+        if not ms:
+            continue
+        no = ms.group(1)
+        who = strip_bracket_footnotes(ms.group(2))
+        tail = (ms.group(3) or "").strip()
+
+        date_raw = None
+        nxt = scan_zone[idx + 1].strip() if idx + 1 < len(scan_zone) else ""
+        if nxt:
+            _, iso = parse_any_date(nxt)
+            if iso:
+                date_raw = _clean_ascii(nxt)
+
+        meta["signature_no_lines"].append(
+            {
+                "no": no,
+                "who": who,
+                "date_raw": date_raw or (_clean_ascii(tail) if tail else None),
+            }
+        )
+
+    return meta
+
+
+# ----------------------------
+# Main
+# ----------------------------
 def main():
-    ap = argparse.ArgumentParser(description="Ingest Venona cable PDFs into pages (one page per message/cable).")
+    ap = argparse.ArgumentParser(
+        description="Ingest Venona cable PDFs into pages (message/cable units) + write page_metadata."
+    )
     ap.add_argument("--pdf", required=True, help="Path to PDF (WSL path recommended).")
     ap.add_argument("--source-key", default=None, help="Stable ingest key (default: venona:<filename-stem>).")
     ap.add_argument("--volume", default=None, help="Optional volume label stored on documents.volume.")
     ap.add_argument("--language", default="en", help="pages.language (default: en).")
     ap.add_argument("--collection-slug", default="venona", help="collections.slug (default: venona).")
     ap.add_argument("--collection-title", default="Venona Decrypts", help="collections.title.")
-    ap.add_argument("--collection-description", default="Venona cable ingests. Logical pages are message/cable units.", help="collections.description.")
+    ap.add_argument(
+        "--collection-description",
+        default="Venona cable ingests. Logical pages are message/cable units; pdf_page_number is start page of message.",
+        help="collections.description.",
+    )
     args = ap.parse_args()
 
     pdf_path = Path(args.pdf)
@@ -290,9 +660,9 @@ def main():
     source_key = args.source_key or f"venona:{pdf_path.stem}"
     source_name = pdf_path.name
 
-    # Extract messages by scanning pages in order
-    messages = []
-    current = None  # dict with: start_pdf_page, lines(list[str]), header_meta(dict), label(str|None)
+    # Extract messages by scanning PDF pages
+    messages: List[dict] = []
+    current: Optional[dict] = None
     page_seq = 0
 
     doc = fitz.open(str(pdf_path))
@@ -301,29 +671,24 @@ def main():
             page = doc[pdf_idx]
             lines = page_lines_in_reading_order(page)
 
-            # Light front-matter skip heuristic if no current message and no start markers
+            # If we aren't in a message yet, try to start one
             if current is None:
                 if not detect_message_start(lines):
-                    # If it looks like cover/intro, skip
-                    if FRONT_MATTER_HINT_RE.search("\n".join(lines[:60])) and pdf_idx < 5:
+                    if FRONT_MATTER_HINT_RE.search("\n".join(lines[:70])) and pdf_idx < 6:
                         continue
-                    # Otherwise just continue (blank/odd pages)
                     continue
 
-                # Start new message
                 label, header_meta = extract_label_from_header(lines)
                 current = {
-                    "start_pdf_page": pdf_idx + 1,  # 1-indexed
+                    "start_pdf_page": pdf_idx + 1,
                     "lines": list(lines),
                     "label": label,
                     "header_meta": header_meta,
                 }
                 continue
 
-            # If we are inside a message:
-            # Check if THIS page begins a NEW message. If so, flush current and start new.
+            # If we are inside a message, check if a new message starts here
             if detect_message_start(lines):
-                # Flush current
                 page_seq += 1
                 raw_text = "\n".join(current["lines"])
                 messages.append(
@@ -331,12 +696,10 @@ def main():
                         "page_seq": page_seq,
                         "pdf_page_number": current["start_pdf_page"],
                         "logical_page_label": current["label"] or f"msg.{page_seq:04d}",
-                        "header_meta": current["header_meta"],
                         "raw_text": raw_text,
                     }
                 )
 
-                # Start next
                 label, header_meta = extract_label_from_header(lines)
                 current = {
                     "start_pdf_page": pdf_idx + 1,
@@ -345,10 +708,9 @@ def main():
                     "header_meta": header_meta,
                 }
             else:
-                # Continuation page: append lines verbatim-ish
                 current["lines"].extend(lines)
 
-        # Flush last
+        # Flush last message
         if current is not None:
             page_seq += 1
             raw_text = "\n".join(current["lines"])
@@ -357,41 +719,43 @@ def main():
                     "page_seq": page_seq,
                     "pdf_page_number": current["start_pdf_page"],
                     "logical_page_label": current["label"] or f"msg.{page_seq:04d}",
-                    "header_meta": current["header_meta"],
                     "raw_text": raw_text,
                 }
             )
     finally:
         doc.close()
 
-    # Ensure labels are unique per document
-    seen = {}
-    pages = []
+    if not messages:
+        print("ERROR: extracted 0 messages. This PDF may not match the Venona-cables format.", file=sys.stderr)
+        sys.exit(2)
+
+    # Deduplicate labels within this document deterministically
+    seen: Dict[str, int] = {}
+    pages: List[dict] = []
     for msg in messages:
         base = normalize_label(msg["logical_page_label"])
         n = seen.get(base, 0) + 1
         seen[base] = n
         label = base if n == 1 else f"{base}__dup{n}"
-
         pages.append(
             {
                 "logical_page_label": label,
-                "pdf_page_number": msg["pdf_page_number"],
-                "page_seq": msg["page_seq"],
+                "pdf_page_number": int(msg["pdf_page_number"]),
+                "page_seq": int(msg["page_seq"]),
                 "language": args.language,
                 "content_role": "primary",
                 "raw_text": msg["raw_text"],
-                "header_meta": msg["header_meta"],
             }
         )
-
-    if len(pages) == 0:
-        print("ERROR: extracted 0 messages. This PDF may not match the Venona-cables format.", file=sys.stderr)
-        sys.exit(2)
 
     try:
         with connect() as conn, conn.cursor() as cur:
             ensure_ingest_runs_table(cur)
+
+            can_write_page_metadata = page_metadata_table_exists(cur)
+            if not can_write_page_metadata:
+                print("WARNING: page_metadata table not found; header metadata will not be stored.", file=sys.stderr)
+
             if not should_run(cur, source_key, sha, PIPELINE_VERSION):
                 print("No-op: already ingested for this pipeline_version and PDF hash.")
                 return
@@ -412,19 +776,23 @@ def main():
                 volume=args.volume,
                 source_ref=str(pdf_path),
                 metadata={
-                    "ingested_by": "scripts/ingest_venona_cables_pdf.py",
+                    "ingested_by": "scripts/ingest_venona_pdf.py",
                     "pipeline_version": PIPELINE_VERSION,
+                    "meta_pipeline_version": META_PIPELINE_VERSION,
                     "pdf_sha256": sha,
                     "split_rule": "messages split by USSR Ref No or From/To/No header clusters; continuation pages appended",
                 },
             )
 
-            # Deterministic replay: replace all pages for this doc
+            # If your page_metadata FK is RESTRICT, uncomment this before deleting pages:
+            # cur.execute(
+            #     "DELETE FROM page_metadata WHERE page_id IN (SELECT id FROM pages WHERE document_id=%s)",
+            #     (doc_id,),
+            # )
+
             delete_pages_for_document(cur, doc_id)
 
-            # Insert pages. Store per-page header_meta inside raw_text? No. Keep raw_text sacred.
-            # For now, we tuck header_meta into documents.metadata only by omission; if you later want it per-page,
-            # add a JSONB column or a separate table. Today: keep it simple.
+            # Insert message-pages + metadata
             for p in pages:
                 cur.execute(
                     """
@@ -433,6 +801,7 @@ def main():
                       language, content_role, raw_text
                     )
                     VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    RETURNING id
                     """,
                     (
                         doc_id,
@@ -444,6 +813,19 @@ def main():
                         p["raw_text"],
                     ),
                 )
+                page_id = int(cur.fetchone()[0])
+
+                if can_write_page_metadata:
+                    ven_meta = extract_venona_metadata_from_message(p["raw_text"])
+                    upsert_page_metadata(
+                        cur,
+                        page_id=page_id,
+                        pipeline_version=META_PIPELINE_VERSION,
+                        meta_raw={
+                            "venona": ven_meta,
+                            "source": "scripts/ingest_venona_pdf.py",
+                        },
+                    )
 
             mark_success(cur, source_key)
             conn.commit()

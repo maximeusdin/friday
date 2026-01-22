@@ -1,17 +1,33 @@
+#!/usr/bin/env python3
+"""
+Ingest Vassiliev PDF into Postgres using *original PDF pages* as the canonical pages.
+
+- 1 pages row per PDF page (page_seq = pdf_page_number).
+- logical_page_label is stable "pdf.N".
+- Does NOT use p.xx markers for splitting.
+- Extracts any p.xx markers present on that PDF page and stores them in page_metadata.meta_raw
+  for downstream chunking/citation heuristics.
+
+Change requested:
+- "with_markers" should mean: meta_raw contains the key "p_markers" ONLY WHEN markers exist.
+  => We now OMIT "p_markers" and "p_marker_first" entirely when no markers are found.
+"""
+
 import os
 import re
 import sys
 import hashlib
 import argparse
 from pathlib import Path
+from typing import Optional, List, Dict
 
 import psycopg2
 from psycopg2.extras import Json
-
 import fitz  # PyMuPDF
 
 
-PIPELINE_VERSION = "v2_line_level_dict"
+PIPELINE_VERSION = "v4e_pdf_pages_only"
+META_PIPELINE_VERSION = "meta_v1_pxx_markers"
 
 
 DB_HOST = os.getenv("DB_HOST", "localhost")
@@ -42,6 +58,20 @@ def ensure_ingest_runs_table(cur):
         )
         """
     )
+
+
+def page_metadata_table_exists(cur) -> bool:
+    cur.execute(
+        """
+        SELECT EXISTS (
+          SELECT 1
+          FROM information_schema.tables
+          WHERE table_schema = 'public'
+            AND table_name = 'page_metadata'
+        )
+        """
+    )
+    return bool(cur.fetchone()[0])
 
 
 def should_run(cur, source_key: str, source_sha256: str, pipeline_version: str) -> bool:
@@ -104,7 +134,7 @@ def mark_failed_best_effort(source_key: str, source_sha256: str, err: str):
         pass
 
 
-def upsert_collection(cur, slug: str, title: str, description: str | None = None) -> int:
+def upsert_collection(cur, slug: str, title: str, description: Optional[str] = None) -> int:
     cur.execute(
         """
         INSERT INTO collections (slug, title, description)
@@ -116,11 +146,17 @@ def upsert_collection(cur, slug: str, title: str, description: str | None = None
         """,
         (slug, title, description),
     )
-    return cur.fetchone()[0]
+    return int(cur.fetchone()[0])
 
 
-def upsert_document(cur, collection_id: int, source_name: str, volume: str | None, source_ref: str | None, metadata: dict) -> int:
-    # Uses UNIQUE(collection_id, source_name, volume_key) from your schema
+def upsert_document(
+    cur,
+    collection_id: int,
+    source_name: str,
+    volume: Optional[str],
+    source_ref: Optional[str],
+    metadata: dict,
+) -> int:
     cur.execute(
         """
         INSERT INTO documents (collection_id, source_name, volume, source_ref, metadata)
@@ -132,104 +168,67 @@ def upsert_document(cur, collection_id: int, source_name: str, volume: str | Non
         """,
         (collection_id, source_name, volume, source_ref, Json(metadata)),
     )
-    return cur.fetchone()[0]
+    return int(cur.fetchone()[0])
 
 
 def delete_pages_for_document(cur, document_id: int):
-    # Safe right now because you aren't creating chunks yet; ensures deterministic page_seq and avoids uniqueness collisions.
+    # Deterministic replay (OK before chunks exist; later you'll need to delete chunks first or upsert pages).
     cur.execute("DELETE FROM pages WHERE document_id = %s", (document_id,))
 
 
-PXX_RE = re.compile(r"(?m)^\s*(p\.\s*\d+)\s*$")
+# Extract p.xx markers in the page text.
+PXX_ANYWHERE_RE = re.compile(r"(?m)^\s*(p\.\s*\d+)\s*$")
 
 
-def normalize_label(label: str) -> str:
+def normalize_pxx(label: str) -> str:
     # "p. 71" -> "p.71"
     return re.sub(r"\s+", "", label.strip())
 
 
-PXX_LINE_RE = re.compile(r"^\s*(p\.\s*\d+)\s*$")
-
-def extract_pxx_pages(pdf_path: Path) -> list[dict]:
+def extract_pdf_pages(pdf_path: Path) -> List[Dict]:
     """
-    Layout-aware, line-level extraction:
-      - iterates lines (not blocks)
-      - detects marker lines like 'p.71'
-      - assigns subsequent lines until next marker line
     Returns list of dicts:
-      logical_page_label, pdf_page_number, raw_text
+      pdf_page_number (1-indexed), raw_text (full page)
     """
-    out: list[dict] = []
+    out: List[Dict] = []
     doc = fitz.open(str(pdf_path))
     try:
-        for pdf_idx in range(len(doc)):
-            page = doc[pdf_idx]
-            d = page.get_text("dict")
-            lines = []
-
-            # Collect (y0, x0, text) for each line
-            for block in d.get("blocks", []):
-                if block.get("type") != 0:
-                    continue  # non-text block
-                for line in block.get("lines", []):
-                    spans = line.get("spans", [])
-                    if not spans:
-                        continue
-                    # Combine spans into the visual line text (preserve as-is)
-                    text = "".join(s.get("text", "") for s in spans)
-                    if not text or not text.strip():
-                        continue
-
-                    x0, y0, x1, y1 = line.get("bbox", [0, 0, 0, 0])
-                    lines.append((float(y0), float(x0), text))
-
-            if not lines:
-                continue
-
-            # Sort top-to-bottom, then left-to-right
-            lines.sort(key=lambda t: (t[0], t[1]))
-
-            # Find indices of marker lines
-            marker_idxs = []
-            marker_labels = []
-            for i, (_, __, txt) in enumerate(lines):
-                m = PXX_LINE_RE.match(txt.strip())
-                if m:
-                    label = normalize_label(m.group(1))  # your existing helper
-                    marker_idxs.append(i)
-                    marker_labels.append(label)
-
-            if not marker_idxs:
-                continue
-
-            # Segment lines between markers
-            for k, start_i in enumerate(marker_idxs):
-                end_i = marker_idxs[k + 1] if k + 1 < len(marker_idxs) else len(lines)
-                label = marker_labels[k]
-
-                # Include the marker line and all following lines up to (not including) next marker
-                segment_lines = [lines[j][2] for j in range(start_i, end_i)]
-
-                # Join with newlines; do not strip internal whitespace
-                raw_text = "\n".join(segment_lines)
-
-                out.append(
-                    {
-                        "logical_page_label": label,
-                        "pdf_page_number": pdf_idx + 1,
-                        "raw_text": raw_text,
-                    }
-                )
+        for i in range(len(doc)):
+            page = doc[i]
+            raw = page.get_text("text") or ""
+            out.append({"pdf_page_number": i + 1, "raw_text": raw})
     finally:
         doc.close()
-
     return out
 
 
+def upsert_page_metadata(cur, page_id: int, pipeline_version: str, meta_raw: dict):
+    cur.execute(
+        """
+        INSERT INTO page_metadata (page_id, pipeline_version, meta_raw)
+        VALUES (%s, %s, %s)
+        ON CONFLICT (page_id, pipeline_version) DO UPDATE
+        SET meta_raw = page_metadata.meta_raw || EXCLUDED.meta_raw,
+            extracted_at = now()
+        """,
+        (page_id, pipeline_version, Json(meta_raw)),
+    )
+
+
+def dedupe_preserve_order(items: List[str]) -> List[str]:
+    seen = set()
+    out: List[str] = []
+    for it in items:
+        if it not in seen:
+            seen.add(it)
+            out.append(it)
+    return out
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Ingest Vassiliev PDF pages using p.xx markers as logical pages.")
+    parser = argparse.ArgumentParser(
+        description="Ingest Vassiliev PDF as original PDF pages; store p.xx markers in metadata only when present."
+    )
     parser.add_argument("--pdf", required=True, help="Path to the PDF (WSL path recommended, e.g. /mnt/c/.../file.pdf)")
     parser.add_argument("--source-key", default=None, help="Stable ingest source key (default derived from filename)")
     parser.add_argument("--volume", default="Yellow Notebook #1", help="Document volume label (stored on documents.volume)")
@@ -247,37 +246,21 @@ def main():
     source_key = args.source_key or f"vassiliev:{pdf_path.stem}"
     source_name = pdf_path.name
 
-    # Extract p.xx-defined pages
-    extracted = extract_pxx_pages(pdf_path)
-    if len(extracted) < 10:
-        print(f"WARNING: extracted only {len(extracted)} p.xx pages. Check marker regex or PDF text.", file=sys.stderr)
-
-    # Ensure unique logical_page_label within this document (your schema enforces it).
-    # If duplicates occur, we suffix them deterministically while keeping original p.xx line inside raw_text.
-    seen: dict[str, int] = {}
-    pages: list[dict] = []
-    seq = 0
-    for item in extracted:
-        seq += 1
-        base_label = item["logical_page_label"]
-        n = seen.get(base_label, 0) + 1
-        seen[base_label] = n
-        label = base_label if n == 1 else f"{base_label}__dup{n}"
-
-        pages.append(
-            {
-                "logical_page_label": label,
-                "pdf_page_number": item["pdf_page_number"],
-                "page_seq": seq,
-                "language": args.language,
-                "content_role": "primary",
-                "raw_text": item["raw_text"],
-            }
-        )
+    extracted = extract_pdf_pages(pdf_path)
+    if len(extracted) == 0:
+        print("ERROR: PDF had 0 pages?", file=sys.stderr)
+        sys.exit(1)
 
     try:
         with connect() as conn, conn.cursor() as cur:
             ensure_ingest_runs_table(cur)
+            can_write_page_metadata = page_metadata_table_exists(cur)
+            if not can_write_page_metadata:
+                print(
+                    "WARNING: page_metadata table not found. "
+                    "Pages will be ingested, but p.xx marker metadata will NOT be written.",
+                    file=sys.stderr,
+                )
 
             if not should_run(cur, source_key, pdf_sha256, PIPELINE_VERSION):
                 print("No-op: already ingested for this pipeline_version and PDF hash.")
@@ -289,7 +272,7 @@ def main():
                 cur,
                 slug="vassiliev",
                 title="Vassiliev Notebooks",
-                description="Notebook ingests (logical pages defined by p.xx markers; PDF page retained).",
+                description="Notebook ingests (canonical unit = PDF page; p.xx markers stored as derived metadata).",
             )
 
             doc_id = upsert_document(
@@ -302,15 +285,25 @@ def main():
                     "ingested_by": "scripts/ingest_vassiliev_pdf.py",
                     "pipeline_version": PIPELINE_VERSION,
                     "pdf_sha256": pdf_sha256,
-                    "split_rule": "logical pages split by ^p\\.\\s*\\d+ markers",
+                    "split_rule": "canonical pages are original PDF pages (1 row per PDF page)",
+                    "meta_pipeline_version": META_PIPELINE_VERSION,
+                    "marker_policy": "meta_raw.p_markers key exists only when markers are present",
                 },
             )
 
-            # Deterministic replay: replace pages for this doc on rerun
+            # Deterministic replay
             delete_pages_for_document(cur, doc_id)
 
-            # Insert pages
-            for p in pages:
+            inserted_pages = 0
+            inserted_meta = 0
+
+            for item in extracted:
+                pdf_page_number = int(item["pdf_page_number"])
+                raw_text = item["raw_text"]
+
+                logical_label = f"pdf.{pdf_page_number}"
+                page_seq = pdf_page_number  # stable monotonic
+
                 cur.execute(
                     """
                     INSERT INTO pages (
@@ -318,22 +311,48 @@ def main():
                       language, content_role, raw_text
                     )
                     VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    RETURNING id
                     """,
                     (
                         doc_id,
-                        p["logical_page_label"],
-                        p["pdf_page_number"],
-                        p["page_seq"],
-                        p["language"],
-                        p["content_role"],
-                        p["raw_text"],
+                        logical_label,
+                        pdf_page_number,
+                        page_seq,
+                        args.language,
+                        "primary",
+                        raw_text,
                     ),
                 )
+                page_id = int(cur.fetchone()[0])
+                inserted_pages += 1
+
+                if can_write_page_metadata:
+                    markers = [normalize_pxx(m) for m in PXX_ANYWHERE_RE.findall(raw_text)]
+                    markers_unique = dedupe_preserve_order(markers)
+
+                    # Always include provenance keys; only include p_markers/p_marker_first when present.
+                    meta_raw = {
+                        "source": "scripts/ingest_vassiliev_pdf.py",
+                        "note": "p.xx markers stored for downstream chunk labeling; not used for splitting",
+                    }
+                    if markers_unique:
+                        meta_raw["p_markers"] = markers_unique
+                        meta_raw["p_marker_first"] = markers_unique[0]
+
+                    upsert_page_metadata(
+                        cur,
+                        page_id=page_id,
+                        pipeline_version=META_PIPELINE_VERSION,
+                        meta_raw=meta_raw,
+                    )
+                    inserted_meta += 1
 
             mark_success(cur, source_key)
             conn.commit()
 
-        print(f"Done. Ingested {len(pages)} logical pages from {pdf_path.name}")
+        print(f"Done. Ingested {inserted_pages} PDF pages from {pdf_path.name}")
+        if inserted_meta:
+            print(f"Wrote page_metadata for {inserted_meta} pages (pipeline={META_PIPELINE_VERSION})")
         print(f"source_key={source_key}")
         print(f"pdf_sha256={pdf_sha256}")
 

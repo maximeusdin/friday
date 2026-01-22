@@ -1,0 +1,15 @@
+defaults:
+  model: text-embedding-3-small
+  dim: 1536
+  batch_size: 128
+  max_chars: 12000   # safety; you can tune later
+
+per_collection:
+  venona:
+    model: text-embedding-3-small
+    dim: 1536
+    # later: maybe strip Venona boilerplate headers if you want, but not required
+
+  vassiliev:
+    model: text-embedding-3-small
+    dim: 1536
