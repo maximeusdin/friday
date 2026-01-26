@@ -35,13 +35,243 @@ Dependencies:
   pip install pdfplumber
 """
 
+import warnings
+# Suppress SyntaxWarnings about escape sequences in raw regex strings (must be before other imports)
+# These are false positives - the patterns are correct for regex
+warnings.filterwarnings('ignore', category=SyntaxWarning)
+
 import os
 import re
 import argparse
+import time
+import sys
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Tuple
 
 import psycopg2
+
+
+# -----------------------
+# Footnote removal from raw text
+# -----------------------
+
+# Pattern to detect if a line looks like a new entry (not indented, starts with capital or quote)
+# Defined here so it can be used by footnote removal functions
+_RE_ENTRY_START_FOOTNOTE = re.compile(r'^[^\s]|^\s{0,10}[A-Z"""]')
+
+def remove_footnotes_from_layout_lines(lines: List["PdfLine"]) -> List["PdfLine"]:
+    """
+    Remove footnotes from layout-extracted lines.
+    
+    Similar to remove_footnotes_from_text but works with PdfLine objects.
+    Filters out lines that start footnotes and their continuations.
+    Preserves entry continuations that come after footnotes.
+    """
+    output_lines = []
+    i = 0
+    
+    # Patterns that indicate entry continuation (not footnote continuation)
+    # Entry continuations often have:
+    # - Section headers with colons: "Pseudonyms and work names:", "Cover name in Venona:"
+    # - Citation patterns: "As X:", "As "Y":"
+    # - Lists of names: "Michael Green, Alexander Hansen"
+    # - Quoted names: "Bill", "Will", "William"
+    entry_continuation_patterns = [
+        r'^[^:]*:\s*[A-Z]',  # "Pseudonyms and work names: ..." or "Cover name in Venona: ..."
+        r'^As\s+["""]?[A-Z]',  # "As Akhmerov:" or "As "Jung":"
+        r'^[A-Z][a-z]+\s+and\s+[A-Z]',  # "Michael Green and Alexander Hansen"
+        r'^[A-Z][a-z]+,\s+[A-Z]',  # "Michael Green, Alexander Hansen"
+        r'^["""][A-Z]',  # "Bill", "Will", "William"
+        r'^[A-Z][A-Z\s]+\[',  # "MAYOR [MER" - all caps with brackets
+    ]
+    entry_continuation_re = re.compile('|'.join(entry_continuation_patterns))
+    
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.text.strip() if line.text else ""
+        
+        # Check if this line starts a footnote (number + period)
+        if _RE_FOOTNOTE_START.match(stripped):
+            # Skip this footnote line
+            i += 1
+            
+            # Track if we've seen a period that might end the footnote
+            footnote_lines_skipped = 0
+            max_footnote_lines = 5  # Footnotes are typically short (1-5 lines)
+            
+            while i < len(lines):
+                next_line = lines[i]
+                next_stripped = next_line.text.strip() if next_line.text else ""
+                
+                # Empty lines end the footnote
+                if not next_stripped:
+                    break
+                
+                # If next line starts a new footnote, continue skipping
+                if _RE_FOOTNOTE_START.match(next_stripped):
+                    i += 1
+                    continue
+                
+                # Check if this looks like a new entry
+                # Entry starts are typically at left margin (low x0) or start with capital/quote
+                is_indented = next_line.x0 > 50  # More than 50 points from left = indented
+                looks_like_new_entry = (
+                    next_line.x0 <= 50 and 
+                    next_line.text and 
+                    _RE_ENTRY_START_FOOTNOTE.match(next_line.text)
+                )
+                
+                if looks_like_new_entry:
+                    # This is a new entry, stop skipping
+                    break
+                
+                # Check if this looks like entry continuation (even if indented)
+                # Entry continuations often have patterns like "Pseudonyms:", "Cover name:", "As X:"
+                if next_line.text and entry_continuation_re.match(next_stripped):
+                    # This is entry continuation, stop skipping and keep it
+                    break
+                
+                # Check if we've skipped too many lines (footnotes are short)
+                footnote_lines_skipped += 1
+                if footnote_lines_skipped > max_footnote_lines:
+                    # Probably hit entry continuation, stop skipping
+                    break
+                
+                # Check if line ends with period and looks like it completes a citation
+                # If it's indented and ends with period, it might be the end of the footnote
+                if is_indented and next_stripped.endswith('.'):
+                    # Might be end of footnote, but could also be entry continuation
+                    # If next non-empty line also looks like entry continuation, stop here
+                    # Otherwise, this is probably footnote continuation
+                    j = i + 1
+                    while j < len(lines) and (not lines[j].text or not lines[j].text.strip()):
+                        j += 1
+                    if j < len(lines) and lines[j].text:
+                        next_non_empty = lines[j].text.strip()
+                        if entry_continuation_re.match(next_non_empty):
+                            # Next line is entry continuation, so this line is too - stop skipping
+                            break
+                    # This looks like end of footnote, stop skipping
+                    break
+                
+                # This is a continuation of the footnote, skip it
+                i += 1
+        else:
+            # Not a footnote, keep the line
+            output_lines.append(line)
+            i += 1
+    
+    return output_lines
+
+
+def remove_footnotes_from_text(text: str) -> str:
+    """
+    Remove footnotes from raw extracted text.
+    
+    Footnotes:
+    - Always start with a number and period (e.g., "8. Lota, GRU i Atomnaya Bomba.")
+    - May span multiple lines
+    - May appear multiple in a row
+    - If a footnote interrupts an entry, continuation on next page will be indented
+    - New entries are not indented (entry starts are at left margin)
+    
+    Strategy:
+    - Detect lines starting with number + period
+    - Remove those lines and any continuation lines that look like citation text
+    - Stop when we hit text that looks like entry continuation (e.g., "Pseudonyms", "Cover name", "As X:")
+    - Or when we hit a new entry (not indented, starts with capital/quote)
+    """
+    lines = text.split("\n")
+    output_lines = []
+    i = 0
+    
+    # Patterns that indicate entry continuation (not footnote continuation)
+    # Entry continuations often have:
+    # - Section headers with colons: "Pseudonyms and work names:", "Cover name in Venona:"
+    # - Citation patterns: "As X:", "As "Y":"
+    # - Lists of names: "Michael Green, Alexander Hansen"
+    # - Quoted names: "Bill", "Will", "William"
+    entry_continuation_patterns = [
+        r'^[^:]*:\s*[A-Z]',  # "Pseudonyms and work names: ..." or "Cover name in Venona: ..."
+        r'^As\s+["""]?[A-Z]',  # "As Akhmerov:" or "As "Jung":"
+        r'^[A-Z][a-z]+\s+and\s+[A-Z]',  # "Michael Green and Alexander Hansen"
+        r'^[A-Z][a-z]+,\s+[A-Z]',  # "Michael Green, Alexander Hansen"
+        r'^["""][A-Z]',  # "Bill", "Will", "William"
+        r'^[A-Z][A-Z\s]+\[',  # "MAYOR [MER" - all caps with brackets
+    ]
+    entry_continuation_re = re.compile('|'.join(entry_continuation_patterns))
+    
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+        
+        # Check if this line starts a footnote (number + period)
+        if _RE_FOOTNOTE_START.match(stripped):
+            # Skip this footnote line
+            i += 1
+            
+            # Track if we've seen a period that might end the footnote
+            footnote_lines_skipped = 0
+            max_footnote_lines = 5  # Footnotes are typically short (1-5 lines)
+            
+            while i < len(lines):
+                next_line = lines[i]
+                next_stripped = next_line.strip()
+                
+                # Empty lines end the footnote
+                if not next_stripped:
+                    break
+                
+                # If next line starts a new footnote, continue skipping
+                if _RE_FOOTNOTE_START.match(next_stripped):
+                    i += 1
+                    continue
+                
+                # Check if this looks like a new entry (not indented, starts with capital/quote)
+                is_indented = len(next_line) - len(next_line.lstrip()) > 10  # More than 10 spaces = indented
+                looks_like_new_entry = _RE_ENTRY_START_FOOTNOTE.match(next_line) and not is_indented
+                
+                if looks_like_new_entry:
+                    # This is a new entry, stop skipping
+                    break
+                
+                # Check if this looks like entry continuation (even if indented)
+                # Entry continuations often have patterns like "Pseudonyms:", "Cover name:", "As X:"
+                if entry_continuation_re.match(next_stripped):
+                    # This is entry continuation, stop skipping and keep it
+                    break
+                
+                # Check if we've skipped too many lines (footnotes are short)
+                footnote_lines_skipped += 1
+                if footnote_lines_skipped > max_footnote_lines:
+                    # Probably hit entry continuation, stop skipping
+                    break
+                
+                # Check if line ends with period and looks like it completes a citation
+                # If it's indented and ends with period, it might be the end of the footnote
+                if is_indented and next_stripped.endswith('.'):
+                    # Might be end of footnote, but could also be entry continuation
+                    # If next non-empty line also looks like entry continuation, stop here
+                    # Otherwise, this is probably footnote continuation
+                    j = i + 1
+                    while j < len(lines) and not lines[j].strip():
+                        j += 1
+                    if j < len(lines):
+                        next_non_empty = lines[j].strip()
+                        if entry_continuation_re.match(next_non_empty):
+                            # Next line is entry continuation, so this line is too - stop skipping
+                            break
+                    # This looks like end of footnote, stop skipping
+                    break
+                
+                # This is a continuation of the footnote, skip it
+                i += 1
+        else:
+            # Not a footnote, keep the line
+            output_lines.append(line)
+            i += 1
+    
+    return "\n".join(output_lines)
 
 
 # -----------------------
@@ -131,6 +361,7 @@ def extract_index_lines_layout(
     marker: str = "The Index",
     marker_page_1based: int = 7,
     y_tolerance: float = 2.5,
+    verbose: bool = False,
 ) -> List[PdfLine]:
     """
     Layout extractor: returns lines after the marker, preserving x0 positions.
@@ -147,6 +378,8 @@ def extract_index_lines_layout(
     out: List[PdfLine] = []
     with pdfplumber.open(pdf_path) as pdf:
         n_pages = len(pdf.pages)
+        if verbose:
+            print(f"[layout extract] PDF has {n_pages} pages", file=sys.stderr)
         if marker_page_1based < 1 or marker_page_1based > n_pages:
             raise RuntimeError(f"marker_page_1based={marker_page_1based} out of range (PDF has {n_pages} pages)")
 
@@ -154,6 +387,8 @@ def extract_index_lines_layout(
         marker_page = pdf.pages[p0]
 
         def page_to_lines(page, page_no_1based: int) -> List[PdfLine]:
+            if verbose and page_no_1based % 10 == 0:
+                print(f"[layout extract] Processing page {page_no_1based}...", file=sys.stderr)
             words = page.extract_words(
                 keep_blank_chars=False,
                 use_text_flow=True,
@@ -192,6 +427,8 @@ def extract_index_lines_layout(
                 lines_out.append(PdfLine(text=txt, x0=x0, page_no_1based=page_no_1based))
             return lines_out
 
+        if verbose:
+            print(f"[layout extract] Extracting marker page {marker_page_1based}...", file=sys.stderr)
         marker_lines = page_to_lines(marker_page, marker_page_1based)
         idx = _marker_line_reached(marker_lines, marker)
         if idx is None:
@@ -199,11 +436,20 @@ def extract_index_lines_layout(
 
         # Lines strictly after the marker line on the marker page
         out.extend(marker_lines[idx + 1:])
+        if verbose:
+            print(f"[layout extract] Found {len(marker_lines[idx + 1:])} lines after marker on page {marker_page_1based}", file=sys.stderr)
 
         # Subsequent pages
+        pages_to_process = n_pages - (p0 + 1)
+        if verbose:
+            print(f"[layout extract] Processing {pages_to_process} subsequent pages...", file=sys.stderr)
         for pi in range(p0 + 1, n_pages):
             out.extend(page_to_lines(pdf.pages[pi], pi + 1))
+            if verbose and (pi - p0) % 10 == 0:
+                print(f"[layout extract] Processed {pi - p0}/{pages_to_process} pages, {len(out)} lines so far...", file=sys.stderr)
 
+    if verbose:
+        print(f"[layout extract] Total lines extracted: {len(out)}", file=sys.stderr)
     return out
 
 
@@ -236,6 +482,8 @@ _RE_AS_LINE = re.compile(r"^(As|Translated as)\b", flags=re.IGNORECASE)
 
 _RE_FOOTNOTE_START = re.compile(r"^\s*\d+\.\s+")     # "4. ..."
 _RE_FOOTNOTE_LIKE = re.compile(r"^\s*\d+\.\s+\S")    # "4. X"
+# Pattern to detect if a line looks like a new entry (not indented, starts with capital or quote)
+_RE_ENTRY_START = re.compile(r'^[^\s]|^\s{0,10}[A-Z"""]')
 _RE_BARE_SMALL_INT_LINE = re.compile(r"^\s*\d{1,3}\s*$")
 
 # Regex segmentation entry-start candidates
@@ -398,8 +646,27 @@ def segment_entries_layout(
     if verbose:
         print(f"[layout] left_margin≈{left_margin:.2f}  threshold≈{threshold:.2f}  lines={len(usable)}")
 
+    # Patterns that indicate entry continuation (not a new entry)
+    # These can be indented (after footnotes) or at left margin
+    # Must be specific to avoid matching actual new entries
+    entry_continuation_patterns = [
+        r'^Pseudonyms\s+and\s+work\s+names:',  # "Pseudonyms and work names:"
+        r'^Cover\s+name\s+in\s+(Venona|Vassiliev)',  # "Cover name in Venona:" or "Cover name in Vassiliev's notebooks:"
+        r'^Cover\s+names\s+in\s+(Venona|Vassiliev)',  # "Cover names in Venona:"
+        r'^As\s+["""]?[A-Z]',  # "As Akhmerov:" or "As "Jung":"
+        r'^[A-Z][a-z]+\s+and\s+[A-Z][a-z]+',  # "Michael Green and Alexander Hansen" (both capitalized words)
+        r'^[A-Z][a-z]+,\s+[A-Z][a-z]+',  # "Michael Green, Alexander Hansen" (both capitalized words)
+        r'^["""][A-Z][a-z]+["""]',  # "Bill", "Will", "William" (quoted capitalized word)
+        r'^[A-Z][A-Z\s]+\[',  # "MAYOR [MER" - all caps with brackets
+    ]
+    entry_continuation_re = re.compile('|'.join(entry_continuation_patterns), re.IGNORECASE)
+    
     def is_layout_headword_line(ln: PdfLine) -> bool:
         return (ln.x0 <= threshold) and _looks_like_headword_text_layout(ln.text)
+    
+    def is_entry_continuation(ln: PdfLine) -> bool:
+        """Check if line looks like entry continuation (can be indented after footnotes)"""
+        return entry_continuation_re.match(ln.text.strip()) is not None
 
     blocks: List[List[str]] = []
     cur: List[str] = []
@@ -421,14 +688,26 @@ def segment_entries_layout(
             continue
 
         # While in footnotes, skip everything until a new headword begins
+        # BUT: if we see entry continuation patterns, exit footnote mode and treat as continuation
         if in_footnotes:
-            if is_layout_headword_line(ln):
+            if is_entry_continuation(ln):
+                # This is entry continuation after a footnote, exit footnote mode and continue with current entry
+                in_footnotes = False
+                # Don't treat as new headword, just add to current entry
+                if cur:
+                    cur.append(line)
+                else:
+                    # No current entry, start a new one (shouldn't happen, but handle gracefully)
+                    cur = [line]
+                continue
+            elif is_layout_headword_line(ln):
                 in_footnotes = False
             else:
                 continue
 
         # Normal entry handling
         if is_layout_headword_line(ln):
+            # This is a real new entry headword
             if cur:
                 blocks.append(cur)
             cur = [line]
@@ -470,8 +749,49 @@ def strip_outer_quotes(s: str) -> str:
     return s2
 
 
+def remove_question_marks(text: str) -> str:
+    """Remove question marks (uncertainty markers) from text."""
+    return text.replace("?", "").strip()
+
+
 def looks_like_person_head(head: str) -> bool:
-    return "," in head.strip()
+    """Check if text looks like a person name (comma-delimited or title case with space)."""
+    head = head.strip()
+    # Comma-delimited: "Last, First"
+    if "," in head:
+        return True
+    # Title case with space: "First Last" (2-4 words, all title case)
+    words = head.split()
+    if 2 <= len(words) <= 4:
+        if all(w and w[0].isupper() for w in words):
+            return True
+    return False
+
+
+def invert_comma_delimited_name(name: str) -> str:
+    """
+    Invert comma-delimited person name: "Rogov, Alexander" -> "Alexander Rogov"
+    Also handles question marks: "Kalinin, ?" -> "Kalinin"
+    """
+    name = name.strip()
+    if "," not in name:
+        return name
+    
+    parts = [p.strip() for p in name.split(",", 1)]
+    if len(parts) != 2:
+        return name
+    
+    last_name, first_part = parts[0], parts[1]
+    
+    # Remove question marks (uncertainty markers)
+    first_part = first_part.replace("?", "").strip()
+    
+    if not first_part:
+        # Just last name: "Kalinin, ?" -> "Kalinin"
+        return last_name
+    
+    # Invert: "Rogov, Alexander" -> "Alexander Rogov"
+    return f"{first_part} {last_name}".strip()
 
 
 def split_head_and_body(first_line: str) -> Tuple[str, str, str]:
@@ -527,25 +847,415 @@ def extract_head_synonyms(head_clean: str) -> List[str]:
     return [strip_outer_quotes(p.strip()) for p in parts if p.strip()]
 
 
-def infer_referent_from_body_start(body: str) -> Optional[str]:
+@dataclass
+class ParsedDefinition:
+    definition_text: str
+    definition_type: Optional[str] = None  # e.g., "expansion", "gloss", "description", "original", "translation"
+    notes: Optional[str] = None
+
+
+def extract_definitions_from_body(body_text: str, entity_type: str) -> Tuple[List[ParsedDefinition], str]:
+    """
+    Extract definition(s) from body text, returning definitions and the remainder for citation parsing.
+    
+    Rules:
+    - For colon entries, take the first sentence/clause as definition (unless it's "See ...", "Cover name ...", etc.)
+    - Handle bilingual definitions (split on em-dash/en-dash)
+    - Handle multiple definitions separated by semicolons/commas
+    - Return remainder text (after definitions) for citation parsing
+    
+    Returns:
+        (definitions_list, remainder_text)
+    """
+    definitions: List[ParsedDefinition] = []
+    remainder = body_text
+    
+    # Skip if body starts with cross-reference or other non-definition patterns
+    body_lower = body_text.strip().lower()
+    if body_lower.startswith(("see ", "cover name", "as ", "translated as")):
+        return definitions, remainder
+    
+    # Extract definition(s) - can span multiple sentences until we hit citation patterns
+    # Look for definition text that ends when we see:
+    # 1. Citation patterns like "Venona ..." or "Vassiliev ..." followed by document names and page numbers
+    # 2. "Cover name in Venona/Vassiliev:" patterns (these are structured covername sections, not definitions)
+    # 3. "As X:" patterns (these are scoped citation sections, not definitions)
+    
+    # Pattern: citation starts with "Venona" or "Vassiliev" followed by document name (like "USA Naval GRU", "Black Notebook")
+    # and then page numbers. This distinguishes citations from definitions that mention "Venona analysts" etc.
+    # Use regular string to avoid SyntaxWarning (Python sees \s as invalid escape in raw strings)
+    citation_start_pattern = '\\b(Venona|Vassiliev(?:[’'']s)?)\\s+[A-Z][^,]*,\\s*\\d'
+    
+    # Pattern: "Cover name in Venona/Vassiliev:" - these are structured sections, not definitions
+    covername_section_pattern = '\\bCover\\s+names?\\s+in\\s+(?:Venona|Vassiliev[’'']s?\\s+notebooks?)'
+    
+    # Pattern: "As X:" - these are scoped citation sections, not definitions
+    # Require "As" to be capitalized (not lowercase "as" which is a common word)
+    scoped_citation_pattern = '\\bAs\\s+["""""]?[^""""":]+["""""]?\\s*:'
+    
+    # Find where definition should end (earliest of: citation, covername section, or scoped citation)
+    citation_match = re.search(citation_start_pattern, body_text, re.IGNORECASE)
+    covername_match = re.search(covername_section_pattern, body_text, re.IGNORECASE)
+    scoped_match = re.search(scoped_citation_pattern, body_text, re.IGNORECASE)
+    
+    # Find the earliest match
+    end_positions = []
+    if citation_match:
+        end_positions.append(('citation', citation_match.start()))
+    if covername_match:
+        end_positions.append(('covername', covername_match.start()))
+    if scoped_match:
+        # Verify that "As" is capitalized OR lowercase "as" followed by uppercase word
+        scoped_pos = scoped_match.start()
+        scoped_text_at_pos = body_text[scoped_pos:scoped_pos+10]
+        # Accept if: "As " (capitalized) OR "as " followed by uppercase letter (e.g., "as UCN/25:")
+        if scoped_text_at_pos.startswith('As ') or (scoped_text_at_pos.startswith('as ') and len(scoped_text_at_pos) > 3 and scoped_text_at_pos[3].isupper()):
+            end_positions.append(('scoped', scoped_pos))
+    
+    if end_positions:
+        # Use the earliest position
+        end_positions.sort(key=lambda x: x[1])
+        end_type, end_pos = end_positions[0]
+        # Extract everything before the end marker as potential definition
+        definition_text = body_text[:end_pos].strip()
+        remainder = body_text[end_pos:].strip()
+    else:
+        # No clear citation pattern - try to extract first sentence(s) that look like definition
+        sentences = re.split(r'(\.\s+)', body_text)
+        definition_parts = []
+        for i in range(0, len(sentences), 2):  # sentences are at even indices
+            sentence = sentences[i] if i < len(sentences) else ""
+            if not sentence.strip():
+                continue
+            # Stop if sentence looks like a citation (Venona/Vassiliev + document name + page numbers)
+            if re.match('^(Venona|Vassiliev(?:[’'']s)?)\\s+[A-Z]', sentence.strip(), re.IGNORECASE):
+                # Check if it has page numbers (citation-like)
+                if re.search(',\\s*\\d', sentence):
+                    break
+            definition_parts.append(sentence)
+            if i + 1 < len(sentences):
+                definition_parts.append(sentences[i + 1])  # Add the period/space separator
+        
+        definition_text = ''.join(definition_parts).strip()
+        # Remainder is everything after the definition
+        if definition_text:
+            remainder = body_text[len(definition_text):].strip()
+        else:
+            remainder = body_text
+    
+    # Process definition_text if we found one
+    if definition_text:
+        # Check if this looks like a definition (not a citation)
+        if len(definition_text.split()) >= 2:
+            # Fix incomplete definitions that end mid-phrase
+            # If definition ends with "referred to" or "also referred to", try to extend it
+            definition_lower = definition_text.lower().strip()
+            if definition_lower.endswith(('referred to', 'also referred to', 'also referred')):
+                # Look for the complete phrase pattern: "referred to as X, Y, and Z"
+                extended_match = re.search(
+                    r'(?:also\s+)?referred\s+to\s+as\s+([^.]+)',
+                    body_text,
+                    re.IGNORECASE
+                )
+                if extended_match:
+                    # Extend definition to include the full "referred to as" phrase
+                    extended_end = extended_match.end()
+                    # Find the end of the phrase (period, semicolon, or start of next major clause)
+                    phrase_end_match = re.search(r'[.;]', body_text[extended_end:])
+                    if phrase_end_match:
+                        definition_text = body_text[:extended_end + phrase_end_match.start()].strip()
+                    else:
+                        # If no clear end, take up to the next sentence or citation
+                        next_sentence = re.search(r'\.\s+[A-Z]', body_text[extended_end:])
+                        if next_sentence:
+                            definition_text = body_text[:extended_end + next_sentence.start()].strip()
+                        else:
+                            definition_text = body_text[:extended_end].strip()
+            
+            # Check for bilingual definition (em-dash/en-dash separator)
+            dash_chars = r'[–—-]'
+            dash_pattern = rf'\s+{dash_chars}\s+'
+            
+            if re.search(dash_pattern, definition_text):
+                # Split into original and translation
+                parts = re.split(dash_pattern, definition_text, 1)
+                if len(parts) >= 2:
+                    original = parts[0].strip().rstrip('.').strip()
+                    translation = parts[1].strip().rstrip('.').strip()
+                    # Remove trailing parentheticals
+                    original = re.sub(r'\s*\([^)]*\)\s*$', '', original).strip()
+                    translation = re.sub(r'\s*\([^)]*\)\s*$', '', translation).strip()
+                    
+                    if original and len(original.split()) >= 2:
+                        definitions.append(ParsedDefinition(
+                            definition_text=original,
+                            definition_type="original",
+                            notes="Original language definition"
+                        ))
+                    if translation and len(translation.split()) >= 2:
+                        definitions.append(ParsedDefinition(
+                            definition_text=translation,
+                            definition_type="translation",
+                            notes="English translation"
+                        ))
+            else:
+                # Single definition (can be multi-sentence), remove trailing parentheticals
+                defn_clean = re.sub(r'\s*\([^)]*\)\s*$', '', definition_text).strip().rstrip('.').strip()
+                if defn_clean:
+                    definitions.append(ParsedDefinition(
+                        definition_text=defn_clean,
+                        definition_type="expansion",
+                        notes="Definitional expansion"
+                    ))
+    
+    return definitions, remainder
+
+
+def infer_referent_from_body_start(body: str, entry_key: Optional[str] = None) -> Optional[str]:
     b = body.strip()
     if not b:
         return None
     b_norm = _normalize_quotes(b)
-    first_sentence = b_norm.split(".", 1)[0].strip()
+    
+    # If entry_key is provided and body starts with it, extract name from entry_key instead
+    # This handles cases like entry_key="BARCH (cover name in Venona) Semen Kremer"
+    # and body="BARCH (cover name in Venona) Semen Kremer. Venona London GRU..."
+    if entry_key:
+        entry_key_norm = _normalize_quotes(entry_key.strip())
+        # Check if body starts with the entry key (possibly followed by period)
+        if b_norm.lower().startswith(entry_key_norm.lower()):
+            # Extract the name from the entry key by removing the cover name part
+            # Pattern: "COVERNAME (cover name in X) Person Name" -> extract "Person Name"
+            # Or: "COVERNAME Person Name" -> extract "Person Name"
+            key_parts = entry_key_norm.split(')', 1)
+            if len(key_parts) > 1:
+                # Has parenthetical, extract what comes after
+                name_part = key_parts[1].strip()
+                if name_part:
+                    # Recursively call to clean it up
+                    return infer_referent_from_body_start(name_part, entry_key=None)
+            # Try to extract name after cover name descriptor
+            name_match = re.search(r'\(cover name[^)]+\)\s+(.+)', entry_key_norm, flags=re.IGNORECASE)
+            if name_match:
+                name_part = name_match.group(1).strip()
+                if name_part:
+                    return infer_referent_from_body_start(name_part, entry_key=None)
+            # If no pattern matches, try to extract from body after entry key
+            remaining = b_norm[len(entry_key_norm):].strip()
+            remaining = re.sub(r'^[.\s]+', '', remaining)
+            if remaining:
+                b_norm = remaining
+            else:
+                # Body is just the entry key repeated, return None
+                return None
+    
+    # Find the first period that ends the name (not an abbreviation)
+    # Stop at the first period, handling abbreviations like "W." or "J."
+    # But be careful: "J. Robert Oppenheimer" has "J." as an abbreviation, but it's part of the name
+    first_sentence = ""
+    i = 0
+    while i < len(b_norm):
+        if b_norm[i] == '.':
+            # Check if this is an abbreviation (single letter before period)
+            is_abbreviation = False
+            if i > 0:
+                # Find the start of the word before this period
+                word_start = i - 1
+                while word_start > 0 and b_norm[word_start-1].isalpha():
+                    word_start -= 1
+                word_before_period = b_norm[word_start:i].strip()
+                # If it's a single letter, check if there's more text after
+                if len(word_before_period) == 1 and word_before_period.isalpha():
+                    # Check if there's a space and capital letter after (e.g., "J. Robert")
+                    if i + 2 < len(b_norm) and b_norm[i+1] == ' ' and b_norm[i+2].isupper():
+                        # It's an abbreviation that's part of a name - continue past it
+                        is_abbreviation = True
+                    else:
+                        # Period at end or followed by lowercase/space - likely sentence end
+                        # But if it's part of a pattern like "J. Robert Oppenheimer", we need to continue
+                        # Check if there are more words after (look for pattern like "X. Y Z")
+                        if i + 1 < len(b_norm) and b_norm[i+1] == ' ':
+                            # Look ahead to find the next word
+                            j = i + 2
+                            while j < len(b_norm) and (b_norm[j].isalpha() or b_norm[j] == '.'):
+                                if b_norm[j] == '.':
+                                    # Found another period - this is likely "J. Robert" pattern
+                                    is_abbreviation = True
+                                    break
+                                j += 1
+                            else:
+                                # No period found, check if there's a capital letter word
+                                if j > i + 2 and b_norm[i+2].isupper():
+                                    is_abbreviation = True
+                                else:
+                                    is_abbreviation = False
+                        else:
+                            is_abbreviation = False
+            
+            if not is_abbreviation:
+                # This is a real period - stop here
+                first_sentence = b_norm[:i].strip()
+                break
+        i += 1
+    
+    # Fallback: if we didn't find a period, take up to first period (even if abbreviation)
+    if not first_sentence:
+        first_sentence = b_norm.split(".", 1)[0].strip()
+    
     if not first_sentence:
         return None
 
-    bad_starts = (
-        "unidentified", "likely", "?", "described as", "initial", "abbreviation",
-        "refers to", "translated as", "see "
+    # Remove qualifiers from the beginning (likely, probably, etc.)
+    # Also handle quoted qualifiers like "Probably"
+    # Also handle "then" qualifier (e.g., "then "Meter"")
+    qualifiers = (
+        "likely", "probably", "possibly", "perhaps", "maybe", "unidentified", 
+        "?", "described as", "initial", "abbreviation", "refers to", 
+        "translated as", "see ", "then"
     )
-    if first_sentence.lower().startswith(bad_starts):
+    first_sentence_lower = first_sentence.lower()
+    
+    # Remove quoted qualifiers first (e.g., "Probably" or "Likely")
+    first_sentence = re.sub(r'^["""](probably|likely|possibly|perhaps|maybe)["""]\s+', '', first_sentence, flags=re.IGNORECASE)
+    
+    # Remove "then" qualifier (can be before quotes or unquoted)
+    # Handle "then "Name"" -> extract just "Name" (stop at closing quote)
+    # Also handle "then "Name" [bracket]" -> extract just "Name"
+    # Use a more specific pattern that handles the full quoted string
+    then_quoted_match = re.match(r'^then\s+["""]([^"""]+)["""]', first_sentence, flags=re.IGNORECASE)
+    if then_quoted_match:
+        # Extract the quoted name
+        quoted_name = then_quoted_match.group(1).strip()
+        # Check if there are brackets after the quote
+        remaining_after_match = first_sentence[then_quoted_match.end():].strip()
+        # If there are brackets, we've already extracted the name, so use it
+        first_sentence = quoted_name
+    else:
+        # Handle "then NAME" (unquoted) or "then NAME [BRACKET]"
+        # Remove "then" and extract the name part
+        first_sentence = re.sub(r'^then\s+', '', first_sentence, flags=re.IGNORECASE)
+        # If there are brackets, extract just the part before brackets
+        bracket_pos = first_sentence.find('[')
+        if bracket_pos > 0:
+            first_sentence = first_sentence[:bracket_pos].strip()
+        first_sentence = strip_outer_quotes(first_sentence)
+    
+    # Then remove unquoted qualifiers
+    for qualifier in qualifiers:
+        if first_sentence_lower.startswith(qualifier):
+            # Remove the qualifier and any following comma/colon
+            remaining = first_sentence[len(qualifier):].strip()
+            remaining = re.sub(r'^[,:\s]+', '', remaining)
+            if remaining:
+                first_sentence = remaining
+            else:
+                return None
+            break
+    
+    # Remove any remaining quotes around the name
+    first_sentence = strip_outer_quotes(first_sentence)
+    
+    # Fix incomplete quotes (e.g., """Glan" -> "Glan")
+    first_sentence = re.sub(r'^["""]+([^"""]+)["""]*$', r'\1', first_sentence)
+    
+    if not first_sentence:
         return None
+    
+    # Handle patterns like "X was identified as Y" or "X was possibly Y" or "judged that X was Y"
+    # Extract the name after "was" or "was possibly" or similar
+    was_patterns = [
+        r'judged\s+that\s+\w+\s+was\s+["""]?(possibly|probably|likely)?["""]?\s+([^.]+?)(?:\.|$)',
+        r'was\s+(?:identified\s+as|possibly|probably|likely)\s+["""]?([^.]+?)(?:\.|$)',
+        r'was\s+["""]?(possibly|probably|likely)["""]?\s+([^.]+?)(?:\.|$)',
+    ]
+    for pattern in was_patterns:
+        match = re.search(pattern, first_sentence, flags=re.IGNORECASE)
+        if match:
+            # Get the last non-empty group (the name)
+            for i in range(match.lastindex, 0, -1):
+                name = match.group(i)
+                if name and name.strip():
+                    name = name.strip()
+                    name = strip_outer_quotes(name)
+                    if name:
+                        first_sentence = name
+                        break
+            if first_sentence != name:  # If we found a match and updated
+                break
+    
+    # If the result starts with "unidentified" or other descriptive text, return None
+    # (we don't want to create entities for "Unidentified Soviet intelligence source/agent")
+    descriptive_starts = (
+        "unidentified", "described as", "error for", "soviet intelligence source/agent",
+        "soviet intelligence source", "intelligence source/agent", "intelligence source",
+        "cover name", "likely", "probably", "possibly", "analysts", "judged", "was identified",
+        "venona", "vassiliev", "notebook"
+    )
+    first_sentence_lower = first_sentence.lower()
+    if any(first_sentence_lower.startswith(desc) for desc in descriptive_starts):
+        return None
+    
+    # Handle citation text at the start (e.g., "133–34; Vassiliev Yellow Notebook...")
+    # If it starts with numbers or citation patterns, it's likely not a name
+    if re.match(r'^\d+[–-]\d+', first_sentence) or re.match(r'^\d+[–-]\d+;\s+Vassiliev', first_sentence):
+        return None
+    
+    # Clean up: remove any trailing parentheticals or explanatory text
+    # Stop at opening parenthesis if it appears early (likely explanatory)
+    paren_pos = first_sentence.find('(')
+    if paren_pos > 0 and paren_pos < len(first_sentence) * 0.5:  # Parenthesis in first half
+        first_sentence = first_sentence[:paren_pos].strip()
+    
+    if not first_sentence:
+        return None
+    
+    # If the result is a comma-delimited name that looks like a person, invert it
+    # "Beigel, Rose" -> "Rose Beigel"
+    if looks_like_person_head(first_sentence):
+        first_sentence = invert_comma_delimited_name(first_sentence)
+
+    # Handle comma-separated descriptions
+    # If there's a comma, check if the part after is descriptive text (not a name)
+    # Patterns like: "Unidentified Soviet intelligence source/agent, cover name..." -> stop at comma
+    # Also handle: "Beigel, Rose. Also know as Rose Arenal, wife of Luis Arenal."
+    if "," in first_sentence:
+        parts = first_sentence.split(",", 1)
+        if len(parts) == 2:
+            first_part = parts[0].strip()
+            second_part = parts[1].strip()
+            
+            # Check if second part is a temporal qualifier (starts with circa, prior to, after, etc.)
+            temporal_pattern = r'^(circa|prior to|after|before|from|until|since|in|during)\s+\d'
+            if re.match(temporal_pattern, second_part, flags=re.IGNORECASE):
+                first_sentence = first_part
+            # Check if first part is descriptive text (unidentified, described as, etc.)
+            # If so, return None - we don't want descriptive text as a referent
+            descriptive_starts = (
+                "unidentified", "described as", "likely", "probably", "possibly",
+                "soviet intelligence source/agent", "soviet intelligence source",
+                "intelligence source/agent", "intelligence source", "error for"
+            )
+            if any(first_part.lower().startswith(desc) for desc in descriptive_starts):
+                return None
+            # Check if second part is descriptive text (cover name, source/agent, etc.)
+            elif any(desc in second_part.lower() for desc in ("cover name", "source/agent", "intelligence", "described as")):
+                # Stop at the comma - the name is in the first part
+                first_sentence = first_part
+            # Handle patterns like "Beigel, Rose. Also know as Rose Arenal, wife of..."
+            # Extract just the name part before "Also know as" or similar
+            elif re.search(r'\b(also\s+know\s+as|also\s+called|wife\s+of|husband\s+of)', second_part, flags=re.IGNORECASE):
+                # The name is in the first part, but might need to be inverted
+                first_sentence = first_part
+            else:
+                # Not clearly descriptive, keep the comma-separated form
+                first_sentence = first_sentence
 
     # Trim temporal qualifiers: "Jack Soble prior to ..." -> "Jack Soble"
+    # Handle "in mid- and late 1930s" pattern
+    first_sentence = re.sub(r'\s+in\s+mid-\s+and\s+late\s+\d{4}s', '', first_sentence, flags=re.IGNORECASE).strip()
+    
     first_sentence = re.split(
-        r"\b(prior to|after|before|from|until|since)\b",
+        r"\b(prior to|after|before|from|until|since|in mid- and late)\b",
         first_sentence,
         flags=re.IGNORECASE
     )[0].strip()
@@ -602,6 +1312,11 @@ def parse_citation_chunks(text: str) -> List[str]:
         if not p:
             continue
         p_norm = p.lstrip()
+        # Skip narrative text that doesn't look like citations
+        # Reject chunks that are clearly narrative (e.g., "as the anglicized version...")
+        if p_norm.lower().startswith(('as the ', 'as a ', 'as an ')):
+            # Likely narrative text, not a citation
+            continue
         if _looks_like_citationish(p_norm):
             chunks.append(p_norm)
     return chunks
@@ -673,6 +1388,7 @@ class ParsedEntry:
     aliases: List[ParsedAlias] = field(default_factory=list)
     links: List[ParsedLink] = field(default_factory=list)
     citations: List[ParsedCitation] = field(default_factory=list)
+    definitions: List[ParsedDefinition] = field(default_factory=list)  # Structured definitions, not aliases
     is_crossref_only: bool = False
     crossref_target: Optional[str] = None
 
@@ -770,6 +1486,9 @@ def parse_entry_block(block: str, entry_seq: int) -> ParsedEntry:
     entity_type = classify_entity_type(entry_key, body_joined)
 
     head_no_desc = remove_trailing_descriptor_paren(head_raw_norm).strip()
+    
+    # Remove question marks from headword (uncertainty markers)
+    head_no_desc = remove_question_marks(head_no_desc)
 
     quoted = extract_quoted_strings(head_no_desc)
     bracket_tokens = extract_bracket_tokens(head_no_desc)
@@ -786,22 +1505,52 @@ def parse_entry_block(block: str, entry_seq: int) -> ParsedEntry:
     canonical = canonical.strip()
     if delim == ".":
         canonical = canonical.rstrip(".").strip()
+    
+    # Remove question marks from canonical name
+    canonical = remove_question_marks(canonical)
+    
+    # Remove parenthetical qualifiers from canonical name (e.g., "Amtorg (AMTORG)" -> "Amtorg")
+    # But only if it's a simple parenthetical at the end, not part of the name structure
+    canonical = re.sub(r'\s*\([^)]*\)\s*$', '', canonical).strip()
+    
+    # Invert comma-delimited person names: "Rogov, Alexander" -> "Alexander Rogov"
+    if entity_type == "person" and looks_like_person_head(canonical):
+        canonical = invert_comma_delimited_name(canonical)
 
     # Crossref-only entries: "X: See Y."
     if is_crossref:
         m = re.match(r'^see\s+["“]?([^".;]+)["”]?', _normalize_quotes(body_first).strip(), flags=re.IGNORECASE)
         if m:
             crossref_target = m.group(1).strip()
+            # Clean the crossref_target (remove trailing period, normalize quotes)
+            crossref_target = crossref_target.rstrip(".").strip()
+            crossref_target = strip_outer_quotes(crossref_target)
+        
+        # Clean entry_key for crossref entries (remove brackets, normalize quotes)
+        # entry_key should be the canonical form, not including brackets
+        cleaned_entry_key = canonical if canonical else entry_key
+        cleaned_entry_key = strip_outer_quotes(cleaned_entry_key)
+        
         pe = ParsedEntry(
-            entry_key=entry_key,
+            entry_key=cleaned_entry_key,
             entry_seq=entry_seq,
             raw_text=raw_text,
-            entity_canonical=canonical if canonical else entry_key,
+            entity_canonical=canonical if canonical else cleaned_entry_key,
             entity_type=entity_type,
             is_crossref_only=True,
             crossref_target=crossref_target,
         )
-        pe.aliases.append(ParsedAlias(alias=entry_key, alias_type="see"))
+        # Add canonical as alias
+        if canonical:
+            pe.aliases.append(ParsedAlias(alias=canonical, alias_type="canonical"))
+        # Add bracket variants as aliases
+        for bt in bracket_tokens:
+            bt2 = bt.strip()
+            bt2 = remove_question_marks(bt2)
+            if bt2 and bt2.lower() != pe.entity_canonical.lower():
+                pe.aliases.append(ParsedAlias(alias=bt2, alias_type="bracket_variant"))
+        # Add the cleaned entry_key as a "see" alias pointing to the crossref target
+        pe.aliases.append(ParsedAlias(alias=cleaned_entry_key, alias_type="see"))
         return pe
 
     pe = ParsedEntry(
@@ -812,13 +1561,35 @@ def parse_entry_block(block: str, entry_seq: int) -> ParsedEntry:
         entity_type=entity_type,
     )
 
+    # Extract definitions BEFORE parsing citations
+    # This prevents definitions from being mixed into citations
+    body_norm = _normalize_quotes(body_joined)
+    pe.definitions, body_after_definitions = extract_definitions_from_body(body_norm, entity_type)
+    
+    # Use body_after_definitions for citation parsing (not the original body)
+    # This ensures citations are clean and don't include definition text
+
     # Canonical alias
     if pe.entity_canonical:
         pe.aliases.append(ParsedAlias(alias=pe.entity_canonical, alias_type="canonical"))
+    
+    # For person entities: also add the original comma-delimited form as alias
+    if entity_type == "person" and looks_like_person_head(head_no_desc):
+        original_form = re.sub(r"\[[^\]]*\]", "", head_no_desc).strip()
+        original_form = strip_outer_quotes(original_form)
+        original_form = remove_question_marks(original_form)
+        if delim == ".":
+            original_form = original_form.rstrip(".").strip()
+        # Clean up trailing commas
+        original_form = original_form.rstrip(",").strip()
+        if original_form and original_form.lower() != pe.entity_canonical.lower():
+            pe.aliases.append(ParsedAlias(alias=original_form, alias_type="original_form"))
 
     # Head synonyms
     for syn in head_syns:
         syn2 = syn.strip()
+        # Remove question marks
+        syn2 = remove_question_marks(syn2)
         if delim == ".":
             syn2 = syn2.rstrip(".").strip()
         if syn2 and syn2.lower() != pe.entity_canonical.lower():
@@ -827,6 +1598,8 @@ def parse_entry_block(block: str, entry_seq: int) -> ParsedEntry:
     # Bracket variants (you said you trust these)
     for bt in bracket_tokens:
         bt2 = bt.strip()
+        # Remove question marks
+        bt2 = remove_question_marks(bt2)
         if delim == ".":
             bt2 = bt2.rstrip(".").strip()
         if bt2 and bt2.lower() != pe.entity_canonical.lower():
@@ -835,6 +1608,8 @@ def parse_entry_block(block: str, entry_seq: int) -> ParsedEntry:
     # Additional quoted variants
     for q in quoted[1:]:
         q2 = strip_outer_quotes(q.strip())
+        # Remove question marks
+        q2 = remove_question_marks(q2)
         if delim == ".":
             q2 = q2.rstrip(".").strip()
         if q2 and q2.lower() != pe.entity_canonical.lower():
@@ -867,22 +1642,281 @@ def parse_entry_block(block: str, entry_seq: int) -> ParsedEntry:
         sp = m.group(1).strip()
         if sp:
             pe.aliases.append(ParsedAlias(alias=sp, alias_type="spelling_variant", notes="Name spelled in texts"))
+    
+    # Body: "Also referred to as X, Y, and Z" or "referred to as X, Y, and Z"
+    # Extract individual aliases from comma/and-separated lists
+    referred_to_pattern = r'(?:also\s+)?referred\s+to\s+as\s+([^.;]+)'
+    for m in re.finditer(referred_to_pattern, body_joined, re.IGNORECASE):
+        aliases_text = m.group(1).strip()
+        # Split on commas and "and"
+        # Handle patterns like "StateD, SD, and DOS" or "X, Y, and Z"
+        parts = re.split(r',\s*(?:and\s+)?', aliases_text)
+        for part in parts:
+            part = part.strip()
+            # Remove trailing "and" if present
+            part = re.sub(r'\s+and\s*$', '', part, flags=re.IGNORECASE).strip()
+            if part:
+                # Clean up the alias
+                part = strip_outer_quotes(part)
+                part = remove_question_marks(part)
+                if part and part.lower() != pe.entity_canonical.lower():
+                    # Check if this alias is already in the list
+                    if not any(a.alias.lower() == part.lower() for a in pe.aliases):
+                        pe.aliases.append(ParsedAlias(
+                            alias=part,
+                            alias_type="definition",
+                            confidence="certain",
+                            notes="Also referred to as"
+                        ))
 
-    # Body: cover name in Venona/Vassiliev mentioned inside person/topic entry
+    # Body: cover name(s) in Venona/Vassiliev mentioned inside person/topic entry
+    # Handle both "Cover name" (singular) and "Cover names" (plural)
+    # Also handle multiple names like "ARNOLD [ARNOL'D] and FAKIR" or comma-separated lists
     for m in re.finditer(
-        r"Cover\s+name\s+in\s+(Venona|Vassiliev[’']s notebooks)\s*:\s*([\"“]?)([^\"”.;,]+)\2",
+        r"Cover\s+names?\s+in\s+(Venona|Vassiliev[’']s notebooks)\s*:\s*([^.;]+?)(?:\.|;|$)",
         _normalize_quotes(body_joined),
         flags=re.IGNORECASE
     ):
-        cn = m.group(3).strip()
-        if cn:
-            pe.links.append(ParsedLink(
-                link_type="cover_name_of",
-                from_name=cn,
-                to_name=pe.entity_canonical,
-                confidence="certain",
-                notes=f"Cover name in {m.group(1)}"
-            ))
+        names_text = m.group(2).strip()
+        source_type = m.group(1)
+        
+        # Normalize whitespace (replace newlines with spaces) before splitting
+        # This ensures comma splitting works correctly even if text has line breaks
+        names_text = re.sub(r'\s+', ' ', names_text).strip()
+        
+        # Extract individual names from the text
+        # Handle patterns like:
+        # - "ARNOLD [ARNOL'D] and FAKIR" (split on "and")
+        # - "Jung" ["Yung"] (1930s), "Mer" (1942–1944), "Albert" (starting August 1944), and "Gold" (comma-separated)
+        # - "MAYOR [MER and MĒR]" (comma inside brackets should NOT split)
+        # Split on commas, but NOT inside brackets or quotes
+        comma_parts = []
+        current = []
+        bracket_depth = 0
+        quote_char = None
+        
+        i = 0
+        while i < len(names_text):
+            char = names_text[i]
+            
+            # Track quotes (handle both straight and curly quotes)
+            if char in '"""' and (i == 0 or names_text[i-1] != '\\'):
+                if quote_char is None:
+                    quote_char = char
+                elif char == quote_char:
+                    quote_char = None
+            # Track brackets (only when not in quotes)
+            elif quote_char is None:
+                if char == '[':
+                    bracket_depth += 1
+                elif char == ']':
+                    bracket_depth -= 1
+                elif char == ',' and bracket_depth == 0:
+                    # This comma is outside brackets/quotes, safe to split
+                    part = ''.join(current).strip()
+                    if part:
+                        comma_parts.append(part)
+                    current = []
+                    i += 1
+                    continue
+            
+            current.append(char)
+            i += 1
+        
+        # Add the last part
+        if current:
+            part = ''.join(current).strip()
+            if part:
+                comma_parts.append(part)
+        
+        # If no commas, try splitting on "and" instead, but NOT inside brackets
+        if len(comma_parts) == 1:
+            # Split on "and" but not inside brackets
+            name_parts = []
+            current = []
+            bracket_depth = 0
+            quote_char = None
+            
+            i = 0
+            text = names_text
+            while i < len(text):
+                char = text[i]
+                
+                # Track quotes
+                if char in '"""' and (i == 0 or text[i-1] != '\\'):
+                    if quote_char is None:
+                        quote_char = char
+                    elif char == quote_char:
+                        quote_char = None
+                # Track brackets (only when not in quotes)
+                elif quote_char is None:
+                    if char == '[':
+                        bracket_depth += 1
+                    elif char == ']':
+                        bracket_depth -= 1
+                    elif bracket_depth == 0:
+                        # Check if this is "and" (case insensitive, with word boundaries)
+                        if i < len(text) - 3:
+                            remaining = text[i:]
+                            match = re.match(r'\s+and\s+', remaining, flags=re.IGNORECASE)
+                            if match:
+                                part = ''.join(current).strip()
+                                if part:
+                                    name_parts.append(part)
+                                current = []
+                                # Skip the "and"
+                                i += len(match.group(0))
+                                continue
+                
+                current.append(char)
+                i += 1
+            
+            if current:
+                part = ''.join(current).strip()
+                if part:
+                    name_parts.append(part)
+        else:
+            name_parts = []
+            for part in comma_parts:
+                part = part.strip()
+                # Remove "and" from beginning or end if present (handle with or without surrounding whitespace)
+                part = re.sub(r'^(and\s+)|(\s+and\s*)$', '', part, flags=re.IGNORECASE).strip()
+                if part:
+                    name_parts.append(part)
+        
+        for name_part in name_parts:
+            name_part = name_part.strip()
+            if not name_part:
+                continue
+            
+            # Strip parenthetical qualifiers first
+            # Handle patterns like: "(prior to 1941)", "(1941–1945)", "(1930s)", "(AMTORG)"
+            name_part = re.sub(r'\s*\([^)]*\)\s*$', '', name_part).strip()
+            # Strip temporal qualifiers like "in 1954", "in May 1944", "starting August 1944"
+            # These can appear at the end of the name part
+            name_part = re.sub(r'\s+(?:in|starting|from|until|during)\s+\d{4}(?:\s+\d{1,2})?\s*$', '', name_part, flags=re.IGNORECASE).strip()
+            name_part = re.sub(r'\s+(?:in|starting|from|until|during)\s+[A-Z][a-z]+\s+\d{4}\s*$', '', name_part, flags=re.IGNORECASE).strip()
+            # Also handle "in 1954" pattern (simpler version)
+            name_part = re.sub(r'\s+in\s+\d{4}\s*$', '', name_part, flags=re.IGNORECASE).strip()
+            
+            # Extract the main name (before brackets if present)
+            # Pattern: "ARNOLD [ARNOL'D]" -> extract "ARNOLD" and "ARNOL'D"
+            # Pattern: "MAYOR [MER and MĒR]" -> extract "MAYOR" and handle "MER and MĒR"
+            # Normalize whitespace (replace newlines with spaces) to handle line breaks
+            name_part_normalized = re.sub(r'\s+', ' ', name_part).strip()
+            
+            # First, try to extract bracket content using a more robust method
+            bracket_start = name_part_normalized.find('[')
+            bracket_end = name_part_normalized.find(']', bracket_start) if bracket_start >= 0 else -1
+            
+            # Handle incomplete brackets (e.g., "DEPARTMENT [OTDEL" without closing bracket)
+            if bracket_start >= 0 and bracket_end == -1:
+                # Incomplete bracket - just extract the part before the bracket
+                main_name = name_part_normalized[:bracket_start].strip()
+                main_name = strip_outer_quotes(main_name)
+                main_name = re.sub(r'\s*\([^)]*\)\s*$', '', main_name).strip()
+                if main_name:
+                    if not any(a.alias.lower() == main_name.lower() for a in pe.aliases):
+                        pe.aliases.append(ParsedAlias(
+                            alias=main_name,
+                            alias_type="covername_from_body",
+                            confidence="certain",
+                            notes=f"Cover name in {source_type}"
+                        ))
+                    pe.links.append(ParsedLink(
+                        link_type="cover_name_of",
+                        from_name=main_name,
+                        to_name=pe.entity_canonical,
+                        confidence="certain",
+                        notes=f"Cover name in {source_type}"
+                    ))
+            elif bracket_start >= 0 and bracket_end > bracket_start:
+                # We have brackets - extract main name and bracket content
+                main_name = name_part_normalized[:bracket_start].strip()
+                bracket_content = name_part_normalized[bracket_start+1:bracket_end].strip()
+                
+                # Clean main name (remove quotes, parentheticals)
+                main_name = strip_outer_quotes(main_name)
+                main_name = re.sub(r'\s*\([^)]*\)\s*$', '', main_name).strip()
+                
+                # Additional safety: if main_name still contains brackets or parentheticals, extract just the quoted part
+                if '[' in main_name or '(' in main_name:
+                    quoted_match = re.search(r'["""]([^"""]+)["""]', main_name)
+                    if quoted_match:
+                        main_name = quoted_match.group(1).strip()
+                
+                if main_name:
+                    # Add as alias
+                    if not any(a.alias.lower() == main_name.lower() for a in pe.aliases):
+                        pe.aliases.append(ParsedAlias(
+                            alias=main_name,
+                            alias_type="covername_from_body",
+                            confidence="certain",
+                            notes=f"Cover name in {source_type}"
+                        ))
+                    # Add link
+                    pe.links.append(ParsedLink(
+                        link_type="cover_name_of",
+                        from_name=main_name,
+                        to_name=pe.entity_canonical,
+                        confidence="certain",
+                        notes=f"Cover name in {source_type}"
+                    ))
+                
+                # Handle bracket content - it might contain "and" (e.g., "MER and MĒR")
+                if bracket_content:
+                    bracket_content = strip_outer_quotes(bracket_content)
+                    # Split on "and" if present, but be careful not to split quoted parts
+                    if ' and ' in bracket_content.lower():
+                        bracket_parts = re.split(r'\s+and\s+', bracket_content, flags=re.IGNORECASE)
+                        for bp in bracket_parts:
+                            bp = strip_outer_quotes(bp.strip())
+                            if bp and not any(a.alias.lower() == bp.lower() for a in pe.aliases):
+                                pe.aliases.append(ParsedAlias(
+                                    alias=bp,
+                                    alias_type="covername_from_body",
+                                    confidence="certain",
+                                    notes=f"Cover name variant in {source_type}"
+                                ))
+                    else:
+                        # Single bracket variant
+                        if bracket_content and not any(a.alias.lower() == bracket_content.lower() for a in pe.aliases):
+                            pe.aliases.append(ParsedAlias(
+                                alias=bracket_content,
+                                alias_type="covername_from_body",
+                                confidence="certain",
+                                notes=f"Cover name variant in {source_type}"
+                            ))
+            else:
+                # No brackets, just a simple name
+                # Use regex match as fallback
+                bracket_match = re.match(r'^(?:["""]([^"""]+)["""]|([^\[\]]+?))\s*$', name_part_normalized)
+                if bracket_match:
+                    name = (bracket_match.group(1) or bracket_match.group(2) or "").strip()
+                    name = strip_outer_quotes(name)
+                    # Additional safety: if name still contains brackets or parentheticals, extract just the quoted part
+                    if '[' in name or '(' in name:
+                        quoted_match = re.search(r'["""]([^"""]+)["""]', name)
+                        if quoted_match:
+                            name = quoted_match.group(1).strip()
+                    
+                    if name:
+                        # Add as alias
+                        if not any(a.alias.lower() == name.lower() for a in pe.aliases):
+                            pe.aliases.append(ParsedAlias(
+                                alias=name,
+                                alias_type="covername_from_body",
+                                confidence="certain",
+                                notes=f"Cover name in {source_type}"
+                            ))
+                        # Add link
+                        pe.links.append(ParsedLink(
+                            link_type="cover_name_of",
+                            from_name=name,
+                            to_name=pe.entity_canonical,
+                            confidence="certain",
+                            notes=f"Cover name in {source_type}"
+                        ))
 
     # Body: changed to
     mchg = re.search(r"\b([A-Z0-9][A-Z0-9'\-]+)\s+was changed to\s+([A-Z0-9][A-Z0-9'\-]+)\b", body_joined)
@@ -898,48 +1932,179 @@ def parse_entry_block(block: str, entry_seq: int) -> ParsedEntry:
 
     # If entry is a cover_name, infer referent from body start (conservative)
     if pe.entity_type == "cover_name":
-        referent = infer_referent_from_body_start(body_first + " " + "\n".join(rest_lines))
+        referent = infer_referent_from_body_start(body_first + " " + "\n".join(rest_lines), entry_key=pe.entry_key)
         if referent:
-            pe.links.append(ParsedLink(
-                link_type="cover_name_of",
-                from_name=pe.entity_canonical,
-                to_name=referent,
-                confidence="certain",
-                notes="Cover name referent from entry header"
-            ))
+            # Remove question marks from referent
+            referent = remove_question_marks(referent)
+            # Check if referent looks like a person name
+            if looks_like_person_head(referent):
+                # Invert if comma-delimited
+                referent = invert_comma_delimited_name(referent)
+                
+                # INVERT: The referent (person) should be the entity, not the cover name
+                # Make the cover name(s) aliases of the person entity
+                old_canonical = pe.entity_canonical
+                old_aliases = pe.aliases.copy()
+                
+                # Change entity to the person (referent)
+                pe.entity_canonical = referent
+                pe.entity_type = "person"
+                
+                # Clear existing aliases and rebuild
+                pe.aliases = []
+                pe.aliases.append(ParsedAlias(alias=referent, alias_type="canonical"))
+                
+                # Add the cover name(s) as aliases
+                pe.aliases.append(ParsedAlias(alias=old_canonical, alias_type="cover_name", confidence="certain", notes="Cover name from entry headword"))
+                
+                # Add bracket variants as cover name aliases
+                for old_alias in old_aliases:
+                    if old_alias.alias_type == "bracket_variant":
+                        pe.aliases.append(ParsedAlias(
+                            alias=old_alias.alias,
+                            alias_type="cover_name",
+                            confidence=old_alias.confidence,
+                            notes="Cover name variant from entry headword"
+                        ))
+                
+                # Add link: cover name -> person (but now person is the entity)
+                pe.links.append(ParsedLink(
+                    link_type="cover_name_of",
+                    from_name=old_canonical,
+                    to_name=referent,
+                    confidence="certain",
+                    notes="Cover name referent from entry header"
+                ))
+            else:
+                # Referent doesn't look like a person, keep original structure
+                pe.links.append(ParsedLink(
+                    link_type="cover_name_of",
+                    from_name=pe.entity_canonical,
+                    to_name=referent,
+                    confidence="certain",
+                    notes="Cover name referent from entry header"
+                ))
 
     # Scoped citation sections: As "X": ... / Translated as X: ...
     scoped_spans: List[Tuple[int, int]] = []
     scoped_pat = re.compile(r'\b(As|Translated as)\s+["“]?([^"”:]+)["”]?\s*:', flags=re.IGNORECASE)
 
-    body_norm = _normalize_quotes(body_joined)
-    matches = list(scoped_pat.finditer(body_norm))
+    matches = list(scoped_pat.finditer(body_after_definitions))
     for i, m in enumerate(matches):
+        # Check that "As" is capitalized OR lowercase "as" followed by uppercase word
+        # The pattern matches "As" or "Translated as", but we need to filter out lowercase "as"
+        # unless it's followed by an uppercase word (e.g., "as UCN/25:")
+        match_start = body_after_definitions[m.start():m.start()+10]
+        if match_start.lower().startswith('as ') and not match_start.startswith('As '):
+            # Check if lowercase "as" is followed by uppercase letter (e.g., "as UCN/25:")
+            if len(match_start) > 3 and not match_start[3].isupper():
+                # Skip lowercase "as" matches that aren't followed by uppercase (common word, not a citation marker)
+                continue
         label = m.group(2).strip()
         start = m.end()
-        end = matches[i + 1].start() if i + 1 < len(matches) else len(body_norm)
-        scoped_text = body_norm[start:end].strip()
-        scoped_spans.append((m.start(), end))
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(body_after_definitions)
+        scoped_text = body_after_definitions[start:end].strip()
+        
+        # Don't add to spans yet - we'll only add if it passes validation
+        # scoped_spans.append((m.start(), end))
 
         if label:
-            pe.aliases.append(ParsedAlias(alias=label, alias_type="scoped_label"))
+            # Validate that this is actually a scoped citation, not narrative text
+            # Two checks:
+            # 1. The label should look like a name/alias (not a descriptive phrase like "the anglicized")
+            # 2. The text after "As X:" should be citation-like (Venona/Vassiliev + document + page numbers)
+            
+            # Check 1: Label should be a name-like string, not a descriptive phrase
+            # Reject common descriptive phrases that appear in narrative
+            # Check BEFORE truncation to catch phrases like "the anglicized version of their"
+            label_lower_original = label.lower().strip()
+            descriptive_phrases = {
+                'the anglicized', 'the anglicized version', 'the version', 'the form',
+                'the name', 'the surname', 'the cover name', 'the real name'
+            }
+            # Check if it starts with descriptive article or is in our list
+            if (label_lower_original in descriptive_phrases or 
+                label_lower_original.startswith(('the ', 'a ', 'an '))):
+                # Likely narrative text, not a citation marker - skip this match
+                continue
+            
+            # Check 2: Scoped citations should be followed by citation-like text
+            looks_like_citation = False
+            if scoped_text:
+                # Check if scoped_text contains citation patterns (Venona/Vassiliev + document + page numbers)
+                # This is more flexible than requiring it at the start
+                # Pattern: Venona/Vassiliev + capital letter + comma + digit (page number)
+                citation_check = re.search('\\b(Venona|Vassiliev(?:[’'']s)?)\\s+[A-Z][^,]*,\\s*\\d', scoped_text, re.IGNORECASE)
+                if citation_check:
+                    looks_like_citation = True
+                # Also check for simpler patterns (just Venona/Vassiliev + comma + digit)
+                elif re.search('\\b(Venona|Vassiliev(?:[’'']s)?)[^,]*,\\s*\\d', scoped_text, re.IGNORECASE):
+                    looks_like_citation = True
+                # Pattern 3: Very lenient - just check if it mentions Venona/Vassiliev and has page numbers
+                elif (re.search('\\b(Venona|Vassiliev(?:[’'']s)?)', scoped_text, re.IGNORECASE) and 
+                      re.search(',\\s*\\d', scoped_text)):
+                    looks_like_citation = True
+            
+            # Only process if it looks like a real scoped citation
+            if not looks_like_citation:
+                continue  # Skip this match - it's narrative text, not a citation marker
+            
+            # Add to spans only after validation passes
+            scoped_spans.append((m.start(), end))
+            
+            # Clean up label - it should be just the name, not a whole sentence
+            # If label contains periods or commas (indicating it captured too much), truncate at first punctuation
+            if '.' in label:
+                # Likely captured too much - take first part before period
+                label = label.split('.')[0].strip()
+            # Remove trailing commas
+            label = label.rstrip(',').strip()
+            # Remove question marks
+            label = remove_question_marks(label)
+            
+            # Limit to reasonable length for names (but allow codes like "UCN/25")
+            # Scoped labels are typically short names (1-3 words) or codes
+            words = label.split()
+            if len(words) > 3:
+                # Take first 2 words as the label (most names are 1-2 words)
+                label = ' '.join(words[:2]).strip()
+            
+            # If label contains brackets like "LIGHT [SVET]", extract both parts separately
+            bracket_match = re.search(r'^(.+?)\s*\[([^\]]+)\]$', label)
+            if bracket_match:
+                main_name = bracket_match.group(1).strip()
+                bracket_name = bracket_match.group(2).strip()
+                # Add main name as scoped label
+                pe.aliases.append(ParsedAlias(alias=main_name, alias_type="scoped_label"))
+                # Add bracket content as separate alias (covername variant)
+                if bracket_name and len(bracket_name) >= 2:
+                    pe.aliases.append(ParsedAlias(
+                        alias=bracket_name,
+                        alias_type="covername_from_body",
+                        confidence="certain",
+                        notes="Bracket variant from scoped citation"
+                    ))
+            else:
+                pe.aliases.append(ParsedAlias(alias=label, alias_type="scoped_label"))
 
-        for chunk in parse_citation_chunks(scoped_text):
-            pe.citations.append(ParsedCitation(
-                citation_text=chunk,
-                alias_label=label,
-                notes=f"{m.group(1).title()} {label}"
-            ))
+            # Only add citations if we have a valid label (validation passed)
+            for chunk in parse_citation_chunks(scoped_text):
+                pe.citations.append(ParsedCitation(
+                    citation_text=chunk,
+                    alias_label=label,
+                    notes=f"{m.group(1).title()} {label}"
+                ))
 
     # Unscoped citations: remove scoped regions and parse remainder
+    # Use body_after_definitions (not body_norm) to avoid including definitions in citations
     if matches:
-        rem = body_norm
+        rem = body_after_definitions
         for (a, b) in reversed(scoped_spans):
             rem = rem[:a] + " " + rem[b:]
         for chunk in parse_citation_chunks(rem):
             pe.citations.append(ParsedCitation(citation_text=chunk, alias_label=None, notes=None))
     else:
-        for chunk in parse_citation_chunks(body_norm):
+        for chunk in parse_citation_chunks(body_after_definitions):
             pe.citations.append(ParsedCitation(citation_text=chunk, alias_label=None, notes=None))
 
     # Deduplicate aliases
@@ -1055,15 +2220,35 @@ def ensure_entity(
     return int(cur.fetchone()[0])
 
 
+def normalize_alias_for_db(alias: str) -> str:
+    """
+    Normalize alias for alias_norm column: lowercase, strip punctuation, collapse whitespace.
+    Matches the normalization used in migrations/0019_entities.sql.
+    """
+    # Lowercase
+    normalized = alias.lower()
+    # Remove punctuation (keep alphanumeric and spaces)
+    normalized = re.sub(r'[^\w\s]', '', normalized)
+    # Collapse whitespace
+    normalized = re.sub(r'\s+', ' ', normalized)
+    # Trim
+    normalized = normalized.strip()
+    return normalized
+
+
 def ensure_alias(cur, source_id: int, entry_id: Optional[int], entity_id: int, al: ParsedAlias) -> int:
+    alias_norm = normalize_alias_for_db(al.alias)
+    
+    # Check for existing alias using the unique constraint key: (entity_id, alias_norm)
+    # This matches the database constraint entity_aliases_entity_id_alias_norm_key
     cur.execute(
         """
         SELECT id FROM entity_aliases
-        WHERE source_id=%s AND entity_id=%s AND alias=%s
+        WHERE entity_id=%s AND alias_norm=%s
         ORDER BY id
         LIMIT 1;
         """,
-        (source_id, entity_id, al.alias),
+        (entity_id, alias_norm),
     )
     row = cur.fetchone()
     if row:
@@ -1071,11 +2256,11 @@ def ensure_alias(cur, source_id: int, entry_id: Optional[int], entity_id: int, a
 
     cur.execute(
         """
-        INSERT INTO entity_aliases(source_id, entry_id, entity_id, alias, alias_type, confidence, notes)
-        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        INSERT INTO entity_aliases(source_id, entry_id, entity_id, alias, alias_norm, alias_type, confidence, notes)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
         RETURNING id;
         """,
-        (source_id, entry_id, entity_id, al.alias, al.alias_type, al.confidence, al.notes),
+        (source_id, entry_id, entity_id, al.alias, alias_norm, al.alias_type, al.confidence, al.notes),
     )
     return int(cur.fetchone()[0])
 
@@ -1171,6 +2356,12 @@ def print_parsed(pe: ParsedEntry):
     print(f"first_line: {pe.raw_text.splitlines()[0][:200]}")
     if pe.is_crossref_only:
         print(f"  CROSSREF: {pe.entry_key!r} -> {pe.crossref_target!r}")
+    if pe.definitions:
+        print("  definitions:")
+        for d in pe.definitions:
+            def_type_str = f" [{d.definition_type}]" if d.definition_type else ""
+            notes_str = f" ({d.notes})" if d.notes else ""
+            print(f"    - {d.definition_text!r}{def_type_str}{notes_str}")
     if pe.aliases:
         print("  aliases:")
         for a in pe.aliases:
@@ -1264,20 +2455,57 @@ def main():
 
     args = ap.parse_args()
 
+    print(f"Starting PDF ingestion: {args.pdf}", file=sys.stderr)
+    print(f"Source: {args.source_slug} - {args.source_title}", file=sys.stderr)
+    print(f"Segmentation method: {args.segment}", file=sys.stderr)
+    
     # Regex path needs marker-sliced plain text
+    print(f"Extracting text from PDF (marker='{args.marker}' on page {args.marker_page})...", file=sys.stderr)
+    extract_start = time.time()
     raw_index_text = slice_index_text_from_pdf(args.pdf, marker=args.marker, marker_page_1based=args.marker_page)
+    extract_time = time.time() - extract_start
+    print(f"✅ PDF text extraction complete: {len(raw_index_text)} characters in {extract_time:.1f}s", file=sys.stderr)
+    
+    # Remove footnotes from raw text before processing
+    print("Removing footnotes from extracted text...", file=sys.stderr)
+    raw_index_text = remove_footnotes_from_text(raw_index_text)
+    print(f"✅ Footnote removal complete: {len(raw_index_text)} characters remaining", file=sys.stderr)
+    
+    print("Normalizing text and segmenting entries (regex method)...", file=sys.stderr)
+    norm_start = time.time()
     norm_text = normalize_for_parsing(raw_index_text)
     blocks_regex = segment_entries_regex(norm_text)
+    norm_time = time.time() - norm_start
+    print(f"✅ Regex segmentation complete: {len(blocks_regex)} entries found in {norm_time:.1f}s", file=sys.stderr)
 
     blocks_layout: Optional[List[str]] = None
     layout_error: Optional[str] = None
 
-    try:
-        layout_lines = extract_index_lines_layout(args.pdf, marker=args.marker, marker_page_1based=args.marker_page)
-        blocks_layout = segment_entries_layout(layout_lines, indent_delta=args.indent_delta, verbose=args.verbose)
-    except Exception as e:
-        layout_error = str(e)
-        blocks_layout = None
+    # Try layout-based segmentation if needed
+    if args.segment in ("auto", "layout"):
+        print("Extracting layout information from PDF (this may take several minutes for large PDFs)...", file=sys.stderr)
+        layout_extract_start = time.time()
+        try:
+            layout_lines = extract_index_lines_layout(args.pdf, marker=args.marker, marker_page_1based=args.marker_page, verbose=True)
+            layout_extract_time = time.time() - layout_extract_start
+            print(f"✅ Layout extraction complete: {len(layout_lines)} lines extracted in {layout_extract_time:.1f}s", file=sys.stderr)
+            
+            # Remove footnotes from layout lines
+            print("Removing footnotes from layout lines...", file=sys.stderr)
+            layout_lines = remove_footnotes_from_layout_lines(layout_lines)
+            print(f"✅ Footnote removal complete: {len(layout_lines)} lines remaining", file=sys.stderr)
+            
+            print(f"Segmenting entries using layout method (indent_delta={args.indent_delta})...", file=sys.stderr)
+            layout_seg_start = time.time()
+            blocks_layout = segment_entries_layout(layout_lines, indent_delta=args.indent_delta, verbose=args.verbose)
+            layout_seg_time = time.time() - layout_seg_start
+            print(f"✅ Layout segmentation complete: {len(blocks_layout)} entries found in {layout_seg_time:.1f}s", file=sys.stderr)
+        except Exception as e:
+            layout_error = str(e)
+            blocks_layout = None
+            print(f"❌ Layout extraction/segmentation failed: {layout_error}", file=sys.stderr)
+            if args.segment == "layout":
+                raise RuntimeError(f"Layout segmentation requested but failed: {layout_error}")
 
     if args.compare:
         if blocks_layout is None:
@@ -1288,25 +2516,28 @@ def main():
             return
 
     # Choose segmentation
+    print("\n" + "="*60, file=sys.stderr)
+    print("SEGMENTATION SUMMARY", file=sys.stderr)
+    print("="*60, file=sys.stderr)
     if args.segment == "regex":
         blocks = blocks_regex
-        if args.verbose:
-            print(f"[segment] using regex blocks={len(blocks)}")
+        print(f"✅ Using REGEX method: {len(blocks)} entries", file=sys.stderr)
     elif args.segment == "layout":
         if blocks_layout is None:
-            raise RuntimeError(f"layout segmentation requested but unavailable: {layout_error}")
+            raise RuntimeError(f"Layout segmentation requested but unavailable: {layout_error}")
         blocks = blocks_layout
-        if args.verbose:
-            print(f"[segment] using layout blocks={len(blocks)}")
+        print(f"✅ Using LAYOUT (position-aware) method: {len(blocks)} entries", file=sys.stderr)
+        print(f"   (Regex method found {len(blocks_regex)} entries for comparison)", file=sys.stderr)
     else:  # auto
         if blocks_layout is not None and len(blocks_layout) >= max(1, int(0.7 * len(blocks_regex))):
             blocks = blocks_layout
-            if args.verbose:
-                print(f"[segment] auto chose layout blocks={len(blocks)} (regex would be {len(blocks_regex)})")
+            print(f"✅ Auto-selected LAYOUT (position-aware) method: {len(blocks)} entries", file=sys.stderr)
+            print(f"   (Regex method found {len(blocks_regex)} entries)", file=sys.stderr)
         else:
             blocks = blocks_regex
-            if args.verbose:
-                print(f"[segment] auto chose regex blocks={len(blocks)} (layout unavailable or suspicious: {layout_error})")
+            print(f"✅ Auto-selected REGEX method: {len(blocks)} entries", file=sys.stderr)
+            print(f"   (Layout method unavailable or suspicious: {layout_error})", file=sys.stderr)
+    print("="*60 + "\n", file=sys.stderr)
 
     if args.limit is not None:
         blocks = blocks[:args.limit]
@@ -1318,7 +2549,13 @@ def main():
     key_counts: Dict[str, int] = {}
     parsed: List[ParsedEntry] = []
 
-    for block in blocks:
+    total_blocks = len(blocks)
+    parse_start_time = time.time()
+    last_reported_pct = -1
+    
+    print(f"Parsing {total_blocks} entries...", file=sys.stderr)
+
+    for idx, block in enumerate(blocks, 1):
         entry_key = _entry_key_for_block(block)
         key_counts.setdefault(entry_key, 0)
         key_counts[entry_key] += 1
@@ -1331,6 +2568,27 @@ def main():
 
         if args.dry_run:
             print_parsed(pe)
+        
+        # Progress reporting: every 10%
+        progress_pct = (idx / total_blocks) * 100
+        current_10pct = int(progress_pct // 10)
+        last_10pct = int(last_reported_pct // 10)
+        
+        if current_10pct > last_10pct or idx == total_blocks:
+            elapsed = time.time() - parse_start_time
+            rate = idx / elapsed if elapsed > 0 else 0
+            remaining = (total_blocks - idx) / rate if rate > 0 else 0
+            print(
+                f"[Progress] {idx}/{total_blocks} ({progress_pct:.1f}%) | "
+                f"Elapsed: {elapsed:.1f}s | "
+                f"Rate: {rate:.1f} entries/s | "
+                f"ETA: {remaining:.1f}s",
+                file=sys.stderr
+            )
+            last_reported_pct = progress_pct
+    
+    parse_time = time.time() - parse_start_time
+    print(f"✅ Parsing complete: {total_blocks} entries in {parse_time:.1f}s", file=sys.stderr)
 
     if args.dry_run:
         print("\n(dry-run) ✅ done")
@@ -1344,7 +2602,13 @@ def main():
             source_id = ensure_source(cur, args.source_slug, args.source_title, args.source_notes)
         conn.commit()
 
-        for pe in parsed:
+        total_parsed = len(parsed)
+        db_start_time = time.time()
+        last_reported_pct = -1
+        
+        print(f"Writing {total_parsed} entries to database...", file=sys.stderr)
+
+        for idx, pe in enumerate(parsed, 1):
             with conn.cursor() as cur:
                 entry_id = upsert_entry(cur, source_id, pe.entry_key, pe.entry_seq, pe.raw_text)
 
@@ -1414,8 +2678,29 @@ def main():
                     )
 
             conn.commit()
-
-        print(f"✅ ingest complete: source_slug={args.source_slug}  entries={len(parsed)}")
+            
+            # Progress reporting: every 10%
+            progress_pct = (idx / total_parsed) * 100
+            current_10pct = int(progress_pct // 10)
+            last_10pct = int(last_reported_pct // 10)
+            
+            if current_10pct > last_10pct or idx == total_parsed:
+                elapsed = time.time() - db_start_time
+                rate = idx / elapsed if elapsed > 0 else 0
+                remaining = (total_parsed - idx) / rate if rate > 0 else 0
+                print(
+                    f"[DB Progress] {idx}/{total_parsed} ({progress_pct:.1f}%) | "
+                    f"Elapsed: {elapsed:.1f}s | "
+                    f"Rate: {rate:.1f} entries/s | "
+                    f"ETA: {remaining:.1f}s",
+                    file=sys.stderr
+                )
+                last_reported_pct = progress_pct
+        
+        db_time = time.time() - db_start_time
+        total_time = time.time() - parse_start_time
+        print(f"✅ Ingest complete: source_slug={args.source_slug}  entries={len(parsed)}", file=sys.stderr)
+        print(f"   Total time: {total_time:.1f}s (parse: {parse_time:.1f}s, DB: {db_time:.1f}s)", file=sys.stderr)
 
     except Exception:
         conn.rollback()
