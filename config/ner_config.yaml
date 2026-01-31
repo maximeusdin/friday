@@ -1,0 +1,40 @@
+ocr:
+  ner_model: "en_core_web_sm"  # Faster model for OCR
+  confidence_threshold: 0.6
+  fuzzy_similarity_threshold: 0.6
+  surface_quality_default: "approx"
+  pattern_weight: 0.3
+  ner_weight: 0.3
+  fuzzy_weight: 0.4
+  ocr_error_correction: true
+
+clean:
+  ner_model: "en_core_web_trf"  # Better model for clean text
+  confidence_threshold: 0.8
+  fuzzy_similarity_threshold: 0.7
+  surface_quality_default: "exact"
+  pattern_weight: 0.2
+  ner_weight: 0.5
+  fuzzy_weight: 0.3
+  ocr_error_correction: false
+
+patterns:
+  person:
+    min_tokens: 2
+    max_tokens: 5
+    require_title: false
+    titles: ["Mr.", "Mrs.", "Ms.", "Dr.", "General", "Colonel", "Captain", "Major", "Lieutenant"]
+  
+  organization:
+    markers: ["Inc.", "Corp.", "Ltd.", "Ministry", "Department", "Bureau", "Agency", "Committee", "Office"]
+    require_marker: false
+  
+  place:
+    geographic_markers: ["in", "from", "to", "near", "at", "of"]
+    require_marker: false
+
+review_queue:
+  auto_insert_threshold: 0.9
+  review_threshold_min: 0.7
+  review_threshold_max: 0.9
+  log_only_threshold: 0.7

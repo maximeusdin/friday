@@ -154,14 +154,49 @@ class EntityPrimitive:
 
 @dataclass
 class CoOccursWithPrimitive:
-    """CO_OCCURS_WITH(entity_id, window) - Find chunks where entity co-occurs"""
+    """
+    CO_OCCURS_WITH(entity_a, entity_b, window) - Find chunks where two entities co-occur
+    
+    Returns chunks containing evidence of both entities appearing together within
+    the specified window. Unlike CO_LOCATED which is symmetric, CO_OCCURS_WITH 
+    conceptually treats entity_a as the "primary" and entity_b as "must co-occur with".
+    (In practice, the SQL is symmetric.)
+    
+    Window semantics:
+    - "chunk" (default): BOTH entities must have mentions in the SAME chunk.
+      This is the strictest match - direct co-mention within the same text block.
+      SQL: EXISTS(em for entity_a in chunk) AND EXISTS(em for entity_b in chunk)
+      
+    - "document": Both entities must appear somewhere in the SAME document,
+      but not necessarily in the same chunk. entity_a could be on page 1, entity_b on page 5.
+      SQL: Complex join checking both entities have mentions in chunks of same document.
+    
+    Expected JSON format:
+      {"type": "CO_OCCURS_WITH", "entity_a": 123, "entity_b": 456, "window": "document"}
+    
+    Never use single entity_id - always specify both entity_a and entity_b.
+    
+    Deduplication: Each qualifying chunk is returned ONCE, regardless of how many
+    times each entity is mentioned within that chunk.
+    """
     type: Literal["CO_OCCURS_WITH"] = "CO_OCCURS_WITH"
-    entity_id: int = 0
-    window: Literal["chunk", "document", "result_set"] = "chunk"
+    entity_a: int = 0
+    entity_b: int = 0
+    window: Literal["chunk", "document"] = "chunk"
 
     def __post_init__(self):
-        if self.entity_id <= 0:
-            raise ValueError("CO_OCCURS_WITH primitive requires positive entity_id")
+        if self.entity_a <= 0:
+            raise ValueError(
+                "CO_OCCURS_WITH primitive requires positive entity_a. "
+                "Expected format: {\"type\": \"CO_OCCURS_WITH\", \"entity_a\": 123, \"entity_b\": 456, \"window\": \"chunk\"}"
+            )
+        if self.entity_b <= 0:
+            raise ValueError(
+                "CO_OCCURS_WITH primitive requires positive entity_b. "
+                "Expected format: {\"type\": \"CO_OCCURS_WITH\", \"entity_a\": 123, \"entity_b\": 456, \"window\": \"chunk\"}"
+            )
+        if self.entity_a == self.entity_b:
+            raise ValueError("CO_OCCURS_WITH primitive requires different entities (entity_a != entity_b)")
 
 
 # ============================================================================
@@ -227,7 +262,33 @@ class FilterCountryPrimitive:
 
 @dataclass
 class CoLocatedPrimitive:
-    """CO_LOCATED(entity_a, entity_b, scope) - Find co-location evidence"""
+    """
+    CO_LOCATED(entity_a, entity_b, scope) - Find chunks where two entities co-occur
+    
+    Returns chunks that contain evidence of both entities appearing together,
+    useful for relationship discovery and co-mention analysis.
+    
+    Scope semantics:
+    - "chunk" (default): BOTH entity_a AND entity_b must have mentions in the SAME chunk.
+      This is the strictest co-location - both entities named within the same text block.
+      Typical use: Find direct evidence of two people being mentioned together.
+      SQL: EXISTS(entity_mentions for entity_a in chunk) AND EXISTS(entity_mentions for entity_b in chunk)
+      
+    - "document": Both entities must appear somewhere in the SAME document,
+      but not necessarily in the same chunk. entity_a could be on page 1, entity_b on page 5.
+      Typical use: Find documents that discuss both entities (broader association).
+      SQL: Complex join checking both entities have mentions in chunks of same document.
+    
+    NOT supported yet:
+    - "page": Same physical page (would need page_num metadata)
+    - "paragraph": Same paragraph (would need paragraph segmentation)
+    - "window:N": Within N characters/tokens of each other
+    
+    Deduplication: Each qualifying chunk is returned ONCE, regardless of how many
+    times each entity is mentioned within that chunk.
+    
+    Note: Order of entity_a/entity_b does not matter - CO_LOCATED(A,B) == CO_LOCATED(B,A)
+    """
     type: Literal["CO_LOCATED"] = "CO_LOCATED"
     entity_a: int = 0
     entity_b: int = 0
@@ -284,6 +345,132 @@ class GroupByPrimitive:
             raise ValueError("GROUP_BY primitive requires non-empty field")
 
 
+# ============================================================================
+# Aggregation Primitives
+# ============================================================================
+
+@dataclass
+class CountPrimitive:
+    """
+    COUNT(group_by?) - Count results without returning full result set.
+    
+    Used for queries like "how many mentions of X?" or "count documents by collection".
+    When group_by is specified, returns counts grouped by that field.
+    
+    Examples:
+        COUNT() - Total count of matching results
+        COUNT(group_by="entity") - Count grouped by entity
+        COUNT(group_by="document") - Count grouped by document
+        COUNT(group_by="collection") - Count grouped by collection
+    """
+    type: Literal["COUNT"] = "COUNT"
+    group_by: Optional[str] = None  # 'entity', 'document', 'collection', or None for total
+    
+    def __post_init__(self):
+        valid_group_by = {None, "entity", "document", "collection", "date", "country"}
+        if self.group_by is not None and self.group_by not in valid_group_by:
+            raise ValueError(f"COUNT group_by must be one of {valid_group_by}, got: {self.group_by}")
+
+
+@dataclass
+class SetQueryModePrimitive:
+    """
+    SET_QUERY_MODE(mode) - Set the query execution mode.
+    
+    Modes:
+        'retrieve' (default) - Return full result set with chunks
+        'count' - Return only counts (faster, no chunk data)
+        'aggregate' - Return aggregated statistics
+    """
+    type: Literal["SET_QUERY_MODE"] = "SET_QUERY_MODE"
+    value: Literal["retrieve", "count", "aggregate"] = "retrieve"
+
+
+# ============================================================================
+# Speaker/Transcript Primitives
+# ============================================================================
+
+@dataclass
+class SpeakerFilterPrimitive:
+    """
+    SPEAKER_FILTER(speakers, mode) - Filter chunks by speaker attribution.
+    
+    For transcript collections (e.g., McCarthy hearings), constrains retrieval
+    to chunks where specific speakers appear.
+    
+    Examples:
+        {"type": "SPEAKER_FILTER", "speakers": ["MR WELCH"], "mode": "include"}
+        {"type": "SPEAKER_FILTER", "speakers": ["__STAGE__"], "mode": "exclude"}
+    
+    Implementation:
+        SQL: primary_speaker_norm = ANY($1) OR speaker_norms && $1::text[]
+    """
+    type: Literal["SPEAKER_FILTER"] = "SPEAKER_FILTER"
+    speakers: List[str] = None  # List of speaker_norm values
+    mode: Literal["include", "exclude"] = "include"
+    
+    def __post_init__(self):
+        if self.speakers is None:
+            self.speakers = []
+        if not self.speakers:
+            raise ValueError("SPEAKER_FILTER primitive requires at least one speaker")
+        # Normalize speaker names to uppercase
+        self.speakers = [s.upper().strip() for s in self.speakers]
+
+
+@dataclass
+class SpeakerBoostPrimitive:
+    """
+    SPEAKER_BOOST(speakers, weight) - Boost score for chunks with target speakers.
+    
+    Unlike SPEAKER_FILTER, this doesn't exclude chunks—it reranks results
+    to favor chunks where the target speakers appear.
+    
+    Examples:
+        {"type": "SPEAKER_BOOST", "speakers": ["SENATOR MCCARTHY"], "weight": 1.5}
+    
+    Implementation:
+        If speaker_norms overlaps with target speakers, multiply score by weight.
+    """
+    type: Literal["SPEAKER_BOOST"] = "SPEAKER_BOOST"
+    speakers: List[str] = None  # List of speaker_norm values
+    weight: float = 1.5  # Score multiplier
+    
+    def __post_init__(self):
+        if self.speakers is None:
+            self.speakers = []
+        if not self.speakers:
+            raise ValueError("SPEAKER_BOOST primitive requires at least one speaker")
+        if self.weight <= 0:
+            raise ValueError("SPEAKER_BOOST primitive requires positive weight")
+        # Normalize speaker names to uppercase
+        self.speakers = [s.upper().strip() for s in self.speakers]
+
+
+@dataclass
+class QuoteAttributionModePrimitive:
+    """
+    QUOTE_ATTRIBUTION_MODE(enabled, speaker?) - Control quote attribution in synthesis.
+    
+    When enabled, instructs the synthesis step to only quote spans where the
+    target speaker is active. Requires chunk_turns or speaker_turn_spans data.
+    
+    Examples:
+        {"type": "QUOTE_ATTRIBUTION_MODE", "enabled": true, "speaker": "MR WELCH"}
+        {"type": "QUOTE_ATTRIBUTION_MODE", "enabled": true}  # Quote any speaker deterministically
+    
+    This is a synthesis directive, not a filter—it doesn't change retrieval
+    but changes how quotes are extracted from retrieved chunks.
+    """
+    type: Literal["QUOTE_ATTRIBUTION_MODE"] = "QUOTE_ATTRIBUTION_MODE"
+    enabled: bool = True
+    speaker: Optional[str] = None  # Optional: restrict quotes to specific speaker
+    
+    def __post_init__(self):
+        if self.speaker:
+            self.speaker = self.speaker.upper().strip()
+
+
 # Forward reference for recursive type (OR_GROUP contains primitives)
 Primitive = Union[
     TermPrimitive,
@@ -306,6 +493,13 @@ Primitive = Union[
     RelationEvidencePrimitive,
     RequireEvidencePrimitive,
     GroupByPrimitive,
+    # Aggregation primitives
+    CountPrimitive,
+    SetQueryModePrimitive,
+    # Speaker/Transcript primitives
+    SpeakerFilterPrimitive,
+    SpeakerBoostPrimitive,
+    QuoteAttributionModePrimitive,
 ]
 
 # Note: OrGroupPrimitive uses forward reference (string literal) for recursive type
@@ -362,7 +556,7 @@ class QueryPlan:
         elif isinstance(p, EntityPrimitive):
             return {"type": "ENTITY", "entity_id": p.entity_id}
         elif isinstance(p, CoOccursWithPrimitive):
-            return {"type": "CO_OCCURS_WITH", "entity_id": p.entity_id, "window": p.window}
+            return {"type": "CO_OCCURS_WITH", "entity_a": p.entity_a, "entity_b": p.entity_b, "window": p.window}
         elif isinstance(p, FilterDateRangePrimitive):
             result = {"type": "FILTER_DATE_RANGE"}
             if p.start:
@@ -382,6 +576,24 @@ class QueryPlan:
             return {"type": "REQUIRE_EVIDENCE", "evidence_type": p.evidence_type}
         elif isinstance(p, GroupByPrimitive):
             return {"type": "GROUP_BY", "field": p.field}
+        # Speaker/Transcript primitives
+        elif isinstance(p, SpeakerFilterPrimitive):
+            return {"type": "SPEAKER_FILTER", "speakers": p.speakers, "mode": p.mode}
+        elif isinstance(p, SpeakerBoostPrimitive):
+            return {"type": "SPEAKER_BOOST", "speakers": p.speakers, "weight": p.weight}
+        elif isinstance(p, QuoteAttributionModePrimitive):
+            result = {"type": "QUOTE_ATTRIBUTION_MODE", "enabled": p.enabled}
+            if p.speaker:
+                result["speaker"] = p.speaker
+            return result
+        # Aggregation primitives
+        elif isinstance(p, CountPrimitive):
+            result = {"type": "COUNT"}
+            if p.group_by:
+                result["group_by"] = p.group_by
+            return result
+        elif isinstance(p, SetQueryModePrimitive):
+            return {"type": "SET_QUERY_MODE", "value": p.value}
         else:
             raise ValueError(f"Unknown primitive type: {type(p)}")
 
@@ -426,10 +638,32 @@ class QueryPlan:
         elif ptype == "ENTITY":
             return EntityPrimitive(entity_id=data["entity_id"])
         elif ptype == "CO_OCCURS_WITH":
-            return CoOccursWithPrimitive(
-                entity_id=data["entity_id"],
-                window=data.get("window", "chunk")
-            )
+            # New format: entity_a + entity_b
+            if "entity_a" in data and "entity_b" in data:
+                return CoOccursWithPrimitive(
+                    entity_a=data["entity_a"],
+                    entity_b=data["entity_b"],
+                    window=data.get("window", "chunk")
+                )
+            # Backward compatibility: entity_id + other_entity_id (legacy format)
+            elif "entity_id" in data and "other_entity_id" in data:
+                return CoOccursWithPrimitive(
+                    entity_a=data["entity_id"],
+                    entity_b=data["other_entity_id"],
+                    window=data.get("window", "chunk")
+                )
+            # Error: single entity_id is no longer valid
+            elif "entity_id" in data:
+                raise ValueError(
+                    f"CO_OCCURS_WITH requires two entities (entity_a and entity_b). "
+                    f"Got only entity_id={data['entity_id']}. "
+                    f"Expected format: {{\"type\": \"CO_OCCURS_WITH\", \"entity_a\": 123, \"entity_b\": 456, \"window\": \"chunk\"}}"
+                )
+            else:
+                raise ValueError(
+                    f"CO_OCCURS_WITH missing required fields. "
+                    f"Expected format: {{\"type\": \"CO_OCCURS_WITH\", \"entity_a\": 123, \"entity_b\": 456, \"window\": \"chunk\"}}"
+                )
         elif ptype == "FILTER_DATE_RANGE":
             return FilterDateRangePrimitive(
                 start=data.get("start"),
@@ -457,6 +691,27 @@ class QueryPlan:
             return RequireEvidencePrimitive(evidence_type=data.get("evidence_type", "chunk"))
         elif ptype == "GROUP_BY":
             return GroupByPrimitive(field=data["field"])
+        # Aggregation primitives
+        elif ptype == "COUNT":
+            return CountPrimitive(group_by=data.get("group_by"))
+        elif ptype == "SET_QUERY_MODE":
+            return SetQueryModePrimitive(value=data.get("value", "retrieve"))
+        # Speaker/Transcript primitives
+        elif ptype == "SPEAKER_FILTER":
+            return SpeakerFilterPrimitive(
+                speakers=data["speakers"],
+                mode=data.get("mode", "include")
+            )
+        elif ptype == "SPEAKER_BOOST":
+            return SpeakerBoostPrimitive(
+                speakers=data["speakers"],
+                weight=data.get("weight", 1.5)
+            )
+        elif ptype == "QUOTE_ATTRIBUTION_MODE":
+            return QuoteAttributionModePrimitive(
+                enabled=data.get("enabled", True),
+                speaker=data.get("speaker")
+            )
         else:
             raise ValueError(f"Unknown primitive type: {ptype}")
 
@@ -662,7 +917,8 @@ def _canonical_order_primitives(primitives: List[Primitive]) -> List[Primitive]:
         elif isinstance(p, EntityPrimitive):
             return ("ENTITY", p.entity_id)
         elif isinstance(p, CoOccursWithPrimitive):
-            return ("CO_OCCURS_WITH", (p.entity_id, p.window))
+            # Sort entity IDs for stable ordering (order shouldn't matter)
+            return ("CO_OCCURS_WITH", (min(p.entity_a, p.entity_b), max(p.entity_a, p.entity_b), p.window))
         elif isinstance(p, FilterDateRangePrimitive):
             # Use normalized dates for stable ordering
             return ("FILTER_DATE_RANGE", (p.start or "", p.end or ""))
@@ -911,13 +1167,14 @@ def compile_primitives_to_expanded(primitives: List[Primitive]) -> Dict[str, Any
     }
 
 
-def compile_primitives_to_scope(primitives: List[Primitive], chunk_id_expr: str = "c.id") -> Tuple[str, List[Any]]:
+def compile_primitives_to_scope(primitives: List[Primitive], chunk_id_expr: str = "c.id") -> Tuple[str, List[Any], Dict[str, bool]]:
     """
     Compile primitives to SQL WHERE constraints with parameterized queries.
     
-    Returns tuple: (sql_fragment, params)
+    Returns tuple: (sql_fragment, params, required_joins)
     - sql_fragment: SQL fragment with %s placeholders
     - params: List of parameter values in order
+    - required_joins: Dict with join information needed for execution
     
     Semantics:
     - WITHIN_RESULT_SET(id): chunks must be in result_set.chunk_ids array
@@ -928,20 +1185,33 @@ def compile_primitives_to_scope(primitives: List[Primitive], chunk_id_expr: str 
       SQL: cm.collection_slug = %s
     - FILTER_DOCUMENT(id): filter by document_id via chunk_metadata
       SQL: cm.document_id = %s
-    - FILTER_DATE_RANGE(start, end): filter by date range via chunk_metadata
-      SQL: cm.date_max >= %s AND cm.date_min <= %s (if both provided)
+    - FILTER_DATE_RANGE(start, end): filter by date range via date_mentions or chunk_metadata
+      SQL: EXISTS (SELECT 1 FROM date_mentions WHERE chunk_id = c.id AND ...) 
+           OR fallback to cm.date_max >= %s AND cm.date_min <= %s
+    - ENTITY(entity_id): filter chunks containing entity mentions
+      SQL: EXISTS (SELECT 1 FROM entity_mentions WHERE chunk_id = c.id AND entity_id = %s)
     
-    Returns ("", []) if no scope constraints.
+    Returns ("", [], {}) if no scope constraints.
     """
     conditions: List[str] = []
     params: List[Any] = []
+    required_joins: Dict[str, bool] = {
+        "chunk_metadata": False,
+        "entity_mentions": False,
+        "date_mentions": False,
+    }
     
     # Collect all WITHIN_RESULT_SET primitives to OR them together
     within_result_sets: List[int] = []
     
+    # Collect ENTITY primitives to handle together
+    entity_ids: List[int] = []
+    
     for p in primitives:
         if isinstance(p, WithinResultSetPrimitive):
             within_result_sets.append(p.result_set_id)
+        elif isinstance(p, EntityPrimitive):
+            entity_ids.append(p.entity_id)
     
     # Handle multiple WITHIN_RESULT_SET primitives by OR-ing them together
     if within_result_sets:
@@ -961,9 +1231,29 @@ def compile_primitives_to_scope(primitives: List[Primitive], chunk_id_expr: str 
                 params.append(rs_id)
             conditions.append(f"({' OR '.join(or_conditions)})")
     
+    # Handle ENTITY primitives - chunks must contain mentions of these entities
+    if entity_ids:
+        if len(entity_ids) == 1:
+            # Single entity - simple EXISTS check
+            conditions.append(
+                f"EXISTS (SELECT 1 FROM entity_mentions em WHERE em.chunk_id = {chunk_id_expr} AND em.entity_id = %s)"
+            )
+            params.append(entity_ids[0])
+            required_joins["entity_mentions"] = True
+        else:
+            # Multiple entities - chunks must contain mentions of ANY of them (OR)
+            or_conditions = []
+            for entity_id in entity_ids:
+                or_conditions.append(
+                    f"EXISTS (SELECT 1 FROM entity_mentions em WHERE em.chunk_id = {chunk_id_expr} AND em.entity_id = %s)"
+                )
+                params.append(entity_id)
+            conditions.append(f"({' OR '.join(or_conditions)})")
+            required_joins["entity_mentions"] = True
+    
     # Process other scope primitives
     for p in primitives:
-        if isinstance(p, WithinResultSetPrimitive):
+        if isinstance(p, WithinResultSetPrimitive) or isinstance(p, EntityPrimitive):
             # Already handled above
             continue
         elif isinstance(p, ExcludeResultSetPrimitive):
@@ -976,33 +1266,140 @@ def compile_primitives_to_scope(primitives: List[Primitive], chunk_id_expr: str 
             # Filter by collection slug (via chunk_metadata)
             conditions.append("cm.collection_slug = %s")
             params.append(p.slug)
+            required_joins["chunk_metadata"] = True
         elif isinstance(p, FilterDocumentPrimitive):
             # Filter by document_id (via chunk_metadata)
             conditions.append("cm.document_id = %s")
             params.append(p.document_id)
+            required_joins["chunk_metadata"] = True
         elif isinstance(p, FilterDateRangePrimitive):
-            # Filter by date range (via chunk_metadata)
+            # Filter by date range - prefer date_mentions table, fallback to chunk_metadata
             date_conditions: List[str] = []
+            date_params: List[Any] = []
+            
+            # Build date_mentions EXISTS condition (more precise)
+            dm_conditions = []
             if p.start:
-                date_conditions.append("cm.date_max >= %s")
-                params.append(p.start)
+                dm_conditions.append("dm.date_end >= %s")
+                date_params.append(p.start)
             if p.end:
-                date_conditions.append("cm.date_min <= %s")
-                params.append(p.end)
-            if date_conditions:
-                conditions.append("(" + " AND ".join(date_conditions) + ")")
+                dm_conditions.append("dm.date_start <= %s")
+                date_params.append(p.end)
+            
+            if dm_conditions:
+                # Use date_mentions for precise date filtering
+                dm_sql = f"EXISTS (SELECT 1 FROM date_mentions dm WHERE dm.chunk_id = {chunk_id_expr} AND {' AND '.join(dm_conditions)})"
+                date_conditions.append(dm_sql)
+                params.extend(date_params)
+                required_joins["date_mentions"] = True
+                
+                # Also add fallback to chunk_metadata for chunks without explicit date mentions
+                # but with date metadata (broader recall)
+                cm_conditions = []
+                cm_params = []
+                if p.start:
+                    cm_conditions.append("cm.date_max >= %s")
+                    cm_params.append(p.start)
+                if p.end:
+                    cm_conditions.append("cm.date_min <= %s")
+                    cm_params.append(p.end)
+                if cm_conditions:
+                    cm_sql = f"({' AND '.join(cm_conditions)})"
+                    date_conditions.append(cm_sql)
+                    params.extend(cm_params)
+                    required_joins["chunk_metadata"] = True
+                
+                # Combine: chunk has date mention OR chunk metadata matches
+                if len(date_conditions) > 1:
+                    conditions.append(f"({' OR '.join(date_conditions)})")
+                else:
+                    conditions.append(date_conditions[0])
         elif isinstance(p, FilterCountryPrimitive):
             # Filter by country (would need country metadata in chunk_metadata)
             # For now, placeholder - would need to add country field to chunk_metadata
             # conditions.append("cm.country_code = %s")
             # params.append(p.value)
             pass  # Not implemented yet - requires schema addition
+        elif isinstance(p, CoOccursWithPrimitive):
+            # CO_OCCURS_WITH: Find chunks where two entities co-occur
+            # Both entity_a and entity_b must have mentions within the specified window
+            # The window parameter controls scope:
+            # - "chunk": both entities mentioned in same chunk (strictest)
+            # - "document": both entities mentioned somewhere in same document (broader)
+            if p.window == "chunk":
+                # Both entities mentioned in same chunk
+                conditions.append(
+                    f"""(
+                        EXISTS (SELECT 1 FROM entity_mentions em WHERE em.chunk_id = {chunk_id_expr} AND em.entity_id = %s)
+                        AND EXISTS (SELECT 1 FROM entity_mentions em WHERE em.chunk_id = {chunk_id_expr} AND em.entity_id = %s)
+                    )"""
+                )
+                params.append(p.entity_a)
+                params.append(p.entity_b)
+                required_joins["entity_mentions"] = True
+            elif p.window == "document":
+                # Both entities mentioned somewhere in same document
+                # Uses entity_mentions.document_id (denormalized) for performance
+                conditions.append(
+                    f"""EXISTS (
+                        SELECT 1 FROM entity_mentions em_a
+                        JOIN entity_mentions em_b ON em_b.document_id = em_a.document_id AND em_b.entity_id = %s
+                        WHERE em_a.entity_id = %s
+                        AND em_a.document_id = (SELECT cm.document_id FROM chunk_metadata cm WHERE cm.chunk_id = {chunk_id_expr} LIMIT 1)
+                    )"""
+                )
+                params.append(p.entity_b)
+                params.append(p.entity_a)
+                required_joins["entity_mentions"] = True
+                required_joins["chunk_metadata"] = True
+        elif isinstance(p, CoLocatedPrimitive):
+            # CO_LOCATED: Find chunks where two entities appear together
+            # Both entity_a and entity_b must have mentions in the specified scope
+            if p.scope == "chunk":
+                # Both entities mentioned in same chunk
+                conditions.append(
+                    f"""(
+                        EXISTS (SELECT 1 FROM entity_mentions em WHERE em.chunk_id = {chunk_id_expr} AND em.entity_id = %s)
+                        AND EXISTS (SELECT 1 FROM entity_mentions em WHERE em.chunk_id = {chunk_id_expr} AND em.entity_id = %s)
+                    )"""
+                )
+                params.append(p.entity_a)
+                params.append(p.entity_b)
+                required_joins["entity_mentions"] = True
+            elif p.scope == "document":
+                # Both entities mentioned somewhere in same document
+                # Uses entity_mentions.document_id (denormalized) for performance
+                # Checks that both entities have mentions in the same document as the target chunk
+                conditions.append(
+                    f"""EXISTS (
+                        SELECT 1 FROM entity_mentions em_a
+                        JOIN entity_mentions em_b ON em_b.document_id = em_a.document_id AND em_b.entity_id = %s
+                        WHERE em_a.entity_id = %s
+                        AND em_a.document_id = (SELECT cm.document_id FROM chunk_metadata cm WHERE cm.chunk_id = {chunk_id_expr} LIMIT 1)
+                    )"""
+                )
+                params.append(p.entity_b)
+                params.append(p.entity_a)
+                required_joins["entity_mentions"] = True
+                required_joins["chunk_metadata"] = True
+        elif isinstance(p, RelationEvidencePrimitive):
+            # RELATION_EVIDENCE: Find chunks that might contain evidence of relationship between two entities
+            # Similar to CO_LOCATED at chunk level, but could be extended with relationship tables
+            conditions.append(
+                f"""(
+                    EXISTS (SELECT 1 FROM entity_mentions em WHERE em.chunk_id = {chunk_id_expr} AND em.entity_id = %s)
+                    AND EXISTS (SELECT 1 FROM entity_mentions em WHERE em.chunk_id = {chunk_id_expr} AND em.entity_id = %s)
+                )"""
+            )
+            params.append(p.entity_a)
+            params.append(p.entity_b)
+            required_joins["entity_mentions"] = True
     
     if not conditions:
-        return ("", [])
+        return ("", [], required_joins)
     
     sql_fragment = " AND ".join(conditions)
-    return (sql_fragment, params)
+    return (sql_fragment, params, required_joins)
 
 
 def compile_primitives(primitives: List[Primitive], *, chunk_id_expr: str = "c.id") -> Dict[str, Any]:
@@ -1043,7 +1440,7 @@ def compile_primitives(primitives: List[Primitive], *, chunk_id_expr: str = "c.i
         tsquery_params = [tsquery_query_text]
     
     # Compile scope constraints
-    scope_sql, scope_params = compile_primitives_to_scope(ordered_primitives, chunk_id_expr=chunk_id_expr)
+    scope_sql, scope_params, required_joins = compile_primitives_to_scope(ordered_primitives, chunk_id_expr=chunk_id_expr)
     
     result = {
         "tsquery": {
@@ -1058,6 +1455,7 @@ def compile_primitives(primitives: List[Primitive], *, chunk_id_expr: str = "c.i
         result["scope"] = {
             "where_sql": scope_sql,
             "params": scope_params,
+            "required_joins": required_joins,  # Indicates which tables need to be joined
         }
     
     return result

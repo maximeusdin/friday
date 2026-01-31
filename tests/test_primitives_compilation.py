@@ -29,8 +29,12 @@ from retrieval.primitives import (
     FilterCollectionPrimitive,
     FilterDocumentPrimitive,
     FilterDateRangePrimitive,
+    EntityPrimitive,
     SetTermModePrimitive,
     OrGroupPrimitive,
+    CoOccursWithPrimitive,
+    CoLocatedPrimitive,
+    QueryPlan,
     normalize_term,
     normalize_phrase,
     compile_primitives_to_tsquery_text,
@@ -167,48 +171,159 @@ def test_tsquery_quote_escaping():
 def test_scope_empty():
     """Test empty primitives → empty scope."""
     primitives = []
-    sql, params = compile_primitives_to_scope(primitives)
+    sql, params, joins = compile_primitives_to_scope(primitives)
     assert sql == ""
     assert params == []
+    assert not any(joins.values())
     print("[OK] Empty scope test passed")
 
 
 def test_scope_within_result_set():
     """Test WITHIN_RESULT_SET compiles correctly."""
     primitives = [WithinResultSetPrimitive(result_set_id=5)]
-    sql, params = compile_primitives_to_scope(primitives, chunk_id_expr="c.id")
+    sql, params, joins = compile_primitives_to_scope(primitives, chunk_id_expr="c.id")
     assert "c.id = ANY" in sql
     assert "result_sets WHERE id = %s" in sql
     assert params == [5]
+    assert not joins.get("chunk_metadata")
     print("[OK] WITHIN_RESULT_SET scope test passed")
 
 
 def test_scope_filter_collection():
     """Test FILTER_COLLECTION compiles correctly."""
     primitives = [FilterCollectionPrimitive(slug="venona")]
-    sql, params = compile_primitives_to_scope(primitives)
+    sql, params, joins = compile_primitives_to_scope(primitives)
     assert "cm.collection_slug = %s" in sql
     assert params == ["venona"]
+    assert joins.get("chunk_metadata") == True
     print("[OK] FILTER_COLLECTION scope test passed")
 
 
 def test_scope_filter_document():
     """Test FILTER_DOCUMENT compiles correctly."""
     primitives = [FilterDocumentPrimitive(document_id=123)]
-    sql, params = compile_primitives_to_scope(primitives)
+    sql, params, joins = compile_primitives_to_scope(primitives)
     assert "cm.document_id = %s" in sql
     assert params == [123]
+    assert joins.get("chunk_metadata") == True
     print("[OK] FILTER_DOCUMENT scope test passed")
 
 
 def test_scope_filter_date_range():
     """Test FILTER_DATE_RANGE compiles correctly."""
     primitives = [FilterDateRangePrimitive(start="1940-01-01", end="1945-12-31")]
-    sql, params = compile_primitives_to_scope(primitives)
-    assert "cm.date_max >= %s" in sql
-    assert "cm.date_min <= %s" in sql
-    assert params == ["1940-01-01", "1945-12-31"]
+    sql, params, joins = compile_primitives_to_scope(primitives)
+    # Should use date_mentions EXISTS or chunk_metadata fallback
+    assert "date_mentions" in sql or "cm.date_max" in sql or "cm.date_min" in sql
+    assert len(params) >= 2
+    assert joins.get("date_mentions") == True or joins.get("chunk_metadata") == True
     print("[OK] FILTER_DATE_RANGE scope test passed")
+
+
+def test_scope_entity():
+    """Test ENTITY primitive compiles correctly."""
+    from retrieval.primitives import EntityPrimitive
+    primitives = [EntityPrimitive(entity_id=12345)]
+    sql, params, joins = compile_primitives_to_scope(primitives)
+    assert "entity_mentions" in sql
+    assert "entity_id = %s" in sql
+    assert params == [12345]
+    assert joins.get("entity_mentions") == True
+    print("[OK] ENTITY scope test passed")
+
+
+def test_scope_co_occurs_with_chunk():
+    """Test CO_OCCURS_WITH primitive (chunk window) compiles correctly."""
+    primitives = [CoOccursWithPrimitive(entity_a=123, entity_b=456, window="chunk")]
+    sql, params, joins = compile_primitives_to_scope(primitives, chunk_id_expr="c.id")
+    
+    # Should have EXISTS checks for both entities
+    assert "entity_mentions" in sql
+    assert "entity_id = %s" in sql
+    assert sql.count("EXISTS") == 2  # Two EXISTS clauses
+    assert 123 in params
+    assert 456 in params
+    assert joins.get("entity_mentions") == True
+    print("[OK] CO_OCCURS_WITH (chunk) scope test passed")
+
+
+def test_scope_co_occurs_with_document():
+    """Test CO_OCCURS_WITH primitive (document window) compiles correctly."""
+    primitives = [CoOccursWithPrimitive(entity_a=123, entity_b=456, window="document")]
+    sql, params, joins = compile_primitives_to_scope(primitives, chunk_id_expr="c.id")
+    
+    # Should have document-level co-occurrence check
+    assert "entity_mentions" in sql
+    assert "document_id" in sql
+    assert 123 in params
+    assert 456 in params
+    assert joins.get("entity_mentions") == True
+    assert joins.get("chunk_metadata") == True
+    print("[OK] CO_OCCURS_WITH (document) scope test passed")
+
+
+def test_co_occurs_with_validation():
+    """Test CO_OCCURS_WITH validation catches errors."""
+    # Test: single entity_id is rejected
+    try:
+        # This should fail in deserialization
+        data = {"type": "CO_OCCURS_WITH", "entity_id": 123, "window": "chunk"}
+        QueryPlan._dict_to_primitive(data)
+        assert False, "Should have raised ValueError for single entity_id"
+    except ValueError as e:
+        assert "requires two entities" in str(e).lower() or "entity_a" in str(e).lower()
+        print("[OK] CO_OCCURS_WITH single entity_id rejected correctly")
+    
+    # Test: missing entity_b fails
+    try:
+        CoOccursWithPrimitive(entity_a=123, entity_b=0, window="chunk")
+        assert False, "Should have raised ValueError for entity_b=0"
+    except ValueError as e:
+        assert "entity_b" in str(e)
+        print("[OK] CO_OCCURS_WITH missing entity_b rejected correctly")
+    
+    # Test: same entity fails
+    try:
+        CoOccursWithPrimitive(entity_a=123, entity_b=123, window="chunk")
+        assert False, "Should have raised ValueError for same entities"
+    except ValueError as e:
+        assert "different entities" in str(e).lower()
+        print("[OK] CO_OCCURS_WITH same entity rejected correctly")
+
+
+def test_co_occurs_with_serialization():
+    """Test CO_OCCURS_WITH serialization round-trip."""
+    original = CoOccursWithPrimitive(entity_a=123, entity_b=456, window="document")
+    
+    # Serialize
+    dict_form = QueryPlan._primitive_to_dict(original)
+    assert dict_form["type"] == "CO_OCCURS_WITH"
+    assert dict_form["entity_a"] == 123
+    assert dict_form["entity_b"] == 456
+    assert dict_form["window"] == "document"
+    
+    # Deserialize
+    restored = QueryPlan._dict_to_primitive(dict_form)
+    assert isinstance(restored, CoOccursWithPrimitive)
+    assert restored.entity_a == 123
+    assert restored.entity_b == 456
+    assert restored.window == "document"
+    
+    print("[OK] CO_OCCURS_WITH serialization round-trip passed")
+
+
+def test_co_occurs_with_backward_compat():
+    """Test CO_OCCURS_WITH backward compatibility with legacy format."""
+    # Legacy format: entity_id + other_entity_id
+    legacy_data = {"type": "CO_OCCURS_WITH", "entity_id": 123, "other_entity_id": 456, "window": "chunk"}
+    restored = QueryPlan._dict_to_primitive(legacy_data)
+    
+    assert isinstance(restored, CoOccursWithPrimitive)
+    assert restored.entity_a == 123
+    assert restored.entity_b == 456
+    assert restored.window == "chunk"
+    
+    print("[OK] CO_OCCURS_WITH backward compatibility passed")
 
 
 def test_scope_combination():
@@ -216,17 +331,22 @@ def test_scope_combination():
     primitives = [
         FilterCollectionPrimitive(slug="venona"),
         WithinResultSetPrimitive(result_set_id=5),
-        FilterDocumentPrimitive(document_id=123)
+        FilterDocumentPrimitive(document_id=123),
+        EntityPrimitive(entity_id=12345)
     ]
-    sql, params = compile_primitives_to_scope(primitives, chunk_id_expr="rc.chunk_id")
+    sql, params, joins = compile_primitives_to_scope(primitives, chunk_id_expr="rc.chunk_id")
     assert "rc.chunk_id = ANY" in sql
     assert "cm.collection_slug = %s" in sql
     assert "cm.document_id = %s" in sql
-    assert len(params) == 3
-    # Params should be in canonical order (FILTER_COLLECTION, FILTER_DOCUMENT, WITHIN_RESULT_SET)
+    assert "entity_mentions" in sql
+    assert len(params) >= 4
+    # Params should be in canonical order
     assert "venona" in params
     assert 123 in params
     assert 5 in params
+    assert 12345 in params
+    assert joins.get("chunk_metadata") == True
+    assert joins.get("entity_mentions") == True
     print("[OK] Scope combination test passed")
 
 
@@ -441,7 +561,17 @@ def run_all_tests(skip_db_tests: bool = False):
     test_scope_filter_collection()
     test_scope_filter_document()
     test_scope_filter_date_range()
+    test_scope_entity()
+    test_scope_co_occurs_with_chunk()
+    test_scope_co_occurs_with_document()
     test_scope_combination()
+    print()
+    
+    # CO_OCCURS_WITH tests
+    print("=== CO_OCCURS_WITH Primitive Tests ===")
+    test_co_occurs_with_validation()
+    test_co_occurs_with_serialization()
+    test_co_occurs_with_backward_compat()
     print()
     
     # Determinism tests

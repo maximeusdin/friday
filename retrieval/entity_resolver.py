@@ -35,17 +35,8 @@ class EntityLookupResult:
     ambiguous: bool  # True if multiple high-confidence matches
 
 
-def normalize_alias(alias: str) -> str:
-    """
-    Normalize alias for matching: lowercase, strip punctuation, collapse whitespace.
-    """
-    # Lowercase
-    normalized = alias.lower()
-    # Remove punctuation (keep alphanumeric and spaces)
-    normalized = re.sub(r'[^\w\s]', '', normalized)
-    # Collapse whitespace
-    normalized = re.sub(r'\s+', ' ', normalized)
-    return normalized.strip()
+# Import from single source of truth
+from retrieval.surface_norm import normalize_surface as normalize_alias
 
 
 def entity_lookup(
@@ -104,7 +95,8 @@ def entity_lookup(
                 entity_id=entity_id,
                 canonical_name=canonical_name,
                 entity_type=etype,
-                confidence=confidence,
+                # psycopg2 may return Decimal for numeric literals; normalize to float
+                confidence=float(confidence),
                 match_method="exact",
                 matched_alias=matched_alias,
             ))
@@ -123,7 +115,7 @@ def entity_lookup(
                     FROM entities e
                     JOIN entity_aliases ea ON ea.entity_id = e.id
                     WHERE e.entity_type = %s
-                      AND ea.alias_norm % %s  -- Trigram filter (uses index)
+                      AND ea.alias_norm %% %s  -- Trigram filter (uses index) [NOTE: use double-percent to escape in psycopg2]
                       AND similarity(ea.alias_norm, %s) >= %s
                     ORDER BY sim_score DESC, e.id
                     LIMIT %s
@@ -138,7 +130,7 @@ def entity_lookup(
                         similarity(ea.alias_norm, %s) AS sim_score
                     FROM entities e
                     JOIN entity_aliases ea ON ea.entity_id = e.id
-                    WHERE ea.alias_norm % %s  -- Trigram filter (uses index)
+                    WHERE ea.alias_norm %% %s  -- Trigram filter (uses index) [NOTE: use double-percent to escape in psycopg2]
                       AND similarity(ea.alias_norm, %s) >= %s
                     ORDER BY sim_score DESC, e.id
                     LIMIT %s

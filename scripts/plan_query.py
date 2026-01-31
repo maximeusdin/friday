@@ -142,6 +142,92 @@ def get_collections(conn) -> List[Dict[str, str]]:
         cur.execute("SELECT slug, title FROM collections ORDER BY slug")
         return [{"slug": r[0], "title": r[1]} for r in cur.fetchall()]
 
+
+def get_conversation_history(conn, session_id: int, limit: int = 10) -> List[Dict[str, Any]]:
+    """
+    Fetch recent conversation messages for context.
+    
+    Returns messages in chronological order (oldest first).
+    Truncates content to avoid prompt bloat.
+    """
+    with conn.cursor() as cur:
+        # Check if research_messages table exists
+        cur.execute("""
+            SELECT EXISTS (
+                SELECT FROM information_schema.tables 
+                WHERE table_name = 'research_messages'
+            )
+        """)
+        if not cur.fetchone()[0]:
+            return []  # Table doesn't exist yet
+        
+        cur.execute("""
+            SELECT role, content, plan_id, result_set_id, created_at
+            FROM research_messages
+            WHERE session_id = %s
+            ORDER BY created_at DESC
+            LIMIT %s
+        """, (session_id, limit))
+        
+        rows = cur.fetchall()
+        if not rows:
+            return []
+        
+        # Reverse to chronological order (oldest first)
+        messages = []
+        for row in reversed(rows):
+            role, content, plan_id, result_set_id, created_at = row
+            # Truncate content to avoid prompt bloat
+            truncated = content[:200] + "..." if len(content) > 200 else content
+            messages.append({
+                "role": role,
+                "content": truncated,
+                "plan_id": plan_id,
+                "result_set_id": result_set_id,
+                "created_at": created_at.isoformat() if created_at else None,
+            })
+        
+        return messages
+
+
+def summarize_conversation_history(history: List[Dict[str, Any]], max_chars: int = 1000) -> str:
+    """
+    Create a summary of conversation history for the LLM prompt.
+    
+    Prioritizes recent messages and ensures we don't exceed max_chars.
+    """
+    if not history:
+        return ""
+    
+    lines = []
+    total_chars = 0
+    
+    for msg in history:
+        role = msg["role"]
+        content = msg["content"]
+        
+        # Format based on role
+        if role == "user":
+            line = f"User: {content}"
+        elif role == "assistant":
+            line = f"Assistant: {content}"
+        elif role == "system":
+            line = f"[System: {content}]"
+        else:
+            line = f"{role}: {content}"
+        
+        # Check if adding this line would exceed max_chars
+        if total_chars + len(line) + 1 > max_chars:
+            # Add ellipsis and stop
+            if lines:
+                lines.insert(0, "... (earlier messages truncated)")
+            break
+        
+        lines.append(line)
+        total_chars += len(line) + 1
+    
+    return "\n".join(lines)
+
 def parse_collection_scope(utterance: str) -> tuple[str, Optional[str]]:
     """
     Deterministically parse collection scope from utterance.
@@ -232,6 +318,239 @@ def resolve_deictics_to_result_set(detected: Dict[str, bool], recent_result_sets
     return recent_result_sets[0]["id"]
 
 # =============================================================================
+# Entity Resolution (Pre-LLM)
+# =============================================================================
+
+# Patterns for detecting potential entity names in utterances
+# These help identify capitalized names, quoted strings, and common entity patterns
+ENTITY_PATTERNS = [
+    # Quoted names: "Ethel Rosenberg", 'CPUSA'
+    r'"([^"]+)"',
+    r"'([^']+)'",
+    # Capitalized multi-word names: Ethel Rosenberg, Julius Rosenberg
+    r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b',
+    # Single capitalized words that could be names (but filter common words)
+    r'\b([A-Z][a-z]{2,})\b',
+    # All-caps acronyms: CPUSA, KGB, FBI
+    r'\b([A-Z]{2,})\b',
+]
+
+# Common words to exclude from entity detection
+ENTITY_STOPWORDS = {
+    # Common English words that start capitalized
+    "the", "a", "an", "in", "on", "at", "to", "for", "of", "with", "by",
+    "from", "about", "into", "through", "during", "before", "after",
+    "above", "below", "between", "under", "over", "out", "up", "down",
+    "off", "then", "once", "here", "there", "when", "where", "why", "how",
+    "all", "each", "every", "both", "few", "more", "most", "other", "some",
+    "such", "no", "nor", "not", "only", "own", "same", "so", "than", "too",
+    "very", "just", "also", "now", "new", "old", "first", "last", "long",
+    "great", "little", "good", "bad", "high", "low", "small", "large",
+    # Query-related words
+    "find", "search", "show", "get", "list", "display", "documents",
+    "mentions", "results", "chunks", "pages", "evidence", "references",
+    "collection", "session", "query", "plan", "filter", "within",
+    # Common sentence starters
+    "what", "who", "which", "whose", "whom", "this", "that", "these",
+    "those", "and", "but", "or", "if", "while", "because", "although",
+    "however", "therefore", "thus", "hence", "indeed", "moreover",
+    # Document types
+    "document", "report", "memo", "letter", "cable", "transcript",
+    # Time-related
+    "today", "yesterday", "tomorrow", "week", "month", "year", "date",
+}
+
+
+def extract_potential_entity_names(utterance: str) -> List[str]:
+    """
+    Extract potential entity names from the utterance using patterns.
+    Returns a list of candidate name strings to look up.
+    """
+    candidates = []
+    seen_lower = set()
+    
+    for pattern in ENTITY_PATTERNS:
+        for match in re.finditer(pattern, utterance):
+            name = match.group(1) if match.lastindex else match.group(0)
+            name = name.strip()
+            
+            # Skip empty, too short, or stopwords
+            if not name or len(name) < 2:
+                continue
+            
+            name_lower = name.lower()
+            if name_lower in ENTITY_STOPWORDS:
+                continue
+            
+            # Skip if we've already seen this (case-insensitive dedup)
+            if name_lower in seen_lower:
+                continue
+            
+            seen_lower.add(name_lower)
+            candidates.append(name)
+
+    # Post-pass: avoid redundant single-token candidates when a longer phrase exists.
+    #
+    # Example: after clarification we may have "Julius Rosenberg" in the utterance.
+    # The single-token pattern also matches "Rosenberg", which can re-trigger
+    # ambiguity even though the longer phrase already disambiguates.
+    multiword = [c for c in candidates if " " in c.strip()]
+    if multiword:
+        multiword_lowers = [f" {mw.lower()} " for mw in multiword]
+        filtered: List[str] = []
+        for c in candidates:
+            c_stripped = c.strip()
+            if " " not in c_stripped:
+                token = f" {c_stripped.lower()} "
+                if any(token in mw for mw in multiword_lowers):
+                    # Drop redundant single token (covered by a longer candidate)
+                    continue
+            filtered.append(c)
+        candidates = filtered
+
+    return candidates
+
+
+def resolve_entities_in_utterance(
+    conn,
+    utterance: str,
+    *,
+    best_guess_mode: Optional[bool] = None,
+    confidence_threshold: float = 0.85,
+) -> Tuple[List[Dict[str, Any]], Dict[str, int], Optional[Dict[str, Any]]]:
+    """
+    Pre-LLM entity resolution. Finds entity names in utterance
+    and resolves them to entity_ids.
+    
+    Args:
+        conn: Database connection
+        utterance: User's query text
+        best_guess_mode: If True, pick top candidate without clarification for ambiguous matches.
+                        If None, uses ENTITY_BEST_GUESS env var (default: False).
+        confidence_threshold: Minimum confidence delta to consider a match "clear".
+                             If top match is this much better than second, use it without clarification.
+    
+    Returns:
+        (entity_context, resolved_map, clarification_needed)
+        - entity_context: list of dicts for LLM prompt with resolved entities (includes confidence)
+        - resolved_map: {surface -> entity_id} for unambiguous matches
+        - clarification_needed: dict with needs_clarification=True and choices if ambiguous
+    """
+    from retrieval.entity_resolver import entity_lookup, EntityLookupResult
+    
+    # Determine best-guess mode
+    if best_guess_mode is None:
+        best_guess_mode = os.getenv("ENTITY_BEST_GUESS", "").lower() in ("1", "true", "yes")
+    
+    entity_context: List[Dict[str, Any]] = []
+    resolved_map: Dict[str, int] = {}
+    
+    # Extract potential entity names from utterance
+    candidate_names = extract_potential_entity_names(utterance)
+    
+    for name in candidate_names:
+        try:
+            result: EntityLookupResult = entity_lookup(conn, name)
+        except Exception as e:
+            # If entity lookup fails (e.g., table doesn't exist), skip gracefully
+            print(f"Warning: Entity lookup failed for '{name}': {e}", file=sys.stderr)
+            continue
+        
+        # Get all matches sorted by confidence
+        all_matches = sorted(
+            result.exact_matches + result.near_matches,
+            key=lambda c: c.confidence,
+            reverse=True
+        )
+        
+        if not all_matches:
+            # No matches - LLM will handle as TERM/PHRASE
+            continue
+        
+        # Check if we have a clear winner
+        is_clear_match = False
+        if len(all_matches) == 1:
+            is_clear_match = True
+        elif len(all_matches) >= 2:
+            # Clear match if top confidence is significantly better than second
+            conf_delta = all_matches[0].confidence - all_matches[1].confidence
+            is_clear_match = conf_delta >= confidence_threshold
+        
+        if result.ambiguous and not is_clear_match:
+            # Ambiguous - check if we should use best-guess mode
+            if best_guess_mode:
+                # Best-guess mode: use top candidate
+                print(f"  Entity '{name}' ambiguous, using best guess: {all_matches[0].canonical_name} "
+                      f"(confidence: {all_matches[0].confidence:.2f})", file=sys.stderr)
+                best_match = all_matches[0]
+                resolved_map[name] = best_match.entity_id
+                entity_context.append({
+                    "surface": name,
+                    "entity_id": best_match.entity_id,
+                    "canonical_name": best_match.canonical_name,
+                    "entity_type": best_match.entity_type,
+                    "confidence": best_match.confidence,
+                    "match_method": best_match.match_method,
+                    "is_best_guess": True,
+                    "alternatives": [
+                        {
+                            "entity_id": c.entity_id,
+                            "canonical_name": c.canonical_name,
+                            "confidence": float(c.confidence),
+                        }
+                        for c in all_matches[1:3]  # Include top 2 alternatives
+                    ],
+                })
+                continue
+            
+            # Need clarification
+            choices = [
+                f"{c.canonical_name} ({c.entity_type}, ID: {c.entity_id}, conf: {c.confidence:.2f})"
+                for c in all_matches[:5]  # Limit to top 5 choices
+            ]
+            return [], {}, {
+                "needs_clarification": True,
+                "choices": choices,
+                "query": {
+                    "raw": utterance,
+                    "primitives": []
+                },
+                "_clarification_context": {
+                    "ambiguous_name": name,
+                    "candidates": [
+                        {
+                            "entity_id": c.entity_id,
+                            "canonical_name": c.canonical_name,
+                            "entity_type": c.entity_type,
+                            # Ensure JSON-serializable (EntityCandidate.confidence can be Decimal)
+                            "confidence": float(c.confidence),
+                        }
+                        for c in all_matches[:5]
+                    ],
+                    "best_guess": {
+                        "entity_id": all_matches[0].entity_id,
+                        "canonical_name": all_matches[0].canonical_name,
+                        "confidence": float(all_matches[0].confidence),
+                    }
+                }
+            }
+        
+        # Single match or clear best match
+        best_match = all_matches[0]
+        resolved_map[name] = best_match.entity_id
+        entity_context.append({
+            "surface": name,
+            "entity_id": best_match.entity_id,
+            "canonical_name": best_match.canonical_name,
+            "entity_type": best_match.entity_type,
+            "confidence": best_match.confidence,
+            "match_method": best_match.match_method,
+        })
+    
+    return entity_context, resolved_map, None
+
+
+# =============================================================================
 # Prompt
 # =============================================================================
 
@@ -241,6 +560,9 @@ def build_llm_prompt(
     recent_result_sets: List[Dict[str, Any]],
     collections: List[Dict[str, str]],
     detected_deictics: Dict[str, bool],
+    entity_context: List[Dict[str, Any]],
+    conversation_history: List[Dict[str, Any]],
+    date_context: List[Dict[str, Any]],
     query_lang_version: str = "qir_v1",
 ) -> str:
     allowed_primitives = [
@@ -250,6 +572,7 @@ def build_llm_prompt(
         "TOGGLE_CONCORDANCE_EXPANSION",
         "ENTITY","CO_OCCURS_WITH","INTERSECT_DATE_WINDOWS","FILTER_COUNTRY",
         "CO_LOCATED","RELATION_EVIDENCE","REQUIRE_EVIDENCE","GROUP_BY",
+        "COUNT","SET_QUERY_MODE",
     ]
 
     rs_ctx = "\nRecent result_sets in this session:\n"
@@ -265,6 +588,47 @@ def build_llm_prompt(
             col_ctx += f"  - slug: {col['slug']}, title: {col['title']}\n"
     else:
         col_ctx = "\nNo collections available.\n"
+
+    # Entity context section
+    entity_ctx = ""
+    if entity_context:
+        entity_ctx = "\nRESOLVED ENTITIES (use these entity_ids in ENTITY primitives):\n"
+        for ent in entity_context:
+            entity_ctx += f"  - \"{ent['surface']}\" -> entity_id={ent['entity_id']} ({ent['canonical_name']}, {ent['entity_type']})\n"
+        entity_ctx += """
+IMPORTANT: When the query mentions a resolved entity above, use the ENTITY primitive with the provided entity_id.
+Example: For "find mentions of Ethel Rosenberg" where Ethel Rosenberg resolves to entity_id=42:
+  {"type": "ENTITY", "entity_id": 42}
+"""
+
+    # Conversation history section
+    conv_ctx = ""
+    if conversation_history:
+        conv_summary = summarize_conversation_history(conversation_history, max_chars=800)
+        if conv_summary:
+            conv_ctx = f"""
+CONVERSATION HISTORY:
+{conv_summary}
+
+Note: The user may reference previous queries or results. Use this context to understand follow-up questions like "what about X?" or "tell me more about Y".
+"""
+
+    # Date context section
+    date_ctx = ""
+    if date_context:
+        date_ctx = "\nRESOLVED DATES (use these in FILTER_DATE_RANGE primitives):\n"
+        for d in date_context:
+            if d.get("start") and d.get("end"):
+                date_ctx += f"  - \"{d['expression']}\" -> start: {d['start']}, end: {d['end']}\n"
+            elif d.get("start"):
+                date_ctx += f"  - \"{d['expression']}\" -> start: {d['start']} (open-ended)\n"
+            elif d.get("end"):
+                date_ctx += f"  - \"{d['expression']}\" -> end: {d['end']} (open-ended)\n"
+        date_ctx += """
+IMPORTANT: When the query mentions dates resolved above, use FILTER_DATE_RANGE primitive with the resolved dates.
+Example: For "documents from the 1940s" resolved to start: 1940-01-01, end: 1949-12-31:
+  {"type": "FILTER_DATE_RANGE", "start": "1940-01-01", "end": "1949-12-31"}
+"""
 
     deictic_warning = ""
     if detected_deictics:
@@ -285,6 +649,9 @@ SESSION CONTEXT:
 {session_summary}
 {rs_ctx}
 {col_ctx}
+{entity_ctx}
+{date_ctx}
+{conv_ctx}
 {deictic_warning}
 
 QUERY LANGUAGE VERSION: {query_lang_version}
@@ -300,10 +667,15 @@ INSTRUCTIONS:
 - Use FILTER_COLLECTION only if clearly mentioned.
 - Add retrieval controls only if clearly implied.
 - When deictic references are detected (those/prev/earlier results), you MUST include WITHIN_RESULT_SET primitive (result_set_id can be null/omitted).
+- When entity names are resolved above, use ENTITY primitives with the provided entity_id.
+- When dates are resolved above, use FILTER_DATE_RANGE primitives with the resolved start/end dates.
+- Use conversation history to understand follow-up questions and contextual references.
 
 HARD CONSTRAINTS:
 - If deictic warning is shown above, you MUST include WITHIN_RESULT_SET and MUST NOT set needs_clarification=true.
-- Only set needs_clarification=true for genuine ambiguities unrelated to result set references (e.g., ambiguous person names).
+- If entities are resolved above, use ENTITY primitives with the provided entity_ids.
+- If dates are resolved above, use FILTER_DATE_RANGE primitives with the resolved dates.
+- Only set needs_clarification=true for genuine ambiguities that couldn't be resolved.
 - Only use allowed primitive types.
 - IDs/slugs must match the provided context.
 """
@@ -319,7 +691,8 @@ def get_plan_json_schema() -> Dict[str, Any]:
         "SET_TOP_K","SET_SEARCH_TYPE","SET_TERM_MODE","OR_GROUP",
         "TOGGLE_CONCORDANCE_EXPANSION",
         "ENTITY","CO_OCCURS_WITH","INTERSECT_DATE_WINDOWS","FILTER_COUNTRY",
-        "CO_LOCATED","RELATION_EVIDENCE","REQUIRE_EVIDENCE","GROUP_BY"
+        "CO_LOCATED","RELATION_EVIDENCE","REQUIRE_EVIDENCE","GROUP_BY",
+        "COUNT","SET_QUERY_MODE"
     ]
 
     nullable_str = {"type": ["string", "null"]}
@@ -714,13 +1087,24 @@ def inject_all_result_sets(plan_dict: Dict[str, Any], recent_result_sets: List[D
 # =============================================================================
 
 def validate_and_normalize(plan_dict: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
+    """
+    Validate and normalize the plan dict.
+    
+    Note: needs_clarification=True is NOT an error - it's a valid plan state
+    that indicates the user needs to make a choice before the plan can be executed.
+    """
     errors: List[str] = []
     if "query" not in plan_dict or not isinstance(plan_dict["query"], dict):
         return plan_dict, ["Missing 'query' field in plan"]
     if "primitives" not in plan_dict["query"]:
         return plan_dict, ["Missing 'query.primitives' field in plan"]
+    
+    # Don't fail on needs_clarification - it's a valid plan state
+    # The backend/UI will handle prompting the user for clarification
     if plan_dict.get("needs_clarification"):
-        return plan_dict, ["LLM requested clarification - cannot proceed"]
+        # For clarification plans, skip primitive validation since they may be empty
+        return plan_dict, []
+    
     try:
         # First validate structure (existing validation)
         errors.extend(validate_plan_json(plan_dict))
@@ -895,8 +1279,33 @@ def save_plan(
     plan: ResearchPlan,
     user_utterance: str,
     query_lang_version: str = "qir_v1",
+    *,
+    resolution_metadata: Optional[Dict[str, Any]] = None,
 ) -> int:
+    """
+    Save a plan to the database.
+    
+    Args:
+        conn: Database connection
+        session_id: Session ID
+        plan: ResearchPlan object
+        user_utterance: Original user query
+        query_lang_version: Query language version
+        resolution_metadata: Optional metadata about pre-LLM resolution:
+            - resolved_dates: List of date expressions resolved to absolute ranges
+            - resolved_entities: List of entity resolutions with confidence
+            - resolution_timestamp: When resolution was performed
+    """
     plan_dict = plan.to_dict()
+    
+    # Add resolution metadata if provided (for reproducibility)
+    if resolution_metadata:
+        plan_dict["_metadata"] = plan_dict.get("_metadata", {})
+        plan_dict["_metadata"]["resolution"] = {
+            **resolution_metadata,
+            "resolved_at": __import__("datetime").datetime.now().isoformat(),
+        }
+    
     plan_hash = compute_plan_hash(plan_dict)
     with conn.cursor() as cur:
         cur.execute(
@@ -941,6 +1350,7 @@ def main():
         recent_result_sets = get_recent_result_sets(conn, session_id)
         recent_run = get_most_recent_retrieval_run(conn, session_id)
         collections = get_collections(conn)
+        conversation_history = get_conversation_history(conn, session_id, limit=10)
 
         # Deterministically parse collection scope BEFORE LLM call
         cleaned_utterance, explicit_collection_scope = parse_collection_scope(args.text)
@@ -956,12 +1366,78 @@ def main():
                 resolved_deictics_meta["resolved_to"] = resolved_rs_id
                 resolved_deictics_meta["resolved_result_set_id"] = resolved_rs_id
 
+        # Pre-LLM date resolution
+        print("Resolving dates in utterance...", file=sys.stderr)
+        try:
+            from retrieval.date_parser import resolve_dates_in_utterance
+            date_context, date_info = resolve_dates_in_utterance(args.text)
+            if date_context:
+                print(f"  Resolved {len(date_context)} date expressions:", file=sys.stderr)
+                for d in date_context:
+                    print(f"    - \"{d['expression']}\" -> {d.get('start', '?')} to {d.get('end', '?')}", file=sys.stderr)
+        except ImportError as e:
+            print(f"  Warning: Date parsing unavailable: {e}", file=sys.stderr)
+            date_context = []
+        except Exception as e:
+            print(f"  Warning: Date parsing failed: {e}", file=sys.stderr)
+            date_context = []
+        
+        # Pre-LLM entity resolution
+        print("Resolving entities in utterance...", file=sys.stderr)
+        entity_context, resolved_entities, clarification_needed = resolve_entities_in_utterance(
+            conn, args.text
+        )
+        
+        if entity_context:
+            print(f"  Resolved {len(entity_context)} entities:", file=sys.stderr)
+            for ent in entity_context:
+                print(f"    - \"{ent['surface']}\" -> {ent['canonical_name']} (ID: {ent['entity_id']})", file=sys.stderr)
+        
+        # If entity resolution requires clarification, return early
+        if clarification_needed:
+            print("Entity resolution requires clarification", file=sys.stderr)
+            # Save as a clarification-needed plan
+            clarification_needed["query"]["raw"] = args.text
+            plan_dict = normalize_plan_dict(clarification_needed)
+            
+            if not args.dry_run:
+                # Save the clarification plan directly
+                plan_hash = compute_plan_hash(plan_dict)
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO research_plans (
+                            session_id,
+                            plan_json,
+                            plan_hash,
+                            query_lang_version,
+                            retrieval_impl_version,
+                            status,
+                            user_utterance
+                        )
+                        VALUES (%s, %s, %s, %s, %s, 'proposed', %s)
+                        RETURNING id
+                        """,
+                        (session_id, Json(plan_dict), plan_hash, args.query_lang_version, "retrieval_v1", args.text),
+                    )
+                    plan_id = cur.fetchone()[0]
+                    conn.commit()
+                print(f"\n⚠️  Clarification needed. Plan saved with ID: {plan_id}", file=sys.stderr)
+                print(json.dumps(plan_dict, indent=2))
+            else:
+                print("\n[DRY RUN] Clarification plan not saved to database", file=sys.stderr)
+                print(json.dumps(plan_dict, indent=2))
+            sys.exit(0)
+
         prompt = build_llm_prompt(
             args.text,
             session_summary,
             recent_result_sets,
             collections,
             detected_deictics,
+            entity_context,
+            conversation_history,
+            date_context,
             args.query_lang_version,
         )
 
@@ -1057,7 +1533,41 @@ def main():
 
         # persist
         if not args.dry_run:
-            plan_id = save_plan(conn, session_id, plan, args.text, args.query_lang_version)
+            # Build resolution metadata for reproducibility
+            resolution_metadata = {}
+            if date_context:
+                resolution_metadata["resolved_dates"] = [
+                    {
+                        "expression": d["expression"],
+                        "start": d.get("start"),
+                        "end": d.get("end"),
+                    }
+                    for d in date_context
+                ]
+            if entity_context:
+                resolution_metadata["resolved_entities"] = [
+                    {
+                        "surface": e["surface"],
+                        "entity_id": e["entity_id"],
+                        "canonical_name": e["canonical_name"],
+                        "confidence": e.get("confidence"),
+                        "match_method": e.get("match_method"),
+                        "is_best_guess": e.get("is_best_guess", False),
+                        # Include alternatives for best-guess resolutions (for later review)
+                        "alternatives": e.get("alternatives", []) if e.get("is_best_guess") else [],
+                    }
+                    for e in entity_context
+                ]
+                # Record resolution settings for reproducibility
+                resolution_metadata["entity_resolution_settings"] = {
+                    "best_guess_mode": os.getenv("ENTITY_BEST_GUESS", "").lower() in ("1", "true", "yes"),
+                    "confidence_threshold": 0.85,  # Default threshold
+                }
+            
+            plan_id = save_plan(
+                conn, session_id, plan, args.text, args.query_lang_version,
+                resolution_metadata=resolution_metadata if resolution_metadata else None,
+            )
             print(f"\n✅ Plan saved with ID: {plan_id} (session={session_id}, status: proposed)", file=sys.stderr)
         else:
             print("\n[DRY RUN] Plan not saved to database", file=sys.stderr)

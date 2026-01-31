@@ -1107,8 +1107,16 @@ def embed_query(text: str) -> List[float]:
     """Embed query using OpenAI embeddings. Assumes chunks.embedding is vector(1536)."""
     from openai import OpenAI  # pip install openai
     model = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small")
+    # Defensive normalization + validation (prevents OpenAI 400 "$.input is invalid")
+    text = _normalize_q(text)
+    if not isinstance(text, str):
+        text = str(text)
+    text = text.strip()
+    if not text:
+        raise ValueError("embed_query got empty input text")
     client = OpenAI()
-    resp = client.embeddings.create(model=model, input=[text])
+    # Some environments are sensitive to input shape; pass as a single string.
+    resp = client.embeddings.create(model=model, input=text)
     vec = resp.data[0].embedding
     if len(vec) != 1536:
         raise RuntimeError(f"Query embedding dim {len(vec)} != 1536 (expected vector(1536))")
