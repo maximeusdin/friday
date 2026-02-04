@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Friday Research Console</title>
+  <meta name="description" content="AI research assistant for Cold War archival materials">
+  <style>
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+    
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: #ffffff;
+      color: #212529;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+    }
+    
+    .container {
+      text-align: center;
+      padding: 2rem;
+      max-width: 600px;
+    }
+    
+    h1 {
+      font-size: 2.5rem;
+      margin-bottom: 1rem;
+      color: #0d6efd;
+    }
+    
+    .subtitle {
+      font-size: 1.1rem;
+      color: #6c757d;
+      margin-bottom: 2rem;
+    }
+    
+    .card {
+      background: #f8f9fa;
+      border: 1px solid #dee2e6;
+      border-radius: 8px;
+      padding: 1.5rem;
+      margin-bottom: 1.5rem;
+      text-align: left;
+    }
+    
+    .card h2 {
+      font-size: 1rem;
+      margin-bottom: 0.75rem;
+      color: #212529;
+    }
+    
+    .card p {
+      font-size: 0.9rem;
+      color: #6c757d;
+      margin-bottom: 0.5rem;
+    }
+    
+    .card code {
+      background: #e9ecef;
+      padding: 0.2rem 0.4rem;
+      border-radius: 4px;
+      font-size: 0.85rem;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    }
+    
+    .btn {
+      display: inline-block;
+      background: #0d6efd;
+      color: white;
+      padding: 0.75rem 1.5rem;
+      border-radius: 6px;
+      text-decoration: none;
+      font-weight: 500;
+      transition: background-color 0.15s ease;
+    }
+    
+    .btn:hover {
+      background: #0b5ed7;
+    }
+    
+    .footer {
+      margin-top: 2rem;
+      font-size: 0.85rem;
+      color: #6c757d;
+    }
+    
+    noscript {
+      background: #fff3cd;
+      padding: 1rem;
+      border-radius: 8px;
+      margin-top: 1rem;
+      display: block;
+      color: #856404;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Friday Research Console</h1>
+    <p class="subtitle">AI research assistant for Cold War archival materials</p>
+    
+    <div class="card">
+      <h2>Build the Application</h2>
+      <p>This is the source directory. To deploy to S3:</p>
+      <p><code>npm install</code></p>
+      <p><code>npm run build</code></p>
+      <p>The built site will be in the <code>out/</code> folder.</p>
+    </div>
+    
+    <div class="card">
+      <h2>Configure API URL</h2>
+      <p>Set the backend API URL before building:</p>
+      <p><code>NEXT_PUBLIC_API_URL=https://your-api.com/api</code></p>
+    </div>
+    
+    <div class="card">
+      <h2>Deploy to S3</h2>
+      <p>After building, deploy with:</p>
+      <p><code>.\deploy.ps1 -BucketName your-bucket</code></p>
+      <p>or</p>
+      <p><code>./deploy.sh your-bucket</code></p>
+    </div>
+    
+    <a href="README.md" class="btn">Read Documentation</a>
+    
+    <p class="footer">
+      See <code>README.md</code> for full deployment instructions.
+    </p>
+    
+    <noscript>
+      <strong>Note:</strong> The deployed application requires JavaScript to run.
+    </noscript>
+  </div>
+</body>
+</html>
