@@ -2,6 +2,7 @@
 Friday Research Console - FastAPI Backend
 """
 import os
+import logging
 import sys
 from pathlib import Path
 
@@ -13,20 +14,49 @@ from fastapi import FastAPI, Request
 from fastapi import HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from dotenv import load_dotenv
 
 from app.routes import sessions, plans, results, documents, meta
 from app.services.db import ConfigError
+from app.services.db import get_conn
 
-# Load .env from repo root and backend/ (dev convenience)
-load_dotenv(REPO_ROOT / ".env")
-load_dotenv(Path(__file__).parent.parent / ".env")
+# Optional: load .env files (dev convenience). Disabled by default so the app
+# can run in a container with only environment variables.
+if os.getenv("FRIDAY_LOAD_DOTENV") == "1":
+    try:
+        from dotenv import load_dotenv
+
+        load_dotenv(REPO_ROOT / ".env")
+        load_dotenv(Path(__file__).parent.parent / ".env")
+    except Exception:
+        # If python-dotenv isn't installed or files are missing, ignore.
+        pass
 
 app = FastAPI(
     title="Friday Research Console",
     description="AI research assistant for Cold War archival materials",
     version="0.1.0",
 )
+
+log = logging.getLogger("friday")
+
+
+def _mask_url(url: str) -> str:
+    # Hide password if present in URL
+    # e.g. postgresql://user:pass@host/db -> postgresql://user:***@host/db
+    import re
+
+    return re.sub(r"(postgres(?:ql)?://[^:]+:)([^@]+)@", r"\1***@", url)
+
+
+@app.on_event("startup")
+async def startup_event():
+    db_url = os.getenv("DATABASE_URL", "")
+    db_host = os.getenv("DB_HOST", "")
+    log.info("ENV_CHECK: DATABASE_URL present=%s", bool(db_url))
+    if db_url:
+        log.info("ENV_CHECK: DATABASE_URL(masked)=%s", _mask_url(db_url))
+    log.info("ENV_CHECK: DB_HOST=%s", db_host or "<missing>")
+
 
 # Consistent error shape
 @app.exception_handler(ConfigError)
@@ -89,5 +119,30 @@ app.include_router(documents.router, prefix="/api", tags=["documents"])
 
 @app.get("/health")
 def health():
-    """Health check endpoint."""
-    return {"status": "ok"}
+    """
+    Health check endpoint.
+
+    Returns:
+    - status: ok
+    - build: short git SHA if available
+    - db: connectivity status (SELECT 1)
+    """
+    build = meta.get_git_sha()
+    db_ok = False
+    db_error = None
+    try:
+        conn = get_conn(connect_timeout_seconds=2)
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1;")
+                _ = cur.fetchone()
+            db_ok = True
+        finally:
+            conn.close()
+    except Exception as e:
+        db_error = str(e)
+
+    out = {"status": "ok", "build": build, "db": {"ok": db_ok}}
+    if db_error and not db_ok:
+        out["db"]["error"] = db_error[:200]
+    return out

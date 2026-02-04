@@ -1,6 +1,7 @@
 """
 Meta endpoints - health, version, contract info
 """
+import os
 import subprocess
 from fastapi import APIRouter
 
@@ -12,6 +13,9 @@ API_VERSION = "0.1.0"
 
 def get_git_sha() -> str:
     """Get current git SHA for build info."""
+    sha = (os.getenv("GIT_SHA") or os.getenv("FRIDAY_GIT_SHA") or "").strip()
+    if sha:
+        return sha
     try:
         result = subprocess.run(
             ["git", "rev-parse", "--short", "HEAD"],

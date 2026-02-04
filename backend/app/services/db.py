@@ -18,11 +18,13 @@ def get_dsn() -> str:
     return dsn
 
 
-def get_conn():
+def get_conn(*, connect_timeout_seconds: int | None = None):
     """
     Get a database connection.
     
     Uses DATABASE_URL environment variable.
     Caller is responsible for closing the connection.
     """
+    if connect_timeout_seconds is not None:
+        return psycopg2.connect(get_dsn(), connect_timeout=connect_timeout_seconds)
     return psycopg2.connect(get_dsn())
