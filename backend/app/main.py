@@ -97,12 +97,16 @@ def http_exception_handler(_request: Request, exc: HTTPException):
         },
     )
 
-# CORS for frontend dev
+# CORS for frontend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:3000",  # Next.js dev
         "http://127.0.0.1:3000",
+        "http://fridayarchive.org",  # S3 production
+        "http://www.fridayarchive.org",
+        "https://fridayarchive.org",  # Future HTTPS
+        "https://www.fridayarchive.org",
     ],
     allow_credentials=True,
     allow_methods=["*"],
