@@ -310,9 +310,24 @@ class NERGuardrails:
         if is_junk:
             return False, f'junk:{junk_reason}'
         
-        doc_count = stats.get('doc_count', 0)
-        mention_count = stats.get('mention_count', 0)
-        ner_score = stats.get('ner_score', 0)
+        # Be defensive: upstream may pass NULL/None from DB columns like doc_freq.
+        doc_count = stats.get('doc_count', 0) or 0
+        mention_count = stats.get('mention_count', 0) or 0
+        ner_score = stats.get('ner_score', 0) or 0.0
+
+        # Normalize types (avoid TypeError on comparisons)
+        try:
+            doc_count = int(doc_count)
+        except Exception:
+            doc_count = 0
+        try:
+            mention_count = int(mention_count)
+        except Exception:
+            mention_count = 0
+        try:
+            ner_score = float(ner_score)
+        except Exception:
+            ner_score = 0.0
         
         # Must meet minimum evidence thresholds
         has_doc_evidence = doc_count >= MIN_DOCS_FOR_QUEUE

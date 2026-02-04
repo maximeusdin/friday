@@ -11,7 +11,40 @@ import psycopg2.extras
 # -----------------------------
 # Embedding provider (pluggable)
 # -----------------------------
-def embed_texts(texts: List[str]) -> List[List[float]]:
+
+# OpenAI embedding models have token limits:
+# - text-embedding-3-small: 8191 tokens
+# - text-embedding-3-large: 8191 tokens
+# Very conservative: ~2.2 chars per token worst case, so ~18000 chars to be safe
+MAX_EMBED_CHARS = int(os.getenv("MAX_EMBED_CHARS", "18000"))
+
+
+def truncate_text(text: str, max_chars: int = MAX_EMBED_CHARS) -> Tuple[str, bool]:
+    """
+    Truncate text to max_chars if needed. Returns (text, was_truncated).
+    Tries to truncate at a sentence or word boundary.
+    """
+    if len(text) <= max_chars:
+        return text, False
+    
+    # Try to find a good break point
+    truncated = text[:max_chars]
+    
+    # Try to break at last sentence
+    for sep in ['. ', '.\n', '\n\n', '\n', ' ']:
+        last_sep = truncated.rfind(sep)
+        if last_sep > max_chars * 0.8:  # Only if we keep at least 80%
+            return truncated[:last_sep + len(sep)].rstrip(), True
+    
+    # Fallback: break at last space
+    last_space = truncated.rfind(' ')
+    if last_space > max_chars * 0.8:
+        return truncated[:last_space], True
+    
+    return truncated, True
+
+
+def embed_texts(texts: List[str], verbose: bool = True) -> List[List[float]]:
     """
     Replace this function with your actual embedding provider.
 
@@ -32,8 +65,20 @@ def embed_texts(texts: List[str]) -> List[List[float]]:
         model = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small")
         client = OpenAI()
 
+        # Truncate oversized texts
+        processed_texts = []
+        truncated_count = 0
+        for t in texts:
+            truncated, was_truncated = truncate_text(t)
+            processed_texts.append(truncated)
+            if was_truncated:
+                truncated_count += 1
+        
+        if truncated_count > 0 and verbose:
+            print(f"  [truncated {truncated_count}/{len(texts)} oversized chunks]", end="", flush=True)
+
         # OpenAI supports batching; keep batch sizes reasonable.
-        resp = client.embeddings.create(model=model, input=texts)
+        resp = client.embeddings.create(model=model, input=processed_texts)
         return [d.embedding for d in resp.data]
 
     raise RuntimeError(

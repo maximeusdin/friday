@@ -39,6 +39,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -79,6 +80,35 @@ def get_conn():
         user=os.environ.get('POSTGRES_USER', 'neh'),
         password=os.environ.get('POSTGRES_PASSWORD', 'neh')
     )
+
+_STOP_REQUESTED = False
+
+
+def _install_interrupt_handlers() -> None:
+    """
+    Ensure Ctrl+C (SIGINT) and SIGTERM lead to a *graceful* stop:
+    finish current batch, commit progress, exit.
+    """
+    def _handler(signum, frame):
+        global _STOP_REQUESTED
+        if not _STOP_REQUESTED:
+            _STOP_REQUESTED = True
+            # stderr so it shows up even if stdout is redirected/buffered
+            print(
+                "\n[INTERRUPT] Stop requested. Finishing current batch, committing progress, then exiting...",
+                file=sys.stderr,
+                flush=True,
+            )
+
+    # SIGTERM isn't available on some Windows runtimes, so be defensive.
+    try:
+        signal.signal(signal.SIGINT, _handler)
+    except Exception:
+        pass
+    try:
+        signal.signal(signal.SIGTERM, _handler)
+    except Exception:
+        pass
 
 
 def check_ner_schema(conn, warn_only: bool = False, check_dates: bool = True) -> bool:
@@ -252,9 +282,9 @@ def get_chunks_for_processing(
         SELECT c.id as chunk_id, c.text, cm.document_id, d.source_name as doc_name,
                col.title as collection_name
         FROM chunks c
-        LEFT JOIN chunk_metadata cm ON cm.chunk_id = c.id
-        LEFT JOIN documents d ON d.id = cm.document_id
-        LEFT JOIN collections col ON col.id = d.collection_id
+        JOIN chunk_metadata cm ON cm.chunk_id = c.id
+        JOIN documents d ON d.id = cm.document_id
+        JOIN collections col ON col.id = d.collection_id
         {where_clause}
         ORDER BY c.id
         {limit_clause}
@@ -915,6 +945,7 @@ def save_ner_date_signals(
 
 
 def main():
+    global _STOP_REQUESTED
     parser = argparse.ArgumentParser(description='Run NER extraction on documents')
     parser.add_argument('--collection', help='Collection to process')
     parser.add_argument('--doc-ids', help='Comma-separated document IDs')
@@ -938,6 +969,8 @@ def main():
     parser.add_argument('--reprocess', action='store_true', 
                        help='Reprocess all chunks (disable skip-processed)')
     args = parser.parse_args()
+
+    _install_interrupt_handlers()
     
     # Skip-processed is default ON; --reprocess turns it OFF
     args.skip_processed = not args.reprocess
@@ -1004,6 +1037,15 @@ def main():
         require_dates=args.extract_dates,  # If dates wanted, don't skip chunks missing dates
     )
     print(f"Found {len(chunks)} chunks to process")
+    if chunks:
+        chunk_ids = [c.get("chunk_id") for c in chunks if c.get("chunk_id") is not None]
+        if chunk_ids:
+            print(f"Chunk id range in this run: {min(chunk_ids)} .. {max(chunk_ids)}")
+            if args.limit:
+                print(
+                    "Note: --limit caps the number of *unprocessed* chunks selected. "
+                    "If you re-run without --reprocess, it will keep advancing to the next chunks."
+                )
     
     if not chunks:
         print("No chunks to process.")
@@ -1035,11 +1077,14 @@ def main():
     batch_chunks = []
     
     for i, chunk in enumerate(chunks):
+        if _STOP_REQUESTED:
+            break
+
         batch_texts.append(chunk['text'] or '')
         batch_chunks.append(chunk)
         
         # Process batch when full or at end
-        if len(batch_texts) >= args.batch_size or i == len(chunks) - 1:
+        if _STOP_REQUESTED or len(batch_texts) >= args.batch_size or i == len(chunks) - 1:
             try:
                 # Extract NER spans (entities)
                 batch_results = extractor.extract_batch(
@@ -1235,6 +1280,22 @@ def main():
                     conn.commit()
                     chunks_since_commit = 0
                     
+                # If user requested stop, commit and exit cleanly after finishing this batch
+                if _STOP_REQUESTED:
+                    if not args.dry_run:
+                        conn.commit()
+                    print("\n[INTERRUPT] Exiting cleanly. Re-run the same command to resume.")
+                    conn.close()
+                    return
+
+            except KeyboardInterrupt:
+                # Treat as graceful stop; commit what we've completed so far.
+                _STOP_REQUESTED = True
+                if not args.dry_run:
+                    conn.commit()
+                print("\n[INTERRUPT] Exiting cleanly. Re-run the same command to resume.")
+                conn.close()
+                return
             except Exception as e:
                 # Rollback on error, log, and re-raise
                 if not args.dry_run:

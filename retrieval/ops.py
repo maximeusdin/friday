@@ -2270,3 +2270,467 @@ def hybrid_rrf(
         conn.commit()
     
     return hits
+
+
+# =============================================================================
+# Phase 4: Threshold-Based Search and SQL CTE RRF
+# =============================================================================
+# These functions implement Two-Mode Retrieval with:
+# - Threshold-based vector search (similarity >= threshold, not top-k)
+# - SQL CTE for RRF (deterministic, efficient for large result sets)
+# - Mode-specific ranking policies
+
+from retrieval.config import (
+    VectorMetricConfig, DEFAULT_VECTOR_CONFIG,
+    ConversationalModeConfig, ThoroughModeConfig,
+)
+
+
+@dataclass
+class ThresholdSearchResult:
+    """Result from threshold-based search."""
+    chunk_id: int
+    score_lexical: Optional[float] = None
+    score_vector: Optional[float] = None
+    score_hybrid: Optional[float] = None
+    vector_distance: Optional[float] = None
+    vector_similarity: Optional[float] = None
+    rank_lexical: Optional[int] = None
+    rank_vector: Optional[int] = None
+    rank: Optional[int] = None
+    in_lexical: bool = False
+    in_vector: bool = False
+    document_id: Optional[int] = None
+
+
+@dataclass
+class ThresholdSearchMetadata:
+    """Metadata from threshold-based search."""
+    total_lexical: int = 0
+    total_vector: int = 0
+    total_combined: int = 0
+    total_before_cap: int = 0
+    cap_applied: bool = False
+    cap_value: Optional[int] = None
+    threshold_used: float = 0.0
+    vector_config: Optional[Dict[str, Any]] = None
+    mode: str = "conversational"
+
+
+def vector_search_threshold(
+    conn,
+    embedding: List[float],
+    threshold: float,
+    *,
+    max_hits: Optional[int] = None,
+    scope_sql: Optional[str] = None,
+    scope_params: Optional[List[Any]] = None,
+    vector_config: VectorMetricConfig = DEFAULT_VECTOR_CONFIG,
+    filters: Optional[SearchFilters] = None,
+) -> Tuple[List[ThresholdSearchResult], ThresholdSearchMetadata]:
+    """
+    Threshold-based vector search with explicit metric semantics.
+    
+    Unlike top-k search, this returns ALL chunks above the similarity threshold,
+    then optionally caps for UX protection.
+    
+    Args:
+        conn: Database connection
+        embedding: Query embedding vector
+        threshold: Minimum similarity (in transformed space, e.g., [-1, 1] for cosine)
+        max_hits: Optional cap on results (for conversational mode)
+        scope_sql: WHERE clause from scope primitives
+        scope_params: Parameters for scope SQL
+        vector_config: Metric configuration for similarity calculation
+        filters: Additional SearchFilters
+        
+    Returns:
+        (results, metadata) tuple
+        
+    Note: For cosine distance (<=>) with similarity = 1 - distance:
+        - similarity range is [-1, 1] (can be negative)
+        - threshold of 0.3 means distance <= 0.7
+    """
+    # Convert threshold to distance for SQL
+    max_distance = vector_config.transform_to_distance(threshold)
+    
+    # Convert embedding to vector literal for PostgreSQL
+    embedding_literal = vector_literal(embedding)
+    
+    # Build base WHERE clause
+    params: Dict[str, Any] = {
+        "embedding": embedding_literal,
+        "max_distance": max_distance,
+        "threshold": threshold,
+    }
+    
+    where_clauses = ["c.embedding IS NOT NULL"]
+    
+    # Add filter clauses if provided
+    if filters:
+        filter_params: Dict[str, Any] = {}
+        filter_sql = _build_where(filters, filter_params)
+        if filter_sql and filter_sql != "TRUE":
+            where_clauses.append(filter_sql)
+            params.update(filter_params)
+    
+    # Add scope SQL if provided
+    if scope_sql:
+        processed_scope_sql = scope_sql
+        if scope_params:
+            # Convert list params to named params
+            for i, p in enumerate(scope_params):
+                params[f"scope_p{i}"] = p
+                processed_scope_sql = processed_scope_sql.replace("%s", f"%(scope_p{i})s", 1)
+        where_clauses.append(f"({processed_scope_sql})")
+    
+    where_sql = " AND ".join(where_clauses)
+    
+    # Query with threshold filter using cosine distance operator
+    # Note: (1 - distance) gives similarity
+    sql = f"""
+        WITH threshold_results AS (
+            SELECT 
+                c.id AS chunk_id,
+                c.embedding {vector_config.operator} %(embedding)s::vector AS distance,
+                1.0 - (c.embedding {vector_config.operator} %(embedding)s::vector) AS similarity,
+                cm.document_id,
+                ROW_NUMBER() OVER (
+                    ORDER BY c.embedding {vector_config.operator} %(embedding)s::vector ASC, c.id ASC
+                ) AS rank
+            FROM chunks c
+            JOIN chunk_metadata cm ON cm.chunk_id = c.id
+            WHERE {where_sql}
+              AND (c.embedding {vector_config.operator} %(embedding)s::vector) <= %(max_distance)s
+        )
+        SELECT chunk_id, distance, similarity, document_id, rank
+        FROM threshold_results
+        ORDER BY rank
+    """
+    
+    # Add limit if max_hits specified
+    if max_hits:
+        sql += f" LIMIT {max_hits}"
+    
+    with conn.cursor() as cur:
+        cur.execute(sql, params)
+        rows = cur.fetchall()
+    
+    # Build results
+    results = []
+    for row in rows:
+        chunk_id, distance, similarity, document_id, rank = row
+        results.append(ThresholdSearchResult(
+            chunk_id=chunk_id,
+            vector_distance=float(distance) if distance else None,
+            vector_similarity=float(similarity) if similarity else None,
+            score_vector=float(similarity) if similarity else None,
+            rank_vector=int(rank),
+            rank=int(rank),
+            in_vector=True,
+            document_id=document_id,
+        ))
+    
+    # Get total count above threshold (before any cap)
+    total_count = len(results)
+    cap_applied = max_hits is not None and total_count >= max_hits
+    
+    # If capped, get actual total for metadata
+    if cap_applied:
+        count_sql = f"""
+            SELECT COUNT(*) FROM chunks c
+            JOIN chunk_metadata cm ON cm.chunk_id = c.id
+            WHERE {where_sql}
+              AND (c.embedding {vector_config.operator} %(embedding)s::vector) <= %(max_distance)s
+        """
+        with conn.cursor() as cur:
+            cur.execute(count_sql, params)
+            total_count = cur.fetchone()[0]
+    
+    metadata = ThresholdSearchMetadata(
+        total_vector=total_count,
+        total_combined=len(results),
+        total_before_cap=total_count,
+        cap_applied=cap_applied,
+        cap_value=max_hits if cap_applied else None,
+        threshold_used=threshold,
+        vector_config=vector_config.to_dict(),
+        mode="conversational" if max_hits else "thorough",
+    )
+    
+    return results, metadata
+
+
+def hybrid_rrf_sql(
+    conn,
+    query: str,
+    embedding: List[float],
+    *,
+    similarity_threshold: float = 0.3,
+    combine_mode: str = "union",  # "union" or "intersection"
+    max_hits: Optional[int] = None,
+    scope_sql: Optional[str] = None,
+    scope_params: Optional[List[Any]] = None,
+    vector_config: VectorMetricConfig = DEFAULT_VECTOR_CONFIG,
+    filters: Optional[SearchFilters] = None,
+    rrf_k: int = 60,
+    lex_limit: int = 1000,  # Max lexical results to consider
+    vec_limit: int = 1000,  # Max vector results to consider
+    retrieval_mode: str = "conversational",
+) -> Tuple[List[ThresholdSearchResult], ThresholdSearchMetadata]:
+    """
+    Hybrid search with RRF ranking using SQL CTE (default implementation).
+    
+    This is the PRIMARY RRF implementation per the plan. It's:
+    - Deterministic (same query = same results)
+    - Faster (no large set pulls into Python)
+    - Memory-efficient for large result sets
+    
+    Args:
+        conn: Database connection
+        query: Search query text (for lexical search)
+        embedding: Query embedding (for vector search)
+        similarity_threshold: Minimum vector similarity
+        combine_mode: "union" (any match) or "intersection" (both required)
+        max_hits: Optional cap on results
+        scope_sql: WHERE clause from scope primitives
+        scope_params: Parameters for scope SQL
+        vector_config: Metric configuration
+        filters: Additional SearchFilters
+        rrf_k: RRF constant (60 is standard)
+        lex_limit: Max lexical candidates
+        vec_limit: Max vector candidates
+        retrieval_mode: "conversational" or "thorough"
+        
+    Returns:
+        (results, metadata) tuple
+    """
+    # Convert threshold to distance
+    max_distance = vector_config.transform_to_distance(similarity_threshold)
+    
+    # Convert embedding to vector literal for PostgreSQL
+    embedding_literal = vector_literal(embedding)
+    
+    # Build tsquery from query
+    # Use simple tokenization for now - could use compile_primitives_to_tsquery for more complex queries
+    tsq = " & ".join(query.lower().split())
+    if not tsq:
+        tsq = query.lower().replace(" ", " & ") if query else ""
+    
+    # Build base WHERE clause
+    params: Dict[str, Any] = {
+        "embedding": embedding_literal,
+        "max_distance": max_distance,
+        "threshold": similarity_threshold,
+        "tsq": tsq,
+        "rrf_k": rrf_k,
+        "lex_limit": lex_limit,
+        "vec_limit": vec_limit,
+        "not_found_rank": 100000,
+    }
+    
+    where_clauses = ["TRUE"]
+    
+    # Add filter clauses if provided
+    if filters:
+        filter_params: Dict[str, Any] = {}
+        filter_sql = _build_where(filters, filter_params)
+        if filter_sql and filter_sql != "TRUE":
+            where_clauses.append(filter_sql)
+            params.update(filter_params)
+    
+    # Add scope SQL if provided
+    if scope_sql:
+        processed_scope_sql = scope_sql
+        if scope_params:
+            # Convert list params to named params
+            for i, p in enumerate(scope_params):
+                params[f"scope_p{i}"] = p
+                processed_scope_sql = processed_scope_sql.replace("%s", f"%(scope_p{i})s", 1)
+        where_clauses.append(f"({processed_scope_sql})")
+    
+    where_sql = " AND ".join(where_clauses)
+    
+    # Determine join type based on combine_mode
+    join_type = "INNER JOIN" if combine_mode == "intersection" else "FULL OUTER JOIN"
+    
+    # Build the SQL CTE query
+    sql = f"""
+    WITH lex_ranked AS (
+        SELECT 
+            c.id AS chunk_id,
+            ts_rank_cd(
+                to_tsvector('simple', COALESCE(c.clean_text, c.text)),
+                to_tsquery('simple', %(tsq)s)
+            ) AS score,
+            ROW_NUMBER() OVER (
+                ORDER BY ts_rank_cd(
+                    to_tsvector('simple', COALESCE(c.clean_text, c.text)),
+                    to_tsquery('simple', %(tsq)s)
+                ) DESC, c.id ASC
+            ) AS rank
+        FROM chunks c
+        JOIN chunk_metadata cm ON cm.chunk_id = c.id
+        WHERE {where_sql}
+          AND to_tsvector('simple', COALESCE(c.clean_text, c.text)) @@ to_tsquery('simple', %(tsq)s)
+        LIMIT %(lex_limit)s
+    ),
+    vec_ranked AS (
+        SELECT 
+            c.id AS chunk_id,
+            1.0 - (c.embedding {vector_config.operator} %(embedding)s::vector) AS similarity,
+            c.embedding {vector_config.operator} %(embedding)s::vector AS distance,
+            ROW_NUMBER() OVER (
+                ORDER BY c.embedding {vector_config.operator} %(embedding)s::vector ASC, c.id ASC
+            ) AS rank
+        FROM chunks c
+        JOIN chunk_metadata cm ON cm.chunk_id = c.id
+        WHERE {where_sql}
+          AND c.embedding IS NOT NULL
+          AND (c.embedding {vector_config.operator} %(embedding)s::vector) <= %(max_distance)s
+        LIMIT %(vec_limit)s
+    ),
+    combined AS (
+        SELECT 
+            COALESCE(l.chunk_id, v.chunk_id) AS chunk_id,
+            l.rank AS rank_lex,
+            l.score AS score_lex,
+            v.rank AS rank_vec,
+            v.similarity AS score_vec,
+            v.distance AS vector_distance,
+            1.0 / (%(rrf_k)s + COALESCE(l.rank, %(not_found_rank)s)) + 
+            1.0 / (%(rrf_k)s + COALESCE(v.rank, %(not_found_rank)s)) AS rrf_score,
+            l.chunk_id IS NOT NULL AS in_lexical,
+            v.chunk_id IS NOT NULL AS in_vector
+        FROM lex_ranked l
+        {join_type} vec_ranked v ON l.chunk_id = v.chunk_id
+    ),
+    ranked AS (
+        SELECT 
+            *,
+            ROW_NUMBER() OVER (ORDER BY rrf_score DESC, chunk_id ASC) AS final_rank
+        FROM combined
+    )
+    SELECT 
+        r.chunk_id,
+        r.rank_lex,
+        r.score_lex,
+        r.rank_vec,
+        r.score_vec,
+        r.vector_distance,
+        r.rrf_score,
+        r.in_lexical,
+        r.in_vector,
+        r.final_rank,
+        cm.document_id
+    FROM ranked r
+    JOIN chunk_metadata cm ON cm.chunk_id = r.chunk_id
+    ORDER BY r.final_rank
+    """
+    
+    # Add limit if max_hits specified
+    if max_hits:
+        sql += f" LIMIT {max_hits}"
+    
+    with conn.cursor() as cur:
+        cur.execute(sql, params)
+        rows = cur.fetchall()
+    
+    # Build results
+    results = []
+    for row in rows:
+        (chunk_id, rank_lex, score_lex, rank_vec, score_vec, 
+         vector_distance, rrf_score, in_lexical, in_vector, 
+         final_rank, document_id) = row
+        
+        results.append(ThresholdSearchResult(
+            chunk_id=chunk_id,
+            score_lexical=float(score_lex) if score_lex else None,
+            score_vector=float(score_vec) if score_vec else None,
+            score_hybrid=float(rrf_score) if rrf_score else None,
+            vector_distance=float(vector_distance) if vector_distance else None,
+            vector_similarity=float(score_vec) if score_vec else None,
+            rank_lexical=int(rank_lex) if rank_lex else None,
+            rank_vector=int(rank_vec) if rank_vec else None,
+            rank=int(final_rank),
+            in_lexical=bool(in_lexical),
+            in_vector=bool(in_vector),
+            document_id=document_id,
+        ))
+    
+    # Get totals for metadata
+    total_combined = len(results)
+    cap_applied = max_hits is not None and total_combined >= max_hits
+    
+    # If capped, we need to get actual total
+    total_before_cap = total_combined
+    if cap_applied:
+        count_sql = f"""
+        WITH lex_ranked AS (
+            SELECT c.id AS chunk_id
+            FROM chunks c
+            JOIN chunk_metadata cm ON cm.chunk_id = c.id
+            WHERE {where_sql}
+              AND to_tsvector('simple', COALESCE(c.clean_text, c.text)) @@ to_tsquery('simple', %(tsq)s)
+            LIMIT %(lex_limit)s
+        ),
+        vec_ranked AS (
+            SELECT c.id AS chunk_id
+            FROM chunks c
+            JOIN chunk_metadata cm ON cm.chunk_id = c.id
+            WHERE {where_sql}
+              AND c.embedding IS NOT NULL
+              AND (c.embedding {vector_config.operator} %(embedding)s::vector) <= %(max_distance)s
+            LIMIT %(vec_limit)s
+        )
+        SELECT COUNT(*) FROM (
+            SELECT chunk_id FROM lex_ranked
+            {"INTERSECT" if combine_mode == "intersection" else "UNION"}
+            SELECT chunk_id FROM vec_ranked
+        ) combined
+        """
+        with conn.cursor() as cur:
+            cur.execute(count_sql, params)
+            total_before_cap = cur.fetchone()[0]
+    
+    metadata = ThresholdSearchMetadata(
+        total_lexical=sum(1 for r in results if r.in_lexical),
+        total_vector=sum(1 for r in results if r.in_vector),
+        total_combined=total_combined,
+        total_before_cap=total_before_cap,
+        cap_applied=cap_applied,
+        cap_value=max_hits if cap_applied else None,
+        threshold_used=similarity_threshold,
+        vector_config=vector_config.to_dict(),
+        mode=retrieval_mode,
+    )
+    
+    return results, metadata
+
+
+def compute_thorough_rank(results: List[ThresholdSearchResult]) -> List[ThresholdSearchResult]:
+    """
+    Recompute ranks for thorough mode using deterministic (document_id, chunk_id) ordering.
+    
+    Thorough mode ignores scores and uses stable ordering based on document structure.
+    Chunks without document_id sort LAST using sentinel value.
+    
+    Args:
+        results: List of search results
+        
+    Returns:
+        Results with updated rank field
+    """
+    SENTINEL = 2147483647  # Max int for NULL document_id
+    
+    # Sort by (document_id, chunk_id) - NULL document_id sorts last
+    sorted_results = sorted(
+        results,
+        key=lambda r: (r.document_id if r.document_id else SENTINEL, r.chunk_id)
+    )
+    
+    # Assign new ranks
+    for i, result in enumerate(sorted_results, 1):
+        result.rank = i
+    
+    return sorted_results

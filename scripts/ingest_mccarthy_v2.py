@@ -16,6 +16,7 @@ import re
 import json
 import argparse
 import hashlib
+import time
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import List, Optional, Set, Tuple, Dict
@@ -23,6 +24,8 @@ from collections import Counter
 
 import psycopg2
 import fitz  # PyMuPDF
+
+import ingest_runs
 
 
 # =============================================================================
@@ -363,9 +366,10 @@ def create_chunks_from_turns(
     chunks: List[TurnChunk] = []
     current_turns: List[Turn] = []
     current_chars = 0
+    _last_chunk_progress_printed = 0
     
     def flush_chunk():
-        nonlocal current_turns, current_chars
+        nonlocal current_turns, current_chars, _last_chunk_progress_printed
         
         if not current_turns:
             return
@@ -412,6 +416,16 @@ def create_chunks_from_turns(
             speaker_turn_spans=speaker_turn_spans,
         )
         chunks.append(chunk)
+
+        # Chunk-creation progress: print every 10 chunks so long runs don't look stuck.
+        # (Newline-based, so it shows up even if carriage returns are not rendered.)
+        if len(chunks) % 10 == 0 and len(chunks) != _last_chunk_progress_printed:
+            _last_chunk_progress_printed = len(chunks)
+            print(
+                f"    Chunking progress: created {len(chunks)} chunks so far "
+                f"(latest: pages {chunk.page_start}-{chunk.page_end}, turns {chunk.turn_id_start}-{chunk.turn_id_end})",
+                flush=True,
+            )
         
         current_turns = []
         current_chars = 0
@@ -750,21 +764,59 @@ def process_pdf(
     
     # Insert pages
     page_id_map: Dict[int, int] = {}  # pdf_page -> page_id
-    for _, pdf_page, txt in pages_data:
+    print(f"    Inserting {len(pages_data)} pages...", flush=True)
+    pages_t0 = time.monotonic()
+    for i, (_, pdf_page, txt) in enumerate(pages_data, start=1):
+        # Progress before DB work so hangs show the last attempted page.
+        if i == 1 or i % 25 == 0 or i == len(pages_data):
+            elapsed = time.monotonic() - pages_t0
+            rate = (i / elapsed) if elapsed > 0 else 0.0
+            print(
+                f"\r    Pages: {i}/{len(pages_data)} inserted (rate {rate:.2f}/s)...",
+                end="",
+                flush=True,
+            )
         page_id = insert_page(cur, doc_id, pdf_page, pdf_page, f"p{pdf_page:04d}", txt)
         page_id_map[pdf_page] = page_id
+    print("", flush=True)
     
     # Insert turns
     turn_db_ids: Dict[int, int] = {}  # turn.turn_id -> db id
-    for turn in turns:
+    print(f"    Inserting {len(turns)} turns...", flush=True)
+    turns_t0 = time.monotonic()
+    for i, turn in enumerate(turns, start=1):
+        # Progress before DB work so hangs show the last attempted turn id.
+        if i == 1 or i % 500 == 0 or i == len(turns):
+            elapsed = time.monotonic() - turns_t0
+            rate = (i / elapsed) if elapsed > 0 else 0.0
+            print(
+                f"\r    Turns: {i}/{len(turns)} inserted (rate {rate:.2f}/s, last turn_id={turn.turn_id})...",
+                end="",
+                flush=True,
+            )
         db_id = insert_turn(cur, doc_id, turn)
         turn_db_ids[turn.turn_id] = db_id
+    print("", flush=True)
     
     # Create and insert chunks
+    print("    Creating chunks from turns...", flush=True)
     chunks = create_chunks_from_turns(turns, config, doc_ref)
     print(f"    Created {len(chunks)} chunks")
-    
-    for chunk in chunks:
+
+    total_chunks = len(chunks)
+    t0 = time.monotonic()
+    last_progress_log = t0
+
+    for idx, chunk in enumerate(chunks, start=1):
+        # Lightweight progress indicator. We intentionally print *before* doing DB
+        # work so if we hang, the last line tells you which chunk we were on.
+        print(
+            f"\r    Inserting chunk {idx}/{total_chunks} "
+            f"(pages {chunk.page_start}-{chunk.page_end}, turns {chunk.turn_id_start}-{chunk.turn_id_end})...",
+            end="",
+            flush=True,
+        )
+
         chunk_id = insert_chunk_v2(cur, chunk, pipeline_version)
         
         # Link to pages
@@ -781,6 +833,24 @@ def process_pdf(
         
         # Populate chunk_turns for turn-level evidence retrieval
         insert_chunk_turns(cur, chunk_id, chunk, turn_db_ids)
+
+        # Periodic newline progress so logs show movement even if \r isn't visible.
+        now = time.monotonic()
+        if idx == total_chunks or idx % 25 == 0 or (now - last_progress_log) >= 60:
+            elapsed = now - t0
+            rate = (idx / elapsed) if elapsed > 0 else 0.0
+            remaining = total_chunks - idx
+            eta_s = (remaining / rate) if rate > 0 else None
+            eta_str = f"{eta_s/60:.1f}m" if eta_s is not None else "n/a"
+            print(
+                f"\n    Progress: {idx}/{total_chunks} chunks inserted "
+                f"(elapsed {elapsed/60:.1f}m, rate {rate:.2f} chunks/s, eta {eta_str})",
+                flush=True,
+            )
+            last_progress_log = now
+
+    # Ensure we end the carriage-return status line cleanly.
+    print("", flush=True)
     
     return doc_id, page_count, len(turns), len(chunks)
 
@@ -821,22 +891,53 @@ def main():
     total_chunks = 0
     
     with connect() as conn, conn.cursor() as cur:
+        ingest_runs.ensure_ingest_runs_table(cur)
         collection_id = get_or_create_collection(cur)
         print(f"Collection: {COLLECTION_SLUG} (id={collection_id})")
         print()
         
         for pdf_path in paths:
-            doc_id, pages, turns, chunks = process_pdf(
-                Path(pdf_path), cur, collection_id, config,
-                args.pipeline_version, args.dry_run,
-            )
-            total_pages += pages
-            total_turns += turns
-            total_chunks += chunks
-            
-            if not args.dry_run:
-                conn.commit()
-                print(f"    -> document_id={doc_id}")
+            p = Path(pdf_path)
+            source_key = f"{COLLECTION_SLUG}:{p.name}"
+            fp = ingest_runs.file_fingerprint_fast(p) if args.dry_run else ingest_runs.file_sha256(p)
+            pipeline_version = str(args.pipeline_version)
+
+            if not args.dry_run and not ingest_runs.should_run(
+                cur, source_key=source_key, source_fingerprint=fp, pipeline_version=pipeline_version
+            ):
+                print(f"[skip] {p.name} (already ingested: pipeline={pipeline_version})")
+                continue
+
+            try:
+                if not args.dry_run:
+                    ingest_runs.mark_running(
+                        cur, source_key=source_key, source_fingerprint=fp, pipeline_version=pipeline_version
+                    )
+
+                doc_id, pages, turns, chunks = process_pdf(
+                    p, cur, collection_id, config,
+                    pipeline_version, args.dry_run,
+                )
+                total_pages += pages
+                total_turns += turns
+                total_chunks += chunks
+
+                if not args.dry_run:
+                    ingest_runs.mark_success(cur, source_key=source_key)
+                    conn.commit()
+                    print(f"    -> document_id={doc_id}")
+            except Exception as e:
+                conn.rollback()
+                if not args.dry_run:
+                    ingest_runs.mark_failed_best_effort(
+                        connect,
+                        source_key=source_key,
+                        source_fingerprint=fp,
+                        pipeline_version=pipeline_version,
+                        error=str(e),
+                    )
+                print(f"    ERROR: {p.name}: {e}")
+                continue
         
         print()
         print(f"{'[DRY RUN] ' if args.dry_run else ''}Done!")

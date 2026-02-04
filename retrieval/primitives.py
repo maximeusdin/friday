@@ -13,7 +13,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 
@@ -471,6 +471,669 @@ class QuoteAttributionModePrimitive:
             self.speaker = self.speaker.upper().strip()
 
 
+# ============================================================================
+# Two-Mode Retrieval Control Primitives (Phase 3)
+# ============================================================================
+
+@dataclass
+class SetRetrievalModePrimitive:
+    """
+    SET_RETRIEVAL_MODE(mode) - Control primitive: Sets retrieval mode for the query.
+    
+    Mode types:
+    - "conversational": Fast, top-k results, score-based ranking, LLM summarization
+    - "thorough": Exhaustive, no cap, deterministic ordering, paginated delivery
+    
+    Note: This is a CONTROL primitive. It affects execution behavior but does not
+    constrain the scope of retrieval (unlike scope primitives like FILTER_COLLECTION).
+    
+    Mode Precedence (highest to lowest):
+    1. UI toggle - explicit user selection
+    2. This primitive - SET_RETRIEVAL_MODE in plan
+    3. Trigger phrase detection - "exhaustive", "everything", etc.
+    4. Default - conversational
+    
+    Examples:
+        {"type": "SET_RETRIEVAL_MODE", "mode": "thorough"}
+        {"type": "SET_RETRIEVAL_MODE", "mode": "conversational"}
+    """
+    type: Literal["SET_RETRIEVAL_MODE"] = "SET_RETRIEVAL_MODE"
+    mode: str = "conversational"  # "conversational" | "thorough"
+    
+    def __post_init__(self):
+        if self.mode not in ("conversational", "thorough"):
+            raise ValueError(f"Invalid mode: {self.mode}. Must be 'conversational' or 'thorough'.")
+
+
+@dataclass
+class SetSimilarityThresholdPrimitive:
+    """
+    SET_SIMILARITY_THRESHOLD(threshold) - Control primitive: Sets minimum vector similarity.
+    
+    For cosine distance (default):
+    - Similarity range is [-1, 1] (can be negative for opposite-direction embeddings)
+    - Threshold of 0.3 similarity means max distance of 0.7
+    
+    Default thresholds:
+    - Conversational mode: 0.35 (higher precision)
+    - Thorough mode: 0.25 (higher recall)
+    
+    Note: This is a CONTROL primitive that affects vector search filtering.
+    The threshold is in the INTERNAL similarity space ([-1, 1] for cosine),
+    not the UI space (which may be transformed).
+    
+    Examples:
+        {"type": "SET_SIMILARITY_THRESHOLD", "threshold": 0.4}
+        {"type": "SET_SIMILARITY_THRESHOLD", "threshold": 0.2}  # Lower for more recall
+    """
+    type: Literal["SET_SIMILARITY_THRESHOLD"] = "SET_SIMILARITY_THRESHOLD"
+    threshold: float = 0.35
+    
+    def __post_init__(self):
+        # Cosine similarity range is [-1, 1]
+        if not -1.0 <= self.threshold <= 1.0:
+            raise ValueError(f"Threshold must be in [-1.0, 1.0] for cosine similarity, got {self.threshold}")
+
+
+@dataclass
+class EntityRolePrimitive:
+    """
+    ENTITY_ROLE(role, entity_id?) - Scope primitive: Filter to chunks mentioning entities of a type.
+    
+    Filters retrieval to chunks that contain mentions of entities with the specified role/type.
+    If entity_id is provided, asserts that the entity has this role.
+    
+    Supported roles:
+    - "person": People (individuals)
+    - "org": Organizations
+    - "place": Locations
+    - "event": Events (if typed in entity table)
+    - "document": Document references
+    
+    Note: This is a SCOPE primitive. It compiles to SQL WHERE constraints.
+    
+    Examples:
+        {"type": "ENTITY_ROLE", "role": "person"}  # All person mentions
+        {"type": "ENTITY_ROLE", "role": "org", "entity_id": 1234}  # Assert entity 1234 is an org
+    """
+    type: Literal["ENTITY_ROLE"] = "ENTITY_ROLE"
+    role: str = ""  # "person" | "org" | "place" | "event" | "document"
+    entity_id: Optional[int] = None  # If provided, assert entity has this role
+    
+    def __post_init__(self):
+        valid_roles = ("person", "org", "place", "event", "document")
+        if self.role not in valid_roles:
+            raise ValueError(f"Invalid role: {self.role}. Must be one of: {valid_roles}")
+        if self.entity_id is not None and self.entity_id <= 0:
+            raise ValueError(f"entity_id must be positive if provided, got {self.entity_id}")
+
+
+@dataclass
+class ExceptEntitiesPrimitive:
+    """
+    EXCEPT_ENTITIES([entity_ids]) - Scope primitive: Exclude chunks mentioning specified entities.
+    
+    Filters OUT chunks that contain mentions of ANY of the specified entities.
+    This is the inverse of ENTITY - instead of requiring mentions, it excludes them.
+    
+    Uses NOT EXISTS (not NOT IN) for performance and null-safety:
+        WHERE NOT EXISTS (
+            SELECT 1 FROM entity_mentions em 
+            WHERE em.chunk_id = c.id 
+            AND em.entity_id = ANY(%(entity_ids)s)
+        )
+    
+    Note: This is a SCOPE primitive. It compiles to SQL WHERE constraints.
+    
+    Examples:
+        {"type": "EXCEPT_ENTITIES", "entity_ids": [1234]}  # Exclude entity 1234
+        {"type": "EXCEPT_ENTITIES", "entity_ids": [1234, 5678]}  # Exclude multiple
+    """
+    type: Literal["EXCEPT_ENTITIES"] = "EXCEPT_ENTITIES"
+    entity_ids: List[int] = None
+    
+    def __post_init__(self):
+        if self.entity_ids is None:
+            self.entity_ids = []
+        if not self.entity_ids:
+            raise ValueError("EXCEPT_ENTITIES requires at least one entity_id")
+        if any(eid <= 0 for eid in self.entity_ids):
+            raise ValueError("All entity_ids must be positive integers")
+
+
+@dataclass
+class RelatedEntitiesPrimitive:
+    """
+    RELATED_ENTITIES(entity_id, window, top_n) - Analysis primitive: Find co-occurring entities.
+    
+    Finds entities that co-occur with the target entity within a specified window.
+    This is an ANALYSIS primitive - it doesn't constrain retrieval scope, but asks
+    for an aggregation over a result set or the full corpus.
+    
+    Parameters:
+    - entity_id: The target entity to find related entities for
+    - window: "chunk" (same chunk) or "document" (same document)
+    - top_n: Maximum number of related entities to return (default 20)
+    - result_set_id: If provided, scope analysis to this result set
+    
+    Note: This is NOT compiled to scope. It's handled separately in execution
+    as an aggregation query on entity_mentions.
+    
+    Examples:
+        {"type": "RELATED_ENTITIES", "entity_id": 1234, "window": "document", "top_n": 20}
+        {"type": "RELATED_ENTITIES", "entity_id": 1234, "window": "chunk", "result_set_id": 5678}
+    """
+    type: Literal["RELATED_ENTITIES"] = "RELATED_ENTITIES"
+    entity_id: int = 0
+    window: str = "document"  # "chunk" | "document"
+    top_n: int = 20
+    result_set_id: Optional[int] = None  # If provided, scope to this result set
+    
+    def __post_init__(self):
+        if self.entity_id <= 0:
+            raise ValueError("RELATED_ENTITIES requires positive entity_id")
+        if self.window not in ("chunk", "document"):
+            raise ValueError(f"Invalid window: {self.window}. Must be 'chunk' or 'document'.")
+        if self.top_n <= 0:
+            raise ValueError(f"top_n must be positive, got {self.top_n}")
+        if self.result_set_id is not None and self.result_set_id <= 0:
+            raise ValueError(f"result_set_id must be positive if provided, got {self.result_set_id}")
+
+
+# =============================================================================
+# Index Retrieval Primitives (Entity)
+# =============================================================================
+
+@dataclass
+class FirstMentionPrimitive:
+    """
+    FIRST_MENTION(entity_id) - Index primitive: Find first chronological mention.
+    
+    Queries the entity_mentions index to find the chronologically earliest
+    chunk where an entity is mentioned. Returns deterministic, index-based
+    results (not fuzzy search).
+    
+    Parameters:
+    - entity_id: The entity to find first mention of
+    - order_by: "chronological" (date-based) or "document_order" (doc_id, page)
+    - scope: Optional scope filters to apply
+    
+    This is an INDEX primitive - it queries entity_mentions directly,
+    not the vector/lexical search indexes.
+    
+    Examples:
+        {"type": "FIRST_MENTION", "entity_id": 72144}
+        {"type": "FIRST_MENTION", "entity_id": 72144, "order_by": "document_order"}
+    """
+    type: Literal["FIRST_MENTION"] = "FIRST_MENTION"
+    entity_id: int = 0
+    order_by: str = "chronological"  # "chronological" | "document_order"
+    scope: Optional[dict] = None  # Optional scope filters
+    
+    def __post_init__(self):
+        if self.entity_id <= 0:
+            raise ValueError("FIRST_MENTION requires positive entity_id")
+        if self.order_by not in ("chronological", "document_order"):
+            raise ValueError(f"Invalid order_by: {self.order_by}. Must be 'chronological' or 'document_order'.")
+
+
+@dataclass
+class FirstCoMentionPrimitive:
+    """
+    FIRST_CO_MENTION(entity_ids) - Index primitive: Find first co-occurrence.
+    
+    Queries the entity_mentions index to find the chronologically earliest
+    chunk where multiple entities are mentioned together.
+    
+    Parameters:
+    - entity_ids: List of at least 2 entity IDs that must co-occur
+    - window: "chunk" (same chunk) - "document" deferred to v2
+    - order_by: "chronological" or "document_order"
+    - scope: Optional scope filters
+    
+    This is an INDEX primitive - queries entity_mentions, not search indexes.
+    
+    Examples:
+        {"type": "FIRST_CO_MENTION", "entity_ids": [72144, 72145]}
+        {"type": "FIRST_CO_MENTION", "entity_ids": [72144, 72145], "window": "chunk"}
+    """
+    type: Literal["FIRST_CO_MENTION"] = "FIRST_CO_MENTION"
+    entity_ids: List[int] = field(default_factory=list)
+    window: str = "chunk"  # "chunk" only for v1
+    order_by: str = "chronological"
+    scope: Optional[dict] = None
+    
+    def __post_init__(self):
+        if len(self.entity_ids) < 2:
+            raise ValueError("FIRST_CO_MENTION requires at least 2 entity_ids")
+        if any(eid <= 0 for eid in self.entity_ids):
+            raise ValueError("All entity_ids must be positive")
+        if self.window not in ("chunk",):  # "document" deferred
+            raise ValueError(f"Invalid window: {self.window}. Only 'chunk' supported in v1.")
+        if self.order_by not in ("chronological", "document_order"):
+            raise ValueError(f"Invalid order_by: {self.order_by}")
+
+
+@dataclass
+class MentionsPrimitive:
+    """
+    MENTIONS(entity_id) - Index primitive: Find all mentions of an entity.
+    
+    Queries the entity_mentions index to find all chunks mentioning an entity,
+    ordered chronologically. Supports pagination for large result sets.
+    
+    Parameters:
+    - entity_id: The entity to find mentions of
+    - window: "chunk" (unique chunks containing mentions)
+    - order_by: "chronological" or "document_order"
+    - scope: Optional scope filters
+    
+    Mode behavior:
+    - Conversational: Returns first answer_k results
+    - Thorough: Returns all results, paginated
+    
+    Examples:
+        {"type": "MENTIONS", "entity_id": 72144}
+        {"type": "MENTIONS", "entity_id": 72144, "order_by": "chronological"}
+    """
+    type: Literal["MENTIONS"] = "MENTIONS"
+    entity_id: int = 0
+    window: str = "chunk"  # "chunk" = unique chunks
+    order_by: str = "chronological"
+    scope: Optional[dict] = None
+    
+    def __post_init__(self):
+        if self.entity_id <= 0:
+            raise ValueError("MENTIONS requires positive entity_id")
+        if self.window not in ("chunk",):
+            raise ValueError(f"Invalid window: {self.window}. Only 'chunk' supported.")
+        if self.order_by not in ("chronological", "document_order"):
+            raise ValueError(f"Invalid order_by: {self.order_by}")
+
+
+# =============================================================================
+# Index Retrieval Primitives (Date)
+# =============================================================================
+
+@dataclass
+class DateRangeFilterPrimitive:
+    """
+    DATE_RANGE_FILTER(date_start, date_end) - Index primitive: Filter by date range.
+    
+    Queries the date_mentions index to filter chunks to those with date mentions
+    falling within the specified range.
+    
+    Parameters:
+    - date_start: ISO format start date (e.g., "1944-01-01"), or None for open start
+    - date_end: ISO format end date (e.g., "1945-12-31"), or None for open end
+    - time_basis: "mentioned_date" (dates in text) or "document_date" (doc metadata)
+    - precision_min: Minimum precision filter ('day', 'month', 'year', or None)
+    
+    Examples:
+        {"type": "DATE_RANGE_FILTER", "date_start": "1944-01-01", "date_end": "1945-12-31"}
+        {"type": "DATE_RANGE_FILTER", "date_start": "1944-01-01", "time_basis": "document_date"}
+    """
+    type: Literal["DATE_RANGE_FILTER"] = "DATE_RANGE_FILTER"
+    date_start: Optional[str] = None  # ISO format
+    date_end: Optional[str] = None
+    time_basis: str = "mentioned_date"  # "mentioned_date" | "document_date"
+    precision_min: Optional[str] = None  # 'day', 'month', 'year'
+    
+    def __post_init__(self):
+        if self.date_start is None and self.date_end is None:
+            raise ValueError("DATE_RANGE_FILTER requires at least one of date_start or date_end")
+        if self.time_basis not in ("mentioned_date", "document_date"):
+            raise ValueError(f"Invalid time_basis: {self.time_basis}")
+        if self.precision_min is not None and self.precision_min not in ("day", "month", "year"):
+            raise ValueError(f"Invalid precision_min: {self.precision_min}")
+
+
+@dataclass
+class DateMentionsPrimitive:
+    """
+    DATE_MENTIONS(date_start, date_end) - Index primitive: Find dated chunks.
+    
+    Queries the date_mentions index to find all chunks with date mentions
+    in the specified range, ordered chronologically by the mentioned date.
+    
+    Parameters:
+    - date_start: ISO format start date, or None for open start
+    - date_end: ISO format end date, or None for open end  
+    - time_basis: "mentioned_date" (default) or "document_date"
+    - order_by: "chronological" (by date mentioned) or "document_order"
+    - scope: Optional scope filters
+    
+    Examples:
+        {"type": "DATE_MENTIONS", "date_start": "1944-01-01", "date_end": "1945-12-31"}
+    """
+    type: Literal["DATE_MENTIONS"] = "DATE_MENTIONS"
+    date_start: Optional[str] = None
+    date_end: Optional[str] = None
+    time_basis: str = "mentioned_date"
+    order_by: str = "chronological"
+    scope: Optional[dict] = None
+    
+    def __post_init__(self):
+        if self.time_basis not in ("mentioned_date", "document_date"):
+            raise ValueError(f"Invalid time_basis: {self.time_basis}")
+        if self.order_by not in ("chronological", "document_order"):
+            raise ValueError(f"Invalid order_by: {self.order_by}")
+
+
+@dataclass
+class FirstDateMentionPrimitive:
+    """
+    FIRST_DATE_MENTION(entity_id) - Index primitive: Find earliest dated reference.
+    
+    Finds the earliest dated chunk where an entity is mentioned. Useful for
+    answering "when was X first mentioned in the documents?"
+    
+    Parameters:
+    - entity_id: The entity to find earliest dated mention for
+    - time_basis: "mentioned_date" (dates in text) or "document_date" (doc metadata)
+    - scope: Optional scope filters
+    
+    Two semantics based on time_basis:
+    - "mentioned_date": Earliest date mentioned in text where entity appears
+    - "document_date": Earliest document (by chunk_metadata.date_min) mentioning entity
+    
+    Examples:
+        {"type": "FIRST_DATE_MENTION", "entity_id": 72144}
+        {"type": "FIRST_DATE_MENTION", "entity_id": 72144, "time_basis": "document_date"}
+    """
+    type: Literal["FIRST_DATE_MENTION"] = "FIRST_DATE_MENTION"
+    entity_id: int = 0
+    time_basis: str = "mentioned_date"
+    scope: Optional[dict] = None
+    
+    def __post_init__(self):
+        if self.entity_id <= 0:
+            raise ValueError("FIRST_DATE_MENTION requires positive entity_id")
+        if self.time_basis not in ("mentioned_date", "document_date"):
+            raise ValueError(f"Invalid time_basis: {self.time_basis}")
+
+
+# =============================================================================
+# Index Retrieval Primitives (Place/Geography)
+# =============================================================================
+
+@dataclass
+class PlaceMentionsPrimitive:
+    """
+    PLACE_MENTIONS(place_entity_id) - Index primitive: Find place mentions.
+    
+    Queries entity_mentions for a place entity (entity_type='place'),
+    returning all chunks that mention the place.
+    
+    Parameters:
+    - place_entity_id: The place entity ID to find mentions of
+    - order_by: "chronological" or "document_order"
+    - scope: Optional scope filters
+    
+    Examples:
+        {"type": "PLACE_MENTIONS", "place_entity_id": 12345}
+    """
+    type: Literal["PLACE_MENTIONS"] = "PLACE_MENTIONS"
+    place_entity_id: int = 0
+    order_by: str = "chronological"
+    scope: Optional[dict] = None
+    
+    def __post_init__(self):
+        if self.place_entity_id <= 0:
+            raise ValueError("PLACE_MENTIONS requires positive place_entity_id")
+        if self.order_by not in ("chronological", "document_order"):
+            raise ValueError(f"Invalid order_by: {self.order_by}")
+
+
+@dataclass
+class RelatedPlacesPrimitive:
+    """
+    RELATED_PLACES(entity_id) - Analysis primitive: Find co-mentioned places.
+    
+    Finds place entities that co-occur with a target entity. This is an
+    analysis primitive - it returns aggregated data, not individual chunks.
+    
+    Parameters:
+    - entity_id: The target entity to find related places for
+    - window: "chunk" (same chunk) or "document" (same document)
+    - top_n: Maximum number of places to return
+    - scope: Optional scope filters (e.g., result_set_id)
+    
+    Examples:
+        {"type": "RELATED_PLACES", "entity_id": 72144, "window": "chunk", "top_n": 20}
+    """
+    type: Literal["RELATED_PLACES"] = "RELATED_PLACES"
+    entity_id: int = 0
+    window: str = "chunk"
+    top_n: int = 20
+    scope: Optional[dict] = None
+    
+    def __post_init__(self):
+        if self.entity_id <= 0:
+            raise ValueError("RELATED_PLACES requires positive entity_id")
+        if self.window not in ("chunk", "document"):
+            raise ValueError(f"Invalid window: {self.window}")
+        if self.top_n <= 0:
+            raise ValueError(f"top_n must be positive, got {self.top_n}")
+
+
+@dataclass  
+class WithinCountryPrimitive:
+    """
+    WITHIN_COUNTRY(country) - Index primitive: Filter to places in a country.
+    
+    Filters results to chunks mentioning places within a specified country.
+    Requires entities.place_country to be populated for place entities.
+    
+    Parameters:
+    - country: Country name or code (e.g., "USSR", "USA", "France")
+    - scope: Optional additional scope filters
+    
+    Examples:
+        {"type": "WITHIN_COUNTRY", "country": "USSR"}
+    """
+    type: Literal["WITHIN_COUNTRY"] = "WITHIN_COUNTRY"
+    country: str = ""
+    scope: Optional[dict] = None
+    
+    def __post_init__(self):
+        if not self.country or not self.country.strip():
+            raise ValueError("WITHIN_COUNTRY requires non-empty country")
+
+
+# =============================================================================
+# Negation/Exclusion Primitives
+# =============================================================================
+
+@dataclass
+class ExcludeTermPrimitive:
+    """
+    EXCLUDE_TERM(value) - Scope primitive: Exclude chunks containing a term.
+    
+    Filters OUT chunks where the full-text index matches the specified term.
+    Uses NOT with websearch_to_tsquery for efficient exclusion.
+    
+    Implementation:
+        NOT (c.fts_vector @@ websearch_to_tsquery('simple', %s))
+    
+    Examples:
+        {"type": "EXCLUDE_TERM", "value": "rosenberg"}
+        - Excludes chunks mentioning "rosenberg"
+    
+    Note: Multiple EXCLUDE_TERM primitives are ANDed (all exclusions apply).
+    """
+    type: Literal["EXCLUDE_TERM"] = "EXCLUDE_TERM"
+    value: str = ""
+    
+    def __post_init__(self):
+        if not self.value or not self.value.strip():
+            raise ValueError("EXCLUDE_TERM primitive requires non-empty value")
+
+
+@dataclass
+class ExcludePhrasePrimitive:
+    """
+    EXCLUDE_PHRASE(value) - Scope primitive: Exclude chunks containing a phrase.
+    
+    Filters OUT chunks where the full-text index matches the specified phrase
+    (words must appear adjacent in order).
+    
+    Implementation:
+        NOT (c.fts_vector @@ websearch_to_tsquery('simple', '"%s"'))
+    
+    Examples:
+        {"type": "EXCLUDE_PHRASE", "value": "soviet intelligence"}
+        - Excludes chunks containing "soviet intelligence" as a phrase
+    
+    Note: Use EXCLUDE_TERM for single words, EXCLUDE_PHRASE for multi-word phrases.
+    """
+    type: Literal["EXCLUDE_PHRASE"] = "EXCLUDE_PHRASE"
+    value: str = ""
+    
+    def __post_init__(self):
+        if not self.value or not self.value.strip():
+            raise ValueError("EXCLUDE_PHRASE primitive requires non-empty value")
+
+
+@dataclass
+class NotEntityPrimitive:
+    """
+    NOT_ENTITY(entity_id) - Scope primitive: Exclude chunks mentioning an entity.
+    
+    Filters OUT chunks that have any entity_mentions for the specified entity.
+    This is similar to EXCEPT_ENTITIES but for a single entity with clearer naming.
+    
+    Implementation:
+        NOT EXISTS (SELECT 1 FROM entity_mentions em WHERE em.chunk_id = c.id AND em.entity_id = %s)
+    
+    Examples:
+        {"type": "NOT_ENTITY", "entity_id": 72144}
+        - Excludes chunks mentioning entity 72144
+    
+    Note: Use EXCEPT_ENTITIES([ids]) for multiple entities in one primitive.
+    """
+    type: Literal["NOT_ENTITY"] = "NOT_ENTITY"
+    entity_id: int = 0
+    
+    def __post_init__(self):
+        if self.entity_id <= 0:
+            raise ValueError("NOT_ENTITY primitive requires positive entity_id")
+
+
+# =============================================================================
+# Geographic Proximity Primitives
+# =============================================================================
+
+@dataclass
+class FilterCityPrimitive:
+    """
+    FILTER_CITY(city, country?) - Scope primitive: Filter to chunks mentioning a city.
+    
+    Filters chunks to those mentioning place entities in a specific city.
+    Optionally specify country to disambiguate cities with the same name.
+    
+    Implementation:
+        EXISTS (SELECT 1 FROM entity_mentions em
+                JOIN entities e ON em.entity_id = e.id
+                WHERE em.chunk_id = c.id
+                AND e.entity_type = 'place'
+                AND e.place_city ILIKE %s
+                [AND e.place_country ILIKE %s])
+    
+    Examples:
+        {"type": "FILTER_CITY", "city": "Washington"}
+        {"type": "FILTER_CITY", "city": "Los Angeles", "country": "USA"}
+        
+    Note: City matching is case-insensitive.
+    """
+    type: Literal["FILTER_CITY"] = "FILTER_CITY"
+    city: str = ""
+    country: Optional[str] = None
+    
+    def __post_init__(self):
+        if not self.city or not self.city.strip():
+            raise ValueError("FILTER_CITY primitive requires non-empty city")
+
+
+@dataclass
+class FilterRegionPrimitive:
+    """
+    FILTER_REGION(region, country?) - Scope primitive: Filter to chunks mentioning a region.
+    
+    Filters chunks to those mentioning place entities in a specific state/province/region.
+    Region can be state name, province, or other administrative division.
+    
+    Implementation:
+        EXISTS (SELECT 1 FROM entity_mentions em
+                JOIN entities e ON em.entity_id = e.id
+                WHERE em.chunk_id = c.id
+                AND e.entity_type = 'place'
+                AND e.place_region ILIKE %s
+                [AND e.place_country ILIKE %s])
+    
+    Examples:
+        {"type": "FILTER_REGION", "region": "California"}
+        {"type": "FILTER_REGION", "region": "Tennessee", "country": "USA"}
+        
+    Note: Region matching is case-insensitive.
+    """
+    type: Literal["FILTER_REGION"] = "FILTER_REGION"
+    region: str = ""
+    country: Optional[str] = None
+    
+    def __post_init__(self):
+        if not self.region or not self.region.strip():
+            raise ValueError("FILTER_REGION primitive requires non-empty region")
+
+
+@dataclass
+class FilterCoordinatesPrimitive:
+    """
+    FILTER_COORDINATES(lat, lng, radius_km) - Scope primitive: Filter by proximity to coordinates.
+    
+    Filters chunks to those mentioning place entities within a specified radius
+    of the given coordinates. Requires PostGIS extension for spatial queries.
+    
+    Implementation (with PostGIS):
+        EXISTS (SELECT 1 FROM entity_mentions em
+                JOIN entities e ON em.entity_id = e.id
+                WHERE em.chunk_id = c.id
+                AND e.entity_type = 'place'
+                AND ST_DWithin(
+                    ST_SetSRID(ST_MakePoint(e.place_lng, e.place_lat), 4326)::geography,
+                    ST_SetSRID(ST_MakePoint(%s, %s), 4326)::geography,
+                    %s * 1000  -- Convert km to meters
+                ))
+    
+    Implementation (without PostGIS, approximate):
+        Uses Haversine formula approximation via latitude/longitude bounds.
+    
+    Parameters:
+        - lat: Latitude of center point (-90 to 90)
+        - lng: Longitude of center point (-180 to 180)
+        - radius_km: Search radius in kilometers (default: 50)
+    
+    Examples:
+        {"type": "FILTER_COORDINATES", "lat": 38.8951, "lng": -77.0364, "radius_km": 50}
+        - Documents within 50km of Washington DC
+        
+        {"type": "FILTER_COORDINATES", "lat": 35.9606, "lng": -83.9207, "radius_km": 100}
+        - Documents within 100km of Oak Ridge, Tennessee
+    """
+    type: Literal["FILTER_COORDINATES"] = "FILTER_COORDINATES"
+    lat: float = 0.0
+    lng: float = 0.0
+    radius_km: float = 50.0
+    
+    def __post_init__(self):
+        if not -90 <= self.lat <= 90:
+            raise ValueError(f"FILTER_COORDINATES lat must be -90 to 90, got {self.lat}")
+        if not -180 <= self.lng <= 180:
+            raise ValueError(f"FILTER_COORDINATES lng must be -180 to 180, got {self.lng}")
+        if self.radius_km <= 0:
+            raise ValueError(f"FILTER_COORDINATES radius_km must be positive, got {self.radius_km}")
+
+
 # Forward reference for recursive type (OR_GROUP contains primitives)
 Primitive = Union[
     TermPrimitive,
@@ -500,6 +1163,32 @@ Primitive = Union[
     SpeakerFilterPrimitive,
     SpeakerBoostPrimitive,
     QuoteAttributionModePrimitive,
+    # Two-Mode Retrieval primitives (Phase 3)
+    SetRetrievalModePrimitive,
+    SetSimilarityThresholdPrimitive,
+    EntityRolePrimitive,
+    ExceptEntitiesPrimitive,
+    RelatedEntitiesPrimitive,
+    # Index Retrieval primitives (Entity)
+    FirstMentionPrimitive,
+    FirstCoMentionPrimitive,
+    MentionsPrimitive,
+    # Index Retrieval primitives (Date)
+    DateRangeFilterPrimitive,
+    DateMentionsPrimitive,
+    FirstDateMentionPrimitive,
+    # Index Retrieval primitives (Place)
+    PlaceMentionsPrimitive,
+    RelatedPlacesPrimitive,
+    WithinCountryPrimitive,
+    # Negation/Exclusion primitives
+    ExcludeTermPrimitive,
+    ExcludePhrasePrimitive,
+    NotEntityPrimitive,
+    # Geographic Proximity primitives
+    FilterCityPrimitive,
+    FilterRegionPrimitive,
+    FilterCoordinatesPrimitive,
 ]
 
 # Note: OrGroupPrimitive uses forward reference (string literal) for recursive type
@@ -594,6 +1283,109 @@ class QueryPlan:
             return result
         elif isinstance(p, SetQueryModePrimitive):
             return {"type": "SET_QUERY_MODE", "value": p.value}
+        # Two-Mode Retrieval primitives (Phase 3)
+        elif isinstance(p, SetRetrievalModePrimitive):
+            return {"type": "SET_RETRIEVAL_MODE", "mode": p.mode}
+        elif isinstance(p, SetSimilarityThresholdPrimitive):
+            return {"type": "SET_SIMILARITY_THRESHOLD", "threshold": p.threshold}
+        elif isinstance(p, EntityRolePrimitive):
+            result = {"type": "ENTITY_ROLE", "role": p.role}
+            if p.entity_id is not None:
+                result["entity_id"] = p.entity_id
+            return result
+        elif isinstance(p, ExceptEntitiesPrimitive):
+            return {"type": "EXCEPT_ENTITIES", "entity_ids": p.entity_ids}
+        elif isinstance(p, RelatedEntitiesPrimitive):
+            result = {
+                "type": "RELATED_ENTITIES",
+                "entity_id": p.entity_id,
+                "window": p.window,
+                "top_n": p.top_n,
+            }
+            if p.result_set_id is not None:
+                result["result_set_id"] = p.result_set_id
+            return result
+        # Index Retrieval primitives (Entity)
+        elif isinstance(p, FirstMentionPrimitive):
+            result = {"type": "FIRST_MENTION", "entity_id": p.entity_id, "order_by": p.order_by}
+            if p.scope:
+                result["scope"] = p.scope
+            return result
+        elif isinstance(p, FirstCoMentionPrimitive):
+            result = {"type": "FIRST_CO_MENTION", "entity_ids": p.entity_ids, "window": p.window, "order_by": p.order_by}
+            if p.scope:
+                result["scope"] = p.scope
+            return result
+        elif isinstance(p, MentionsPrimitive):
+            result = {"type": "MENTIONS", "entity_id": p.entity_id, "window": p.window, "order_by": p.order_by}
+            if p.scope:
+                result["scope"] = p.scope
+            return result
+        # Index Retrieval primitives (Date)
+        elif isinstance(p, DateRangeFilterPrimitive):
+            result = {"type": "DATE_RANGE_FILTER", "time_basis": p.time_basis}
+            if p.date_start:
+                result["date_start"] = p.date_start
+            if p.date_end:
+                result["date_end"] = p.date_end
+            if p.precision_min:
+                result["precision_min"] = p.precision_min
+            return result
+        elif isinstance(p, DateMentionsPrimitive):
+            result = {"type": "DATE_MENTIONS", "time_basis": p.time_basis, "order_by": p.order_by}
+            if p.date_start:
+                result["date_start"] = p.date_start
+            if p.date_end:
+                result["date_end"] = p.date_end
+            if p.scope:
+                result["scope"] = p.scope
+            return result
+        elif isinstance(p, FirstDateMentionPrimitive):
+            result = {"type": "FIRST_DATE_MENTION", "entity_id": p.entity_id, "time_basis": p.time_basis}
+            if p.scope:
+                result["scope"] = p.scope
+            return result
+        # Index Retrieval primitives (Place)
+        elif isinstance(p, PlaceMentionsPrimitive):
+            result = {"type": "PLACE_MENTIONS", "place_entity_id": p.place_entity_id, "order_by": p.order_by}
+            if p.scope:
+                result["scope"] = p.scope
+            return result
+        elif isinstance(p, RelatedPlacesPrimitive):
+            result = {"type": "RELATED_PLACES", "entity_id": p.entity_id, "window": p.window, "top_n": p.top_n}
+            if p.scope:
+                result["scope"] = p.scope
+            return result
+        elif isinstance(p, WithinCountryPrimitive):
+            result = {"type": "WITHIN_COUNTRY", "country": p.country}
+            if p.scope:
+                result["scope"] = p.scope
+            return result
+        # Negation/Exclusion primitives
+        elif isinstance(p, ExcludeTermPrimitive):
+            return {"type": "EXCLUDE_TERM", "value": p.value}
+        elif isinstance(p, ExcludePhrasePrimitive):
+            return {"type": "EXCLUDE_PHRASE", "value": p.value}
+        elif isinstance(p, NotEntityPrimitive):
+            return {"type": "NOT_ENTITY", "entity_id": p.entity_id}
+        # Geographic Proximity primitives
+        elif isinstance(p, FilterCityPrimitive):
+            result = {"type": "FILTER_CITY", "city": p.city}
+            if p.country:
+                result["country"] = p.country
+            return result
+        elif isinstance(p, FilterRegionPrimitive):
+            result = {"type": "FILTER_REGION", "region": p.region}
+            if p.country:
+                result["country"] = p.country
+            return result
+        elif isinstance(p, FilterCoordinatesPrimitive):
+            return {
+                "type": "FILTER_COORDINATES",
+                "lat": p.lat,
+                "lng": p.lng,
+                "radius_km": p.radius_km,
+            }
         else:
             raise ValueError(f"Unknown primitive type: {type(p)}")
 
@@ -622,7 +1414,11 @@ class QueryPlan:
         elif ptype == "FILTER_DOCUMENT":
             return FilterDocumentPrimitive(document_id=data["document_id"])
         elif ptype == "SET_TOP_K":
-            return SetTopKPrimitive(value=data["value"])
+            # Default to 20 if value not provided (common LLM omission)
+            value = data.get("value")
+            if value is None:
+                value = 20
+            return SetTopKPrimitive(value=value)
         elif ptype == "SET_SEARCH_TYPE":
             return SetSearchTypePrimitive(value=data["value"])
         elif ptype == "TOGGLE_CONCORDANCE_EXPANSION":
@@ -711,6 +1507,115 @@ class QueryPlan:
             return QuoteAttributionModePrimitive(
                 enabled=data.get("enabled", True),
                 speaker=data.get("speaker")
+            )
+        # Two-Mode Retrieval primitives (Phase 3)
+        elif ptype == "SET_RETRIEVAL_MODE":
+            return SetRetrievalModePrimitive(mode=data.get("mode", "conversational"))
+        elif ptype == "SET_SIMILARITY_THRESHOLD":
+            return SetSimilarityThresholdPrimitive(threshold=data.get("threshold", 0.35))
+        elif ptype == "ENTITY_ROLE":
+            # Role is required - if null/missing, default to "person" (most common case)
+            role = data.get("role")
+            if not role:
+                role = "person"
+            return EntityRolePrimitive(
+                role=role,
+                entity_id=data.get("entity_id")
+            )
+        elif ptype == "EXCEPT_ENTITIES":
+            return ExceptEntitiesPrimitive(entity_ids=data["entity_ids"])
+        elif ptype == "RELATED_ENTITIES":
+            return RelatedEntitiesPrimitive(
+                entity_id=data["entity_id"],
+                window=data.get("window", "document"),
+                top_n=data.get("top_n", 20),
+                result_set_id=data.get("result_set_id")
+            )
+        # Index Retrieval primitives (Entity)
+        elif ptype == "FIRST_MENTION":
+            return FirstMentionPrimitive(
+                entity_id=data["entity_id"],
+                order_by=data.get("order_by", "chronological"),
+                scope=data.get("scope")
+            )
+        elif ptype == "FIRST_CO_MENTION":
+            return FirstCoMentionPrimitive(
+                entity_ids=data["entity_ids"],
+                window=data.get("window", "chunk"),
+                order_by=data.get("order_by", "chronological"),
+                scope=data.get("scope")
+            )
+        elif ptype == "MENTIONS":
+            return MentionsPrimitive(
+                entity_id=data["entity_id"],
+                window=data.get("window", "chunk"),
+                order_by=data.get("order_by", "chronological"),
+                scope=data.get("scope")
+            )
+        # Index Retrieval primitives (Date)
+        elif ptype == "DATE_RANGE_FILTER":
+            return DateRangeFilterPrimitive(
+                date_start=data.get("date_start"),
+                date_end=data.get("date_end"),
+                time_basis=data.get("time_basis", "mentioned_date"),
+                precision_min=data.get("precision_min")
+            )
+        elif ptype == "DATE_MENTIONS":
+            return DateMentionsPrimitive(
+                date_start=data.get("date_start"),
+                date_end=data.get("date_end"),
+                time_basis=data.get("time_basis", "mentioned_date"),
+                order_by=data.get("order_by", "chronological"),
+                scope=data.get("scope")
+            )
+        elif ptype == "FIRST_DATE_MENTION":
+            return FirstDateMentionPrimitive(
+                entity_id=data["entity_id"],
+                time_basis=data.get("time_basis", "mentioned_date"),
+                scope=data.get("scope")
+            )
+        # Index Retrieval primitives (Place)
+        elif ptype == "PLACE_MENTIONS":
+            return PlaceMentionsPrimitive(
+                place_entity_id=data["place_entity_id"],
+                order_by=data.get("order_by", "chronological"),
+                scope=data.get("scope")
+            )
+        elif ptype == "RELATED_PLACES":
+            return RelatedPlacesPrimitive(
+                entity_id=data["entity_id"],
+                window=data.get("window", "chunk"),
+                top_n=data.get("top_n", 20),
+                scope=data.get("scope")
+            )
+        elif ptype == "WITHIN_COUNTRY":
+            return WithinCountryPrimitive(
+                country=data["country"],
+                scope=data.get("scope")
+            )
+        # Negation/Exclusion primitives
+        elif ptype == "EXCLUDE_TERM":
+            return ExcludeTermPrimitive(value=data["value"])
+        elif ptype == "EXCLUDE_PHRASE":
+            return ExcludePhrasePrimitive(value=data["value"])
+        elif ptype == "NOT_ENTITY":
+            return NotEntityPrimitive(entity_id=data["entity_id"])
+        # Geographic Proximity primitives
+        elif ptype == "FILTER_CITY":
+            return FilterCityPrimitive(
+                city=data["city"],
+                country=data.get("country")
+            )
+        elif ptype == "FILTER_REGION":
+            return FilterRegionPrimitive(
+                region=data["region"],
+                country=data.get("country")
+            )
+        elif ptype == "FILTER_COORDINATES":
+            return FilterCoordinatesPrimitive(
+                lat=data["lat"],
+                lng=data["lng"],
+                radius_km=data.get("radius_km", 50.0)
             )
         else:
             raise ValueError(f"Unknown primitive type: {ptype}")
@@ -1394,6 +2299,163 @@ def compile_primitives_to_scope(primitives: List[Primitive], chunk_id_expr: str 
             params.append(p.entity_a)
             params.append(p.entity_b)
             required_joins["entity_mentions"] = True
+        elif isinstance(p, ExceptEntitiesPrimitive):
+            # EXCEPT_ENTITIES: Exclude chunks mentioning any of the specified entities
+            # Uses NOT EXISTS for performance and null-safety (not NOT IN)
+            conditions.append(
+                f"""NOT EXISTS (
+                    SELECT 1 FROM entity_mentions em 
+                    WHERE em.chunk_id = {chunk_id_expr} 
+                    AND em.entity_id = ANY(%s)
+                )"""
+            )
+            params.append(p.entity_ids)  # Pass as array for ANY()
+            required_joins["entity_mentions"] = True
+        elif isinstance(p, EntityRolePrimitive):
+            # ENTITY_ROLE: Filter to chunks mentioning entities of a specific type
+            if p.entity_id:
+                # Specific entity - assert it has this role and find chunks mentioning it
+                conditions.append(
+                    f"""EXISTS (
+                        SELECT 1 FROM entity_mentions em
+                        JOIN entities e ON em.entity_id = e.id
+                        WHERE em.chunk_id = {chunk_id_expr}
+                        AND em.entity_id = %s
+                        AND e.entity_type = %s
+                    )"""
+                )
+                params.append(p.entity_id)
+                params.append(p.role)
+            else:
+                # Any entity of this type
+                conditions.append(
+                    f"""EXISTS (
+                        SELECT 1 FROM entity_mentions em
+                        JOIN entities e ON em.entity_id = e.id
+                        WHERE em.chunk_id = {chunk_id_expr}
+                        AND e.entity_type = %s
+                    )"""
+                )
+                params.append(p.role)
+            required_joins["entity_mentions"] = True
+        # Negation/Exclusion primitives
+        elif isinstance(p, ExcludeTermPrimitive):
+            # EXCLUDE_TERM: Exclude chunks matching a term in full-text search
+            # Uses NOT with websearch_to_tsquery for efficient exclusion
+            normalized = normalize_term(p.value)
+            if normalized:
+                conditions.append(
+                    f"NOT (c.fts_vector @@ websearch_to_tsquery('simple', %s))"
+                )
+                params.append(normalized)
+        elif isinstance(p, ExcludePhrasePrimitive):
+            # EXCLUDE_PHRASE: Exclude chunks matching a phrase in full-text search
+            # Wraps the phrase in quotes for phrase matching
+            words = normalize_phrase(p.value)
+            if words:
+                phrase = " ".join(words)
+                conditions.append(
+                    f"NOT (c.fts_vector @@ websearch_to_tsquery('simple', %s))"
+                )
+                params.append(f'"{phrase}"')  # Quote for phrase matching
+        elif isinstance(p, NotEntityPrimitive):
+            # NOT_ENTITY: Exclude chunks mentioning a specific entity
+            # Uses NOT EXISTS for performance and null-safety
+            conditions.append(
+                f"""NOT EXISTS (
+                    SELECT 1 FROM entity_mentions em 
+                    WHERE em.chunk_id = {chunk_id_expr} 
+                    AND em.entity_id = %s
+                )"""
+            )
+            params.append(p.entity_id)
+            required_joins["entity_mentions"] = True
+        # Geographic Proximity primitives
+        elif isinstance(p, FilterCityPrimitive):
+            # FILTER_CITY: Filter to chunks mentioning places in a city
+            if p.country:
+                conditions.append(
+                    f"""EXISTS (
+                        SELECT 1 FROM entity_mentions em
+                        JOIN entities e ON em.entity_id = e.id
+                        WHERE em.chunk_id = {chunk_id_expr}
+                        AND e.entity_type = 'place'
+                        AND e.place_city ILIKE %s
+                        AND e.place_country ILIKE %s
+                    )"""
+                )
+                params.append(p.city)
+                params.append(p.country)
+            else:
+                conditions.append(
+                    f"""EXISTS (
+                        SELECT 1 FROM entity_mentions em
+                        JOIN entities e ON em.entity_id = e.id
+                        WHERE em.chunk_id = {chunk_id_expr}
+                        AND e.entity_type = 'place'
+                        AND e.place_city ILIKE %s
+                    )"""
+                )
+                params.append(p.city)
+            required_joins["entity_mentions"] = True
+        elif isinstance(p, FilterRegionPrimitive):
+            # FILTER_REGION: Filter to chunks mentioning places in a region
+            if p.country:
+                conditions.append(
+                    f"""EXISTS (
+                        SELECT 1 FROM entity_mentions em
+                        JOIN entities e ON em.entity_id = e.id
+                        WHERE em.chunk_id = {chunk_id_expr}
+                        AND e.entity_type = 'place'
+                        AND e.place_region ILIKE %s
+                        AND e.place_country ILIKE %s
+                    )"""
+                )
+                params.append(p.region)
+                params.append(p.country)
+            else:
+                conditions.append(
+                    f"""EXISTS (
+                        SELECT 1 FROM entity_mentions em
+                        JOIN entities e ON em.entity_id = e.id
+                        WHERE em.chunk_id = {chunk_id_expr}
+                        AND e.entity_type = 'place'
+                        AND e.place_region ILIKE %s
+                    )"""
+                )
+                params.append(p.region)
+            required_joins["entity_mentions"] = True
+        elif isinstance(p, FilterCoordinatesPrimitive):
+            # FILTER_COORDINATES: Filter by proximity to coordinates
+            # Uses approximate bounding box for efficiency without PostGIS
+            # More accurate calculation would use PostGIS ST_DWithin
+            # Approximate degrees per km at various latitudes:
+            # - 1 degree latitude ≈ 111 km
+            # - 1 degree longitude ≈ 111 * cos(lat) km
+            import math
+            lat_delta = p.radius_km / 111.0
+            lng_delta = p.radius_km / (111.0 * max(0.1, math.cos(math.radians(p.lat))))
+            
+            conditions.append(
+                f"""EXISTS (
+                    SELECT 1 FROM entity_mentions em
+                    JOIN entities e ON em.entity_id = e.id
+                    WHERE em.chunk_id = {chunk_id_expr}
+                    AND e.entity_type = 'place'
+                    AND e.place_lat IS NOT NULL
+                    AND e.place_lng IS NOT NULL
+                    AND e.place_lat BETWEEN %s AND %s
+                    AND e.place_lng BETWEEN %s AND %s
+                )"""
+            )
+            params.append(p.lat - lat_delta)
+            params.append(p.lat + lat_delta)
+            params.append(p.lng - lng_delta)
+            params.append(p.lng + lng_delta)
+            required_joins["entity_mentions"] = True
+        # Note: Control primitives (SetRetrievalModePrimitive, SetSimilarityThresholdPrimitive)
+        # and Analysis primitives (RelatedEntitiesPrimitive) are NOT compiled to scope.
+        # They are handled separately in execution.
     
     if not conditions:
         return ("", [], required_joins)

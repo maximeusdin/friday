@@ -27,6 +27,8 @@ from collections import Counter
 import psycopg2
 import fitz  # PyMuPDF
 
+import ingest_runs
+
 # Fix Windows console encoding
 if sys.platform == 'win32':
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
@@ -869,15 +871,32 @@ def main():
     reports_skipped = 0
     
     with connect() as conn, conn.cursor() as cur:
+        ingest_runs.ensure_ingest_runs_table(cur)
         collection_id = get_or_create_collection(cur)
         print(f"Collection: {COLLECTION_SLUG} (id={collection_id})")
         print()
         
         for pdf_path in paths:
             try:
+                p = Path(pdf_path)
+                pipeline_version = str(args.pipeline_version)
+                source_key = f"{COLLECTION_SLUG}:{p.name}"
+                fp = ingest_runs.file_fingerprint_fast(p) if args.dry_run else ingest_runs.file_sha256(p)
+
+                if not args.dry_run and not ingest_runs.should_run(
+                    cur, source_key=source_key, source_fingerprint=fp, pipeline_version=pipeline_version
+                ):
+                    print(f"[skip] {p.name} (already ingested: pipeline={pipeline_version})")
+                    continue
+
+                if not args.dry_run:
+                    ingest_runs.mark_running(
+                        cur, source_key=source_key, source_fingerprint=fp, pipeline_version=pipeline_version
+                    )
+
                 doc_id, pages, turns, chunks = process_pdf(
-                    Path(pdf_path), cur, collection_id, config,
-                    args.pipeline_version, args.dry_run,
+                    p, cur, collection_id, config,
+                    pipeline_version, args.dry_run,
                 )
                 
                 if turns > 0:  # Was processed as transcript
@@ -887,6 +906,7 @@ def main():
                     transcripts_processed += 1
                     
                     if not args.dry_run:
+                        ingest_runs.mark_success(cur, source_key=source_key)
                         conn.commit()
                         print(f"    -> document_id={doc_id}")
                 else:
@@ -895,6 +915,14 @@ def main():
             except Exception as e:
                 print(f"    ERROR: {e}")
                 conn.rollback()
+                if not args.dry_run:
+                    ingest_runs.mark_failed_best_effort(
+                        connect,
+                        source_key=source_key,
+                        source_fingerprint=fp,
+                        pipeline_version=pipeline_version,
+                        error=str(e),
+                    )
                 continue
         
         print()

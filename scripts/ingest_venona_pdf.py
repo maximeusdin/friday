@@ -63,9 +63,10 @@ DB_PASS = os.getenv("DB_PASS", "neh")
 
 
 def connect():
-    return psycopg2.connect(
-        host=DB_HOST, port=DB_PORT, dbname=DB_NAME, user=DB_USER, password=DB_PASS
-    )
+    database_url = os.getenv("DATABASE_URL")
+    if database_url:
+        return psycopg2.connect(database_url)
+    return psycopg2.connect(host=DB_HOST, port=DB_PORT, dbname=DB_NAME, user=DB_USER, password=DB_PASS)
 
 
 # ----------------------------
@@ -636,9 +637,28 @@ def main():
     ap = argparse.ArgumentParser(
         description="Ingest Venona cable PDFs into pages (message/cable units) + write page_metadata."
     )
-    ap.add_argument("--pdf", required=True, help="Path to PDF (WSL path recommended).")
-    ap.add_argument("--source-key", default=None, help="Stable ingest key (default: venona:<filename-stem>).")
-    ap.add_argument("--volume", default=None, help="Optional volume label stored on documents.volume.")
+    g = ap.add_mutually_exclusive_group(required=True)
+    g.add_argument("--pdf", help="Path to a single PDF (WSL path recommended).")
+    g.add_argument("--pdf-dir", help="Directory containing PDFs to ingest (non-recursive).")
+    ap.add_argument(
+        "--source-key",
+        default=None,
+        help=(
+            "Stable ingest key. For --pdf, defaults to '<collection-slug>:<stem>'. "
+            "For --pdf-dir, if you include '{stem}', it will be formatted per PDF; "
+            "otherwise it is treated as a prefix and ':<stem>' is appended."
+        ),
+    )
+    ap.add_argument(
+        "--volume",
+        default=None,
+        help=(
+            "Document volume label stored on documents.volume. "
+            "For --pdf-dir, if you include '{stem}', it will be formatted per PDF; "
+            "otherwise it is treated as a prefix and ' – <stem>' is appended. "
+            "If omitted in --pdf-dir mode, defaults to '<CollectionSlugCapitalized> – <stem>'."
+        ),
+    )
     ap.add_argument("--language", default="en", help="pages.language (default: en).")
     ap.add_argument("--collection-slug", default="venona", help="collections.slug (default: venona).")
     ap.add_argument("--collection-title", default="Venona Decrypts", help="collections.title.")
@@ -649,194 +669,265 @@ def main():
     )
     args = ap.parse_args()
 
-    pdf_path = Path(args.pdf)
-    if not pdf_path.exists():
-        print(f"ERROR: PDF not found: {pdf_path}", file=sys.stderr)
-        sys.exit(1)
-
-    pdf_bytes = pdf_path.read_bytes()
-    sha = hashlib.sha256(pdf_bytes).hexdigest()
-
-    source_key = args.source_key or f"venona:{pdf_path.stem}"
-    source_name = pdf_path.name
-
-    # Extract messages by scanning PDF pages
-    messages: List[dict] = []
-    current: Optional[dict] = None
-    page_seq = 0
-
-    doc = fitz.open(str(pdf_path))
+    # Preflight DB connection early so AWS shows a connection immediately (and SSL/auth errors surface fast).
     try:
-        for pdf_idx in range(len(doc)):
-            page = doc[pdf_idx]
-            lines = page_lines_in_reading_order(page)
+        with connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT 1;")
+            params = conn.get_dsn_parameters()
+        host = params.get("host", "?")
+        dbname = params.get("dbname", "?")
+        user = params.get("user", "?")
+        port = params.get("port", "?")
+        print(f"DB preflight OK: host={host} port={port} dbname={dbname} user={user}", file=sys.stderr)
+    except Exception as e:
+        print(f"ERROR: DB preflight failed: {e}", file=sys.stderr)
+        raise
 
-            # If we aren't in a message yet, try to start one
-            if current is None:
-                if not detect_message_start(lines):
-                    if FRONT_MATTER_HINT_RE.search("\n".join(lines[:70])) and pdf_idx < 6:
+    def iter_pdfs() -> List[Path]:
+        if args.pdf:
+            return [Path(args.pdf)]
+        d = Path(args.pdf_dir)
+        if not d.exists() or not d.is_dir():
+            print(f"ERROR: --pdf-dir is not a directory: {d}", file=sys.stderr)
+            sys.exit(1)
+        pdfs = [p for p in d.iterdir() if p.is_file() and p.suffix.lower() == ".pdf"]
+        pdfs.sort(key=lambda p: p.name.lower())
+        if not pdfs:
+            print(f"No PDFs found in: {d}", file=sys.stderr)
+        return pdfs
+
+    def per_pdf_source_key(pdf_path: Path, *, bulk: bool) -> str:
+        stem = pdf_path.stem
+        if args.source_key:
+            if "{stem}" in args.source_key:
+                return args.source_key.format(stem=stem)
+            return f"{args.source_key}:{stem}" if bulk else args.source_key
+        return f"{args.collection_slug}:{stem}"
+
+    def per_pdf_volume(pdf_path: Path, *, bulk: bool) -> Optional[str]:
+        stem = pdf_path.stem
+        if args.volume is None:
+            if bulk:
+                return f"{args.collection_slug.capitalize()} – {stem}"
+            return None
+        if "{stem}" in args.volume:
+            return args.volume.format(stem=stem)
+        return f"{args.volume} – {stem}" if bulk else args.volume
+
+    def ingest_one_pdf(pdf_path: Path, *, bulk: bool) -> None:
+        if not pdf_path.exists() or not pdf_path.is_file():
+            raise FileNotFoundError(f"PDF not found: {pdf_path}")
+
+        sha: Optional[str] = None
+        source_key = per_pdf_source_key(pdf_path, bulk=bulk)
+        volume = per_pdf_volume(pdf_path, bulk=bulk)
+        source_name = pdf_path.name
+
+        try:
+            pdf_bytes = pdf_path.read_bytes()
+            sha = hashlib.sha256(pdf_bytes).hexdigest()
+
+            # ----------------------------
+            # 1) Parse PDF into messages
+            # ----------------------------
+            messages: List[dict] = []
+            current: Optional[dict] = None
+            page_seq = 0
+
+            doc = fitz.open(str(pdf_path))
+            try:
+                for pdf_idx in range(len(doc)):
+                    page = doc[pdf_idx]
+                    lines = page_lines_in_reading_order(page)
+
+                    # If we aren't in a message yet, try to start one
+                    if current is None:
+                        if not detect_message_start(lines):
+                            if FRONT_MATTER_HINT_RE.search("\n".join(lines[:70])) and pdf_idx < 6:
+                                continue
+                            continue
+
+                        label, header_meta = extract_label_from_header(lines)
+                        current = {
+                            "start_pdf_page": pdf_idx + 1,
+                            "lines": list(lines),
+                            "label": label,
+                            "header_meta": header_meta,
+                        }
                         continue
-                    continue
 
-                label, header_meta = extract_label_from_header(lines)
-                current = {
-                    "start_pdf_page": pdf_idx + 1,
-                    "lines": list(lines),
-                    "label": label,
-                    "header_meta": header_meta,
-                }
-                continue
+                    # If we are inside a message, check if a new message starts here
+                    if detect_message_start(lines):
+                        page_seq += 1
+                        raw_text = "\n".join(current["lines"])
+                        messages.append(
+                            {
+                                "page_seq": page_seq,
+                                "pdf_page_number": current["start_pdf_page"],
+                                "logical_page_label": current["label"] or f"msg.{page_seq:04d}",
+                                "raw_text": raw_text,
+                            }
+                        )
 
-            # If we are inside a message, check if a new message starts here
-            if detect_message_start(lines):
-                page_seq += 1
-                raw_text = "\n".join(current["lines"])
-                messages.append(
+                        label, header_meta = extract_label_from_header(lines)
+                        current = {
+                            "start_pdf_page": pdf_idx + 1,
+                            "lines": list(lines),
+                            "label": label,
+                            "header_meta": header_meta,
+                        }
+                    else:
+                        current["lines"].extend(lines)
+
+                # Flush last message
+                if current is not None:
+                    page_seq += 1
+                    raw_text = "\n".join(current["lines"])
+                    messages.append(
+                        {
+                            "page_seq": page_seq,
+                            "pdf_page_number": current["start_pdf_page"],
+                            "logical_page_label": current["label"] or f"msg.{page_seq:04d}",
+                            "raw_text": raw_text,
+                        }
+                    )
+            finally:
+                doc.close()
+
+            if not messages:
+                raise ValueError("extracted 0 messages (PDF may not match Venona-cables format)")
+
+            # ----------------------------
+            # 2) Normalize/dedupe labels
+            # ----------------------------
+            seen: Dict[str, int] = {}
+            pages: List[dict] = []
+            for msg in messages:
+                base = normalize_label(msg["logical_page_label"])
+                n = seen.get(base, 0) + 1
+                seen[base] = n
+                label = base if n == 1 else f"{base}__dup{n}"
+                pages.append(
                     {
-                        "page_seq": page_seq,
-                        "pdf_page_number": current["start_pdf_page"],
-                        "logical_page_label": current["label"] or f"msg.{page_seq:04d}",
-                        "raw_text": raw_text,
+                        "logical_page_label": label,
+                        "pdf_page_number": int(msg["pdf_page_number"]),
+                        "page_seq": int(msg["page_seq"]),
+                        "language": args.language,
+                        "content_role": "primary",
+                        "raw_text": msg["raw_text"],
                     }
                 )
 
-                label, header_meta = extract_label_from_header(lines)
-                current = {
-                    "start_pdf_page": pdf_idx + 1,
-                    "lines": list(lines),
-                    "label": label,
-                    "header_meta": header_meta,
-                }
-            else:
-                current["lines"].extend(lines)
+            # ----------------------------
+            # 3) Write to DB (idempotent per source_key+sha+pipeline_version)
+            # ----------------------------
+            with connect() as conn, conn.cursor() as cur:
+                ensure_ingest_runs_table(cur)
 
-        # Flush last message
-        if current is not None:
-            page_seq += 1
-            raw_text = "\n".join(current["lines"])
-            messages.append(
-                {
-                    "page_seq": page_seq,
-                    "pdf_page_number": current["start_pdf_page"],
-                    "logical_page_label": current["label"] or f"msg.{page_seq:04d}",
-                    "raw_text": raw_text,
-                }
-            )
-    finally:
-        doc.close()
-
-    if not messages:
-        print("ERROR: extracted 0 messages. This PDF may not match the Venona-cables format.", file=sys.stderr)
-        sys.exit(2)
-
-    # Deduplicate labels within this document deterministically
-    seen: Dict[str, int] = {}
-    pages: List[dict] = []
-    for msg in messages:
-        base = normalize_label(msg["logical_page_label"])
-        n = seen.get(base, 0) + 1
-        seen[base] = n
-        label = base if n == 1 else f"{base}__dup{n}"
-        pages.append(
-            {
-                "logical_page_label": label,
-                "pdf_page_number": int(msg["pdf_page_number"]),
-                "page_seq": int(msg["page_seq"]),
-                "language": args.language,
-                "content_role": "primary",
-                "raw_text": msg["raw_text"],
-            }
-        )
-
-    try:
-        with connect() as conn, conn.cursor() as cur:
-            ensure_ingest_runs_table(cur)
-
-            can_write_page_metadata = page_metadata_table_exists(cur)
-            if not can_write_page_metadata:
-                print("WARNING: page_metadata table not found; header metadata will not be stored.", file=sys.stderr)
-
-            if not should_run(cur, source_key, sha, PIPELINE_VERSION):
-                print("No-op: already ingested for this pipeline_version and PDF hash.")
-                return
-
-            mark_running(cur, source_key, sha, PIPELINE_VERSION)
-
-            collection_id = upsert_collection(
-                cur,
-                slug=args.collection_slug,
-                title=args.collection_title,
-                description=args.collection_description,
-            )
-
-            doc_id = upsert_document(
-                cur,
-                collection_id=collection_id,
-                source_name=source_name,
-                volume=args.volume,
-                source_ref=str(pdf_path),
-                metadata={
-                    "ingested_by": "scripts/ingest_venona_pdf.py",
-                    "pipeline_version": PIPELINE_VERSION,
-                    "meta_pipeline_version": META_PIPELINE_VERSION,
-                    "pdf_sha256": sha,
-                    "split_rule": "messages split by USSR Ref No or From/To/No header clusters; continuation pages appended",
-                },
-            )
-
-            # If your page_metadata FK is RESTRICT, uncomment this before deleting pages:
-            # cur.execute(
-            #     "DELETE FROM page_metadata WHERE page_id IN (SELECT id FROM pages WHERE document_id=%s)",
-            #     (doc_id,),
-            # )
-
-            delete_pages_for_document(cur, doc_id)
-
-            # Insert message-pages + metadata
-            for p in pages:
-                cur.execute(
-                    """
-                    INSERT INTO pages (
-                      document_id, logical_page_label, pdf_page_number, page_seq,
-                      language, content_role, raw_text
+                can_write_page_metadata = page_metadata_table_exists(cur)
+                if not can_write_page_metadata:
+                    print(
+                        "WARNING: page_metadata table not found; header metadata will not be stored.",
+                        file=sys.stderr,
                     )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
-                    RETURNING id
-                    """,
-                    (
-                        doc_id,
-                        p["logical_page_label"],
-                        p["pdf_page_number"],
-                        p["page_seq"],
-                        p["language"],
-                        p["content_role"],
-                        p["raw_text"],
-                    ),
+
+                if not should_run(cur, source_key, sha, PIPELINE_VERSION):
+                    print(f"No-op: already ingested ({pdf_path.name}) for this pipeline_version and PDF hash.")
+                    return
+
+                mark_running(cur, source_key, sha, PIPELINE_VERSION)
+
+                collection_id = upsert_collection(
+                    cur,
+                    slug=args.collection_slug,
+                    title=args.collection_title,
+                    description=args.collection_description,
                 )
-                page_id = int(cur.fetchone()[0])
 
-                if can_write_page_metadata:
-                    ven_meta = extract_venona_metadata_from_message(p["raw_text"])
-                    upsert_page_metadata(
-                        cur,
-                        page_id=page_id,
-                        pipeline_version=META_PIPELINE_VERSION,
-                        meta_raw={
-                            "venona": ven_meta,
-                            "source": "scripts/ingest_venona_pdf.py",
-                        },
+                doc_id = upsert_document(
+                    cur,
+                    collection_id=collection_id,
+                    source_name=source_name,
+                    volume=volume,
+                    source_ref=str(pdf_path),
+                    metadata={
+                        "ingested_by": "scripts/ingest_venona_pdf.py",
+                        "pipeline_version": PIPELINE_VERSION,
+                        "meta_pipeline_version": META_PIPELINE_VERSION,
+                        "pdf_sha256": sha,
+                        "split_rule": "messages split by USSR Ref No or From/To/No header clusters; continuation pages appended",
+                    },
+                )
+
+                delete_pages_for_document(cur, doc_id)
+
+                for p in pages:
+                    cur.execute(
+                        """
+                        INSERT INTO pages (
+                          document_id, logical_page_label, pdf_page_number, page_seq,
+                          language, content_role, raw_text
+                        )
+                        VALUES (%s, %s, %s, %s, %s, %s, %s)
+                        RETURNING id
+                        """,
+                        (
+                            doc_id,
+                            p["logical_page_label"],
+                            p["pdf_page_number"],
+                            p["page_seq"],
+                            p["language"],
+                            p["content_role"],
+                            p["raw_text"],
+                        ),
                     )
+                    page_id = int(cur.fetchone()[0])
 
-            mark_success(cur, source_key)
-            conn.commit()
+                    if can_write_page_metadata:
+                        ven_meta = extract_venona_metadata_from_message(p["raw_text"])
+                        upsert_page_metadata(
+                            cur,
+                            page_id=page_id,
+                            pipeline_version=META_PIPELINE_VERSION,
+                            meta_raw={"venona": ven_meta, "source": "scripts/ingest_venona_pdf.py"},
+                        )
 
-        print(f"Done. Ingested {len(pages)} messages from {source_name}")
-        print(f"source_key={source_key}")
-        print(f"sha256={sha}")
+                mark_success(cur, source_key)
+                conn.commit()
 
-    except Exception as e:
-        mark_failed_best_effort(source_key, sha, str(e))
-        raise
+            print(f"Done. Ingested {len(pages)} messages from {source_name}")
+            print(f"source_key={source_key}")
+            print(f"sha256={sha}")
+
+        except Exception as e:
+            # Record failure so reruns will retry this PDF.
+            if sha is not None:
+                mark_failed_best_effort(source_key, sha, str(e))
+            raise
+
+    pdf_paths = iter_pdfs()
+    if not pdf_paths:
+        return
+
+    bulk = args.pdf_dir is not None
+    successes = 0
+    failures = 0
+    for i, pdf_path in enumerate(pdf_paths, start=1):
+        if bulk:
+            print(f"\n[{i}/{len(pdf_paths)}] Ingesting {pdf_path.name}")
+        try:
+            ingest_one_pdf(pdf_path, bulk=bulk)
+            successes += 1
+        except Exception as e:
+            failures += 1
+            print(f"ERROR: ingest failed for {pdf_path}: {e}", file=sys.stderr)
+            if not bulk:
+                raise
+
+    if bulk:
+        print(f"\nVenona ingest complete. successes={successes} failures={failures}", file=sys.stderr)
+        if failures:
+            sys.exit(1)
 
 
 if __name__ == "__main__":

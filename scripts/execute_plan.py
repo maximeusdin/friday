@@ -725,11 +725,11 @@ def execute_count_mode(
         
         elif group_by == "document":
             count_sql = f"""
-                SELECT d.id, d.title, COUNT(DISTINCT c.id) as chunk_count
+                SELECT d.id, d.source_name, COUNT(DISTINCT c.id) as chunk_count
                 {from_clause}
                 {joins_sql}
                 {where_clause}
-                GROUP BY d.id, d.title
+                GROUP BY d.id, d.source_name
                 ORDER BY chunk_count DESC
                 LIMIT 50
             """
@@ -1169,6 +1169,901 @@ def main():
         except Exception:
             pass
         conn.close()
+
+# =============================================================================
+# Phase 6: Mode-Aware Execution
+# =============================================================================
+
+def execute_plan_retrieval_v2(
+    conn,
+    plan: ResearchPlan,
+    *,
+    ui_toggle_mode: Optional[str] = None,
+    force_rerun: bool = False,
+    existing_result_set_id: Optional[int] = None,
+) -> Dict[str, Any]:
+    """
+    Execute plan retrieval with mode-aware logic (Two-Mode Retrieval System).
+    
+    Mode Precedence (highest to lowest):
+    1. ui_toggle_mode - explicit user selection
+    2. SET_RETRIEVAL_MODE primitive - from plan
+    3. Trigger phrase detection - from utterance
+    4. Default - conversational
+    
+    Rerun Semantics:
+    - If existing_result_set_id and not force_rerun: return existing (idempotent)
+    - If force_rerun: create new result_set (audit trail preserved)
+    
+    Args:
+        conn: Database connection
+        plan: Compiled research plan
+        ui_toggle_mode: Mode from UI toggle (if set)
+        force_rerun: Force new execution even if result exists
+        existing_result_set_id: Existing result set ID (for idempotent reuse)
+        
+    Returns:
+        {
+            "result_set_id": int,
+            "retrieval_run_id": int,
+            "mode": str,
+            "mode_source": str,
+            "total_results": int,
+            "total_before_cap": int,
+            "cap_applied": bool,
+            "threshold_used": float,
+            "vector_metric": str,
+            "traces_count": int,
+            "was_reused": bool,
+        }
+    """
+    from retrieval.config import (
+        resolve_retrieval_mode, get_mode_config, DEFAULT_VECTOR_CONFIG,
+    )
+    from retrieval.primitives import SetRetrievalModePrimitive, SetSimilarityThresholdPrimitive
+    from retrieval.ops import hybrid_rrf_sql, compute_thorough_rank, ThresholdSearchResult
+    from retrieval.match_trace import (
+        build_base_traces, enrich_tier1_entity_ids, enrich_tier2_for_summarization,
+        persist_match_traces,
+    )
+    
+    # Idempotent rerun check
+    if existing_result_set_id and not force_rerun:
+        # Reuse existing result - load metadata
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT rs.id, rs.retrieval_run_id, rr.retrieval_mode, rr.mode_source,
+                       array_length(rs.chunk_ids, 1) as total_results
+                FROM result_sets rs
+                JOIN retrieval_runs rr ON rr.id = rs.retrieval_run_id
+                WHERE rs.id = %s
+            """, (existing_result_set_id,))
+            row = cur.fetchone()
+            if row:
+                return {
+                    "result_set_id": row[0],
+                    "retrieval_run_id": row[1],
+                    "mode": row[2] or "conversational",
+                    "mode_source": row[3] or "default",
+                    "total_results": row[4] or 0,
+                    "total_before_cap": row[4] or 0,
+                    "cap_applied": False,
+                    "threshold_used": 0.0,
+                    "vector_metric": "cosine",
+                    "traces_count": 0,
+                    "was_reused": True,
+                }
+    
+    # Ensure plan is compiled
+    if not plan.compiled:
+        plan.compile()
+    
+    # 1. Extract primitive mode if present
+    primitive_mode = None
+    custom_threshold = None
+    entity_primitive_ids = []
+    
+    for p in plan.query.primitives:
+        if isinstance(p, SetRetrievalModePrimitive):
+            primitive_mode = p.mode
+        elif isinstance(p, SetSimilarityThresholdPrimitive):
+            custom_threshold = p.threshold
+        # Collect entity IDs for trace enrichment
+        ptype = getattr(p, 'type', None)
+        if ptype == "ENTITY":
+            entity_primitive_ids.append(p.entity_id)
+    
+    # 2. Get utterance for trigger detection
+    utterance = plan.query.raw or ""
+    
+    # 3. Resolve mode with precedence
+    mode, mode_source = resolve_retrieval_mode(ui_toggle_mode, primitive_mode, utterance)
+    
+    # 4. Load config
+    config = get_mode_config(mode)
+    vector_config = DEFAULT_VECTOR_CONFIG
+    
+    # Apply custom threshold if set
+    threshold = custom_threshold if custom_threshold is not None else config.similarity_threshold
+    
+    # Determine cap based on mode
+    max_hits = config.answer_k if mode == "conversational" else None
+    
+    # 5. Get compiled components
+    compiled = plan.compiled
+    expanded = compiled.get("expanded", {})
+    expanded_text = expanded.get("expanded_text", plan.query.raw)
+    scope = compiled.get("scope", {})
+    scope_sql = scope.get("where_sql") if scope else None
+    scope_params = scope.get("params", []) if scope else []
+    
+    # Build filters
+    collection_slugs = None
+    for p in plan.query.primitives:
+        if hasattr(p, "type") and p.type == "FILTER_COLLECTION":
+            if collection_slugs is None:
+                collection_slugs = []
+            collection_slugs.append(p.slug)
+    
+    filters = SearchFilters(
+        chunk_pv="chunk_v1_full",
+        collection_slugs=collection_slugs,
+    )
+    
+    # 6. Execute search
+    if expanded_text and expanded_text.strip():
+        # Get embedding for query
+        embedding = embed_query(expanded_text)
+        
+        # Use threshold-based hybrid search
+        results, metadata = hybrid_rrf_sql(
+            conn,
+            expanded_text,
+            embedding,
+            similarity_threshold=threshold,
+            combine_mode="union",
+            max_hits=max_hits,
+            scope_sql=scope_sql,
+            scope_params=scope_params,
+            vector_config=vector_config,
+            filters=filters,
+            rrf_k=config.rrf_k,
+            retrieval_mode=mode,
+        )
+        
+        # Apply thorough mode ranking if needed
+        if mode == "thorough" and results:
+            results = compute_thorough_rank(results)
+    else:
+        # Scope-only execution (no search text)
+        results = []
+        metadata = None
+        
+        if scope_sql:
+            with conn.cursor() as cur:
+                query = f"""
+                    SELECT DISTINCT c.id, cm.document_id
+                    FROM chunks c
+                    JOIN chunk_metadata cm ON cm.chunk_id = c.id
+                    WHERE {scope_sql}
+                    ORDER BY COALESCE(cm.document_id, 2147483647), c.id
+                """
+                cur.execute(query, scope_params)
+                rows = cur.fetchall()
+                
+                for i, row in enumerate(rows, 1):
+                    results.append(ThresholdSearchResult(
+                        chunk_id=row[0],
+                        document_id=row[1],
+                        rank=i,
+                        in_lexical=False,
+                        in_vector=False,
+                    ))
+    
+    # 7. Build and enrich traces
+    from retrieval.match_trace import ThresholdSearchMetadata as TSM
+    mock_metadata = metadata if metadata else TSM(mode=mode, cap_applied=False)
+    
+    traces = build_base_traces(results, mock_metadata, mode)
+    traces = enrich_tier1_entity_ids(traces, entity_primitive_ids, conn)
+    
+    # Tier 2 enrichment for summarization (top N only)
+    summarization_limit = config.answer_k if hasattr(config, 'answer_k') else 20
+    traces = enrich_tier2_for_summarization(traces, plan.query.primitives, conn, limit=summarization_limit)
+    
+    # 8. Log retrieval run
+    chunk_ids = [r.chunk_id for r in results]
+    embedding_model = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small")
+    
+    run_id = log_retrieval_run(
+        conn,
+        query_text=expanded_text or plan.query.raw,
+        search_type="hybrid" if expanded_text else "lex",
+        chunk_pv=filters.chunk_pv or "all",
+        embedding_model=embedding_model,
+        top_k=len(chunk_ids),
+        returned_chunk_ids=chunk_ids,
+        expanded_query_text=expanded_text,
+        expansion_terms=None,
+        expand_concordance=False,
+        concordance_source_slug=None,
+        query_lang_version="qv3_two_mode",
+        retrieval_impl_version="retrieval_v3_two_mode",
+        normalization_version=None,
+        vector_metric=vector_config.metric,
+        embedding_dim=1536,
+        embed_text_version="embed_text_v1",
+        retrieval_config_json={
+            "mode": mode,
+            "mode_source": mode_source,
+            "threshold": threshold,
+            "rrf_k": config.rrf_k,
+        },
+        tsquery_text=None,
+        auto_commit=False,
+    )
+    
+    # 9. Create result set
+    result_set_name = f"Plan {plan.query.raw[:50] if plan.query.raw else 'unknown'}... (mode={mode})"
+    result_set_id = create_result_set(
+        conn,
+        run_id,
+        chunk_ids,
+        name=result_set_name,
+    )
+    
+    # 10. Persist traces
+    traces_count = persist_match_traces(traces, result_set_id, run_id, conn)
+    
+    # 11. Populate result_set_chunks for pagination
+    with conn.cursor() as cur:
+        cur.execute("SELECT populate_result_set_chunks(%s, %s)", (result_set_id, mode))
+    
+    conn.commit()
+    
+    return {
+        "result_set_id": result_set_id,
+        "retrieval_run_id": run_id,
+        "mode": mode,
+        "mode_source": mode_source,
+        "total_results": len(results),
+        "total_before_cap": metadata.total_before_cap if metadata else len(results),
+        "cap_applied": metadata.cap_applied if metadata else False,
+        "threshold_used": threshold,
+        "vector_metric": vector_config.metric,
+        "traces_count": traces_count,
+        "was_reused": False,
+    }
+
+
+# =============================================================================
+# Index Retrieval Execution
+# =============================================================================
+
+def execute_index_retrieval(
+    conn,
+    primitive,  # Union[FirstMentionPrimitive, FirstCoMentionPrimitive, MentionsPrimitive, ...]
+    *,
+    mode: str = "conversational",
+    scope_sql: Optional[str] = None,
+    scope_params: Optional[Dict[str, Any]] = None,
+    limit: Optional[int] = None,
+    after_rank: Optional[int] = None,
+) -> Dict[str, Any]:
+    """
+    Execute an index retrieval primitive and create a result set.
+    
+    This is the main entry point for index-based retrieval (as opposed to
+    search-based retrieval via execute_plan_retrieval_v2).
+    
+    Args:
+        conn: Database connection
+        primitive: An index primitive (FIRST_MENTION, FIRST_CO_MENTION, MENTIONS, etc.)
+        mode: "conversational" or "thorough"
+        scope_sql: Optional SQL WHERE clause for additional filtering
+        scope_params: Parameters for scope SQL
+        limit: Override for pagination limit
+        after_rank: Cursor for pagination
+        
+    Returns:
+        Dict with result_set_id, retrieval_run_id, metadata, etc.
+    """
+    from retrieval.primitives import (
+        FirstMentionPrimitive, FirstCoMentionPrimitive, MentionsPrimitive,
+        DateRangeFilterPrimitive, DateMentionsPrimitive, FirstDateMentionPrimitive,
+        PlaceMentionsPrimitive, RelatedPlacesPrimitive,
+    )
+    from retrieval.index_ops import (
+        first_mention, first_co_mention, mentions_paginated,
+        date_range_filter, first_date_mention, place_mentions, related_places,
+        IndexHit, IndexMetadata,
+    )
+    from retrieval.match_trace import MatchTrace, persist_match_traces
+    from retrieval.config import ConversationalModeConfig, ThoroughModeConfig
+    
+    # Get mode config for limits
+    if mode == "conversational":
+        config = ConversationalModeConfig()
+        effective_limit = limit or config.answer_k
+    else:
+        config = ThoroughModeConfig()
+        effective_limit = limit or config.pagination_default_limit
+    
+    # Route to appropriate index operation
+    hits: List[IndexHit] = []
+    metadata: IndexMetadata = IndexMetadata()
+    primitive_type = type(primitive).__name__
+    
+    if isinstance(primitive, FirstMentionPrimitive):
+        hit, metadata = first_mention(
+            conn,
+            primitive.entity_id,
+            scope_sql=scope_sql,
+            scope_params=scope_params,
+            order_by=primitive.order_by,
+        )
+        if hit:
+            hits = [hit]
+    
+    elif isinstance(primitive, FirstCoMentionPrimitive):
+        hit, metadata = first_co_mention(
+            conn,
+            primitive.entity_ids,
+            window=primitive.window,
+            scope_sql=scope_sql,
+            scope_params=scope_params,
+            order_by=primitive.order_by,
+        )
+        if hit:
+            hits = [hit]
+    
+    elif isinstance(primitive, MentionsPrimitive):
+        hits, metadata = mentions_paginated(
+            conn,
+            primitive.entity_id,
+            scope_sql=scope_sql,
+            scope_params=scope_params,
+            order_by=primitive.order_by,
+            limit=effective_limit,
+            after_rank=after_rank,
+        )
+    
+    elif isinstance(primitive, DateRangeFilterPrimitive):
+        from datetime import date as date_type
+        date_start = None
+        date_end = None
+        if primitive.date_start:
+            date_start = date_type.fromisoformat(primitive.date_start) if isinstance(primitive.date_start, str) else primitive.date_start
+        if primitive.date_end:
+            date_end = date_type.fromisoformat(primitive.date_end) if isinstance(primitive.date_end, str) else primitive.date_end
+        
+        hits, metadata = date_range_filter(
+            conn,
+            date_start=date_start,
+            date_end=date_end,
+            time_basis=primitive.time_basis,
+            scope_sql=scope_sql,
+            scope_params=scope_params,
+            limit=effective_limit,
+            after_rank=after_rank,
+        )
+    
+    elif isinstance(primitive, DateMentionsPrimitive):
+        from datetime import date as date_type
+        date_start = None
+        date_end = None
+        if primitive.date_start:
+            date_start = date_type.fromisoformat(primitive.date_start) if isinstance(primitive.date_start, str) else primitive.date_start
+        if primitive.date_end:
+            date_end = date_type.fromisoformat(primitive.date_end) if isinstance(primitive.date_end, str) else primitive.date_end
+        
+        hits, metadata = date_range_filter(
+            conn,
+            date_start=date_start,
+            date_end=date_end,
+            time_basis=primitive.time_basis,
+            scope_sql=scope_sql,
+            scope_params=scope_params,
+            limit=effective_limit,
+            after_rank=after_rank,
+        )
+        metadata.primitive_type = "DATE_MENTIONS"
+    
+    elif isinstance(primitive, FirstDateMentionPrimitive):
+        hit, metadata = first_date_mention(
+            conn,
+            primitive.entity_id,
+            time_basis=primitive.time_basis,
+            scope_sql=scope_sql,
+            scope_params=scope_params,
+        )
+        if hit:
+            hits = [hit]
+    
+    elif isinstance(primitive, PlaceMentionsPrimitive):
+        hits, metadata = place_mentions(
+            conn,
+            primitive.place_entity_id,
+            scope_sql=scope_sql,
+            scope_params=scope_params,
+            order_by=primitive.order_by,
+            limit=effective_limit,
+            after_rank=after_rank,
+        )
+    
+    elif isinstance(primitive, RelatedPlacesPrimitive):
+        # Related places returns aggregated data, not individual hits
+        scope_chunk_ids = None
+        if primitive.scope and "result_set_id" in primitive.scope:
+            # Get chunk IDs from result set
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT chunk_id FROM result_set_chunks WHERE result_set_id = %s",
+                    (primitive.scope["result_set_id"],)
+                )
+                scope_chunk_ids = [row[0] for row in cur.fetchall()]
+        
+        results, metadata = related_places(
+            conn,
+            primitive.entity_id,
+            window=primitive.window,
+            top_n=primitive.top_n,
+            scope_chunk_ids=scope_chunk_ids,
+        )
+        
+        # For analysis primitives, we return the aggregated results directly
+        return {
+            "primitive_type": primitive_type,
+            "mode": mode,
+            "results": results,
+            "metadata": metadata.to_dict(),
+            "total_results": len(results),
+        }
+    
+    else:
+        raise ValueError(f"Unknown index primitive type: {primitive_type}")
+    
+    # Build match traces for index hits
+    traces = _build_index_match_traces(hits, metadata, primitive_type)
+    
+    # Create retrieval run
+    chunk_ids = [h.chunk_id for h in hits]
+    
+    run_id = log_retrieval_run(
+        conn,
+        query_text=f"[INDEX] {primitive_type}",
+        search_type="index",
+        chunk_pv="all",
+        embedding_model=None,
+        top_k=len(chunk_ids),
+        returned_chunk_ids=chunk_ids,
+        expanded_query_text=None,
+        expansion_terms=None,
+        expand_concordance=False,
+        concordance_source_slug=None,
+        query_lang_version="qv3_index_retrieval",
+        retrieval_impl_version="retrieval_v3_index",
+        normalization_version=None,
+        vector_metric=None,
+        embedding_dim=None,
+        embed_text_version=None,
+        retrieval_config_json=_build_retrieval_config(
+            mode=mode,
+            primitive_type=primitive_type,
+            metadata=metadata,
+        ),
+        tsquery_text=None,
+        auto_commit=False,
+    )
+    
+    # Create result set with unique name
+    import time
+    result_set_name = f"Index: {primitive_type} (mode={mode}) @ {int(time.time() * 1000)}"
+    result_set_id = create_result_set(
+        conn,
+        run_id,
+        chunk_ids,
+        name=result_set_name,
+    )
+    
+    # Persist traces
+    traces_count = persist_match_traces(traces, result_set_id, run_id, conn)
+    
+    # Populate result_set_chunks for pagination
+    # Note: For index retrieval, ranks are already assigned by the index ops
+    with conn.cursor() as cur:
+        # Insert directly with pre-computed ranks
+        for hit in hits:
+            cur.execute("""
+                INSERT INTO result_set_chunks (result_set_id, chunk_id, rank)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (result_set_id, chunk_id) DO NOTHING
+            """, (result_set_id, hit.chunk_id, hit.rank))
+    
+    conn.commit()
+    
+    return {
+        "result_set_id": result_set_id,
+        "retrieval_run_id": run_id,
+        "mode": mode,
+        "primitive_type": primitive_type,
+        "total_results": len(hits),
+        "total_before_cap": metadata.total_hits,
+        "metadata": metadata.to_dict(),
+        "traces_count": traces_count,
+    }
+
+
+def _build_retrieval_config(
+    mode: str,
+    primitive_type: str,
+    metadata,  # IndexMetadata
+) -> dict:
+    """
+    Build retrieval config with signature hash for determinism verification.
+    
+    The signature_hash allows comparing whether two queries have identical semantics,
+    which is critical for:
+    - Verifying expand preserves original semantics
+    - Debugging why results differ between runs
+    - Caching/deduplication
+    """
+    import hashlib
+    import json
+    from retrieval.chronology import CHRONOLOGY_V1_KEY
+    
+    config = {
+        "mode": mode,
+        "primitive_type": primitive_type,
+        "source": metadata.source,
+        "order_by": metadata.order_by,
+        "dedupe_policy": metadata.dedupe_policy,
+        "span_policy": metadata.span_policy,
+        "retrieval_source": metadata.source,
+        "time_basis": metadata.time_basis,
+        "geo_basis": metadata.geo_basis,
+        "chronology_version": CHRONOLOGY_V1_KEY,
+    }
+    
+    # Compute signature hash for determinism verification
+    # Includes all semantically-significant fields
+    hash_input = json.dumps({
+        "source": config["source"],
+        "order_by": config["order_by"],
+        "dedupe_policy": config["dedupe_policy"],
+        "span_policy": config["span_policy"],
+        "time_basis": config["time_basis"],
+        "geo_basis": config["geo_basis"],
+        "chronology_version": config["chronology_version"],
+    }, sort_keys=True)
+    
+    config["retrieval_signature_hash"] = hashlib.sha256(hash_input.encode()).hexdigest()[:16]
+    
+    return config
+
+
+def _build_index_match_traces(
+    hits: List,  # List[IndexHit]
+    metadata,  # IndexMetadata
+    primitive_type: str,
+) -> List:
+    """
+    Build match traces for index retrieval hits.
+    
+    These are simpler than search traces - no scores, just entity IDs and
+    source information.
+    """
+    from retrieval.match_trace import MatchTrace
+    
+    traces = []
+    for hit in hits:
+        # Build audit dict for rank_trace
+        audit = {
+            "source": metadata.source,
+            "primitive": primitive_type,
+            "order_by": metadata.order_by,
+            "order_sql": metadata.order_sql,
+            "retrieval_type": "index",
+            # Explicit deduplication policy documentation
+            "dedupe_policy": metadata.dedupe_policy,
+            "span_policy": metadata.span_policy,
+        }
+        
+        if metadata.time_basis:
+            audit["time_basis"] = metadata.time_basis
+        if metadata.date_range:
+            audit["date_range"] = metadata.date_range
+        if metadata.geo_basis:
+            audit["geo_basis"] = metadata.geo_basis
+        if hit.mention_surface:
+            audit["mention_surface"] = hit.mention_surface
+        
+        trace = MatchTrace(
+            chunk_id=hit.chunk_id,
+            document_id=hit.document_id,
+            rank=hit.rank,
+            
+            # Hot columns
+            matched_entity_ids=hit.entity_ids,
+            matched_phrases=[hit.mention_surface] if hit.mention_surface else [],
+            scope_passed=True,
+            
+            # For index retrieval, in_lexical and in_vector are False
+            in_lexical=False,
+            in_vector=False,
+            
+            # Audit/trace info stored in rank_trace
+            rank_trace=audit,
+            
+            # No scores for index retrieval
+            score_lexical=None,
+            score_vector=None,
+            score_hybrid=None,
+        )
+        traces.append(trace)
+    
+    return traces
+
+
+def is_index_primitive(primitive) -> bool:
+    """
+    Check if a primitive is an index retrieval primitive.
+    
+    Index primitives query mention indexes directly, not vector/lexical search.
+    """
+    from retrieval.primitives import (
+        FirstMentionPrimitive, FirstCoMentionPrimitive, MentionsPrimitive,
+        DateRangeFilterPrimitive, DateMentionsPrimitive, FirstDateMentionPrimitive,
+        PlaceMentionsPrimitive, RelatedPlacesPrimitive, WithinCountryPrimitive,
+    )
+    
+    return isinstance(primitive, (
+        FirstMentionPrimitive,
+        FirstCoMentionPrimitive,
+        MentionsPrimitive,
+        DateRangeFilterPrimitive,
+        DateMentionsPrimitive,
+        FirstDateMentionPrimitive,
+        PlaceMentionsPrimitive,
+        RelatedPlacesPrimitive,
+        WithinCountryPrimitive,
+    ))
+
+
+# =============================================================================
+# Agentic Workflow Execution
+# =============================================================================
+
+# Feature flag for agentic mode (enabled by default)
+AGENTIC_MODE_ENABLED = os.getenv("AGENTIC_MODE_ENABLED", "1") == "1"
+
+
+def execute_plan_agentic(
+    conn,
+    plan_data: Dict[str, Any],
+    *,
+    max_retries: int = 2,
+) -> Dict[str, Any]:
+    """
+    Execute a plan using the full agentic workflow.
+    
+    Architecture: Plan → Execute → Verify → Render
+    
+    Features:
+    - Iterative multi-round execution with Jaccard+novelty stability
+    - Multi-lane retrieval (entity, lexical, hybrid, ephemeral expansion, co-mention)
+    - Deterministic claim extraction with optional LLM refinement
+    - Intent-specific verification with claim-scoped role evidence
+    - Per-bullet citations in rendered answer
+    
+    Args:
+        conn: Database connection
+        plan_data: Plan data with user_utterance, plan_json, session_id
+        max_retries: Maximum verification retry attempts
+        
+    Returns:
+        Dict with evidence_bundle, verification_result, rendered_answer, etc.
+    """
+    from retrieval.plan import (
+        AgenticPlan, LaneSpec, ExtractionSpec, VerificationSpec,
+        Budgets, StopConditions, BundleConstraints,
+        build_default_lanes_for_intent, build_verification_spec_for_intent,
+    )
+    from retrieval.intent import (
+        IntentFamily, classify_intent, extract_anchors,
+    )
+    from retrieval.lanes import execute_plan_iterative
+    from retrieval.claim_extraction import extract_claims
+    from retrieval.codename_resolution import resolve_codenames
+    from retrieval.verifier import verify_evidence_bundle, filter_claims_by_verification
+    from retrieval.answer_trace import generate_answer_trace
+    from backend.app.services.summarizer.synthesis import render_from_bundle
+    
+    user_text = plan_data.get("user_utterance", "")
+    session_id = plan_data.get("session_id")
+    
+    # Step 1: Classify intent
+    print("  [Agentic] Classifying intent...", file=sys.stderr)
+    intent_result = classify_intent(user_text, [])
+    
+    # Step 2: Extract anchors and build constraints
+    anchors = intent_result.anchors
+    constraints = BundleConstraints(
+        collection_scope=anchors.constraints.get("collection_scope", []),
+        required_role_evidence_patterns=anchors.constraints.get("role_evidence_patterns", []),
+    )
+    
+    # Step 3: Build lanes based on intent
+    lanes = build_default_lanes_for_intent(
+        intent=intent_result.intent_family,
+        entity_ids=anchors.target_entities,
+        query_terms=anchors.key_concepts + anchors.target_tokens,
+        collection_scope=constraints.collection_scope,
+    )
+    
+    # Step 4: Build verification spec
+    verification = build_verification_spec_for_intent(
+        intent=intent_result.intent_family,
+        role_patterns=constraints.required_role_evidence_patterns,
+        collection_scope=constraints.collection_scope,
+    )
+    
+    # Step 5: Build the typed plan
+    agentic_plan = AgenticPlan(
+        intent=intent_result.intent_family,
+        constraints=constraints,
+        lanes=lanes,
+        extraction=ExtractionSpec(
+            predicates=[],
+            allow_llm_refinement=False,
+        ),
+        verification=verification,
+        budgets=Budgets(),
+        stop_conditions=StopConditions(),
+        query_text=user_text,
+        session_id=str(session_id) if session_id else None,
+    )
+    
+    # Validate plan
+    plan_errors = agentic_plan.validate()
+    if plan_errors:
+        raise ValueError(f"Invalid agentic plan: {plan_errors}")
+    
+    print(f"  [Agentic] Intent: {intent_result.intent_family.value}, "
+          f"Lanes: {len(lanes)}, Confidence: {intent_result.confidence:.2f}", file=sys.stderr)
+    
+    # Step 6: Execute iterative retrieval
+    print("  [Agentic] Executing iterative retrieval...", file=sys.stderr)
+    bundle = execute_plan_iterative(agentic_plan, conn)
+    
+    print(f"  [Agentic] Retrieved {len(bundle.all_chunks)} chunks, "
+          f"{len(bundle.entities)} entities in {bundle.rounds_executed} rounds", file=sys.stderr)
+    
+    # Step 7: Extract claims
+    print("  [Agentic] Extracting claims...", file=sys.stderr)
+    chunks_list = list(bundle.all_chunks.values())
+    candidates_dict = {e.key: e for e in bundle.entities}
+    
+    claims = extract_claims(
+        chunks=chunks_list,
+        candidates=candidates_dict,
+        intent=intent_result.intent_family,
+        extraction_spec=agentic_plan.extraction,
+        conn=conn,
+    )
+    bundle.claims = claims
+    
+    print(f"  [Agentic] Extracted {len(claims)} claims", file=sys.stderr)
+    
+    # Step 8: Resolve codenames if any unresolved tokens
+    if bundle.unresolved_tokens:
+        print(f"  [Agentic] Resolving {len(bundle.unresolved_tokens)} codenames...", file=sys.stderr)
+        resolution = resolve_codenames(
+            bundle.unresolved_tokens,
+            constraints.collection_scope,
+            conn,
+        )
+        # Add resolved claims
+        bundle.claims.extend(resolution.claims)
+        bundle.unresolved_tokens = resolution.unresolved
+    
+    # Step 9: Verify with retry loop
+    print("  [Agentic] Verifying evidence bundle...", file=sys.stderr)
+    verification_result = None
+    
+    for retry in range(max_retries + 1):
+        verification_result = verify_evidence_bundle(bundle, conn)
+        
+        if verification_result.passed:
+            print(f"  [Agentic] Verification passed!", file=sys.stderr)
+            break
+        
+        if retry < max_retries:
+            print(f"  [Agentic] Verification failed, retry {retry + 1}/{max_retries}...", file=sys.stderr)
+            # Filter out invalid claims and continue
+            verified_claims, dropped = filter_claims_by_verification(
+                bundle.claims, constraints
+            )
+            bundle.claims = verified_claims
+        else:
+            print(f"  [Agentic] Verification failed after {max_retries} retries", file=sys.stderr)
+    
+    # Step 10: Generate answer trace
+    trace = generate_answer_trace(bundle, verification_result)
+    
+    # Step 11: Render answer from verified bundle
+    print("  [Agentic] Rendering answer...", file=sys.stderr)
+    rendered = render_from_bundle(bundle)
+    
+    print(f"  [Agentic] Complete: {rendered.claims_rendered} claims, "
+          f"{rendered.citations_included} citations", file=sys.stderr)
+    
+    return {
+        "mode": "agentic",
+        "evidence_bundle": bundle.to_dict(),
+        "verification_passed": verification_result.passed if verification_result else False,
+        "verification_result": verification_result.to_dict() if verification_result else None,
+        "rendered_answer": rendered.to_dict(),
+        "answer_trace": trace.to_dict(),
+        "intent": intent_result.to_dict(),
+        "plan": agentic_plan.to_dict(),
+    }
+
+
+def store_evidence_bundle(
+    conn,
+    result_set_id: int,
+    bundle_data: Dict[str, Any],
+    plan_data: Dict[str, Any],
+    verification_data: Optional[Dict[str, Any]],
+    trace_data: Optional[Dict[str, Any]],
+) -> int:
+    """
+    Store evidence bundle in database for audit/debug.
+    
+    Returns evidence_bundle_id.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO evidence_bundles (
+                result_set_id,
+                bundle_type,
+                plan_json,
+                lane_runs_json,
+                bundle_json,
+                verification_status,
+                verification_errors,
+                answer_trace_json,
+                rounds_executed,
+                claims_count,
+                entities_count,
+                unresolved_count
+            )
+            VALUES (
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+            )
+            RETURNING id
+            """,
+            (
+                result_set_id,
+                "agentic_v1",
+                Json(plan_data),
+                Json(bundle_data.get("retrieval_runs", [])),
+                Json(bundle_data),
+                "passed" if verification_data and verification_data.get("passed") else "failed",
+                Json(verification_data.get("errors", []) if verification_data else []),
+                Json(trace_data),
+                bundle_data.get("rounds_executed", 0),
+                len(bundle_data.get("claims", [])),
+                len(bundle_data.get("entities", [])),
+                len(bundle_data.get("unresolved_tokens", [])),
+            ),
+        )
+        bundle_id = cur.fetchone()[0]
+        conn.commit()
+        return bundle_id
+
 
 if __name__ == "__main__":
     main()

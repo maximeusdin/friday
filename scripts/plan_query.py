@@ -38,6 +38,7 @@ from retrieval.primitives import (
     SetSearchTypePrimitive,
 )
 from retrieval.plan_validation import validate_primitives, validate_plan
+from retrieval.concept_expansion import expand_query_concepts, expand_concept
 
 # =============================================================================
 # DB
@@ -573,6 +574,15 @@ def build_llm_prompt(
         "ENTITY","CO_OCCURS_WITH","INTERSECT_DATE_WINDOWS","FILTER_COUNTRY",
         "CO_LOCATED","RELATION_EVIDENCE","REQUIRE_EVIDENCE","GROUP_BY",
         "COUNT","SET_QUERY_MODE",
+        # Two-Mode Retrieval primitives
+        "SET_RETRIEVAL_MODE","SET_SIMILARITY_THRESHOLD",
+        "RELATED_ENTITIES","ENTITY_ROLE","EXCEPT_ENTITIES",
+        # Index Retrieval primitives (entity)
+        "FIRST_MENTION","FIRST_CO_MENTION","MENTIONS",
+        # Index Retrieval primitives (date)
+        "DATE_RANGE_FILTER","DATE_MENTIONS","FIRST_DATE_MENTION",
+        # Index Retrieval primitives (place)
+        "PLACE_MENTIONS","RELATED_PLACES","WITHIN_COUNTRY",
     ]
 
     rs_ctx = "\nRecent result_sets in this session:\n"
@@ -640,6 +650,98 @@ Example: For "documents from the 1940s" resolved to start: 1940-01-01, end: 1949
    The system will inject result_set_id {most_recent} automatically - just include WITHIN_RESULT_SET.
 """
 
+    # Two-Mode Retrieval guidance
+    mode_guidance = """
+RETRIEVAL MODES:
+You may emit SET_RETRIEVAL_MODE("conversational" | "thorough") to suggest a mode.
+However, if the user has explicitly selected a mode via UI, that takes precedence.
+
+When to suggest "thorough" mode:
+- User says "everything", "exhaustive", "all mentions", "don't miss anything"
+- User explicitly asks for comprehensive or complete results
+- Query is about gathering complete evidence across all documents
+
+When to suggest "conversational" mode (or omit the primitive):
+- Typical questions: "tell me about X", "what happened when Y"
+- User wants quick answers with explanations
+- Query is exploratory rather than exhaustive
+
+NEW PRIMITIVES AVAILABLE:
+
+RELATED_ENTITIES(entity_id, window="document", top_n=20)
+  - Analysis primitive: finds entities co-occurring with target
+  - Use for: "who else appears with X", "related people", "associated organizations"
+  
+ENTITY_ROLE(role="person|org|place", entity_id=None)
+  - Scope primitive: filter to entities of a specific type
+  - Use for: "organizations mentioned", "places in these documents", "all people"
+  - REQUIRED: role must be one of: "person", "org", "place", "event", "document"
+  - DO NOT USE for general searches - only when explicitly filtering by entity type
+  
+EXCEPT_ENTITIES([entity_ids])
+  - Scope primitive: exclude chunks mentioning these entities
+  - Use for: "show me X but not Y", "exclude mentions of Z"
+
+SET_SIMILARITY_THRESHOLD(threshold)
+  - Control primitive: set minimum vector similarity [-1, 1]
+  - Default: 0.35 (conversational), 0.25 (thorough)
+  - Use for: tuning precision/recall tradeoff
+
+INDEX PRIMITIVES (for deterministic mention lookups):
+
+FIRST_MENTION(entity_id)
+  - Index primitive: find chronologically first mention of an entity
+  - Use for: "when was X first mentioned", "earliest reference to Y"
+  - Returns deterministic results from entity_mentions index
+
+FIRST_CO_MENTION(entity_ids)
+  - Index primitive: find first time multiple entities appear together
+  - Use for: "when were X and Y first mentioned together"
+  - Requires at least 2 entity_ids
+
+MENTIONS(entity_id)
+  - Index primitive: find all mentions of an entity, paginated
+  - Use for: "every instance of X", "all references to Y", "locate mentions of Z"
+  - In conversational mode: returns first answer_k
+  - In thorough mode: returns all, paginated
+
+DATE_RANGE_FILTER(date_start, date_end)
+  - Index primitive: filter to chunks with date mentions in range
+  - Use for: "documents mentioning dates between 1944-1945"
+  - time_basis: "mentioned_date" (dates in text) or "document_date" (doc metadata)
+
+DATE_MENTIONS(date_start, date_end)
+  - Index primitive: find chunks mentioning dates in range
+  - Similar to DATE_RANGE_FILTER but orders by mentioned date
+
+FIRST_DATE_MENTION(entity_id)
+  - Index primitive: earliest dated mention of an entity
+  - Use for: "when is X first dated in the documents"
+
+PLACE_MENTIONS(place_entity_id)
+  - Index primitive: find all mentions of a place
+  - Use for: "mentions of Moscow", "references to Washington"
+
+RELATED_PLACES(entity_id)
+  - Analysis primitive: find places co-mentioned with an entity
+  - Use for: "where is X mentioned", "locations associated with Y"
+
+WITHIN_COUNTRY(country)
+  - Scope primitive: filter to chunks mentioning places in a country
+  - Use for: "mentions in the USSR", "documents about France"
+
+WHEN TO USE INDEX vs SEARCH PRIMITIVES:
+- Use INDEX primitives when:
+  * User asks "when", "first", "earliest", "all instances", "locate"
+  * Query is about specific entity mentions, not semantic similarity
+  * Deterministic, reproducible results are required
+  
+- Use SEARCH primitives (TERM, PHRASE, ENTITY with search) when:
+  * User asks "tell me about", "what happened", "summarize"
+  * Query is exploratory or requires semantic understanding
+  * Fuzzy matching and ranking by relevance are needed
+"""
+
     return f"""Convert the user's natural language query into a structured query plan using primitives.
 
 USER UTTERANCE:
@@ -653,6 +755,7 @@ SESSION CONTEXT:
 {date_ctx}
 {conv_ctx}
 {deictic_warning}
+{mode_guidance}
 
 QUERY LANGUAGE VERSION: {query_lang_version}
 
@@ -670,6 +773,20 @@ INSTRUCTIONS:
 - When entity names are resolved above, use ENTITY primitives with the provided entity_id.
 - When dates are resolved above, use FILTER_DATE_RANGE primitives with the resolved start/end dates.
 - Use conversation history to understand follow-up questions and contextual references.
+
+IMPORTANT - KEEP PLANS SIMPLE:
+- DO NOT add SET_TOP_K unless the user explicitly asks to limit results (e.g., "show me 10 results")
+- DO NOT add ENTITY_ROLE unless filtering by entity type is explicitly requested (e.g., "show me only organizations")
+- DO NOT add SET_RETRIEVAL_MODE unless user explicitly says "thorough" or "exhaustive"
+- Most queries only need: PHRASE/TERM + optional FILTER_COLLECTION + optional ENTITY (for resolved names)
+- When in doubt, use fewer primitives - let the system defaults handle the rest
+
+CRITICAL - EXTRACT THE RIGHT TERMS:
+- For questions like "is there information about X", the search should focus on X, not other words
+- Technical terms and proper nouns (2+ words) should be PHRASE, not TERM: "proximity fuse", "atomic bomb", "spy ring"
+- Do NOT drop important nouns in favor of common words like "Soviets", "Americans", "documents"
+- If the query asks about a specific topic (weapon, person, event), that topic MUST be in the primitives
+- Example: "Soviets getting the proximity fuse" → PHRASE("proximity fuse") is essential, "Soviets" is secondary
 
 HARD CONSTRAINTS:
 - If deictic warning is shown above, you MUST include WITHIN_RESULT_SET and MUST NOT set needs_clarification=true.
@@ -692,7 +809,16 @@ def get_plan_json_schema() -> Dict[str, Any]:
         "TOGGLE_CONCORDANCE_EXPANSION",
         "ENTITY","CO_OCCURS_WITH","INTERSECT_DATE_WINDOWS","FILTER_COUNTRY",
         "CO_LOCATED","RELATION_EVIDENCE","REQUIRE_EVIDENCE","GROUP_BY",
-        "COUNT","SET_QUERY_MODE"
+        "COUNT","SET_QUERY_MODE",
+        # Two-Mode Retrieval primitives
+        "SET_RETRIEVAL_MODE","SET_SIMILARITY_THRESHOLD",
+        "RELATED_ENTITIES","ENTITY_ROLE","EXCEPT_ENTITIES",
+        # Index Retrieval primitives (entity)
+        "FIRST_MENTION","FIRST_CO_MENTION","MENTIONS",
+        # Index Retrieval primitives (date)
+        "DATE_RANGE_FILTER","DATE_MENTIONS","FIRST_DATE_MENTION",
+        # Index Retrieval primitives (place)
+        "PLACE_MENTIONS","RELATED_PLACES","WITHIN_COUNTRY",
     ]
 
     nullable_str = {"type": ["string", "null"]}
@@ -729,6 +855,19 @@ def get_plan_json_schema() -> Dict[str, Any]:
         "enabled": nullable_bool,
         "source_slug": nullable_str,
         "primitives": {"type": "array", "items": empty_object_strict},
+        # Two-Mode Retrieval fields
+        "mode": nullable_str,  # for SET_RETRIEVAL_MODE
+        "threshold": {"type": ["number", "null"]},  # for SET_SIMILARITY_THRESHOLD
+        "top_n": nullable_int,  # for RELATED_ENTITIES
+        "role": nullable_str,  # for ENTITY_ROLE
+        "entity_ids": {"type": ["array", "null"], "items": {"type": "integer"}},  # for EXCEPT_ENTITIES, FIRST_CO_MENTION
+        # Index Retrieval fields
+        "order_by": nullable_str,  # "chronological" | "document_order"
+        "time_basis": nullable_str,  # "mentioned_date" | "document_date"
+        "date_start": nullable_str,  # ISO date string for DATE_RANGE_FILTER
+        "date_end": nullable_str,  # ISO date string for DATE_RANGE_FILTER
+        "place_entity_id": nullable_int,  # for PLACE_MENTIONS
+        "country": nullable_str,  # for WITHIN_COUNTRY
     }
     leaf_required = list(leaf_properties.keys())
 
@@ -1393,6 +1532,21 @@ def main():
             for ent in entity_context:
                 print(f"    - \"{ent['surface']}\" -> {ent['canonical_name']} (ID: {ent['entity_id']})", file=sys.stderr)
         
+        # Concept expansion: expand conceptual phrases to entities and terms
+        print("Expanding concepts in utterance...", file=sys.stderr)
+        try:
+            concept_primitives, expansion_notes = expand_query_concepts(
+                conn, args.text, entity_context
+            )
+            if concept_primitives:
+                print(f"  Expanded {len(concept_primitives)} concepts:", file=sys.stderr)
+                if expansion_notes:
+                    print(f"    {expansion_notes}", file=sys.stderr)
+        except Exception as e:
+            print(f"  Warning: Concept expansion failed: {e}", file=sys.stderr)
+            concept_primitives = []
+            expansion_notes = ""
+        
         # If entity resolution requires clarification, return early
         if clarification_needed:
             print("Entity resolution requires clarification", file=sys.stderr)
@@ -1491,6 +1645,112 @@ def main():
                 # Inject FILTER_COLLECTION primitive to match explicit scope
                 prims.append({"type": "FILTER_COLLECTION", "slug": explicit_collection_scope})
                 plan_dict.setdefault("query", {})["primitives"] = prims
+
+        # Inject concept-expanded primitives (entity + term fallbacks)
+        prims = plan_dict.get("query", {}).get("primitives", [])
+        
+        # First, add TERM fallbacks for any PHRASE primitives (phrases can be too restrictive)
+        phrase_terms_to_add = []
+        for p in prims:
+            if isinstance(p, dict) and p.get("type") == "PHRASE" and p.get("value"):
+                phrase_value = p.get("value", "")
+                # Extract significant words from phrase for term fallback
+                words = phrase_value.split()
+                for word in words:
+                    word_clean = word.strip().lower()
+                    # Keep words that are likely significant (3+ chars, not common words)
+                    common_words = {"the", "and", "for", "about", "from", "with", "that", "this", "what", "how", "who", "when", "where", "why", "are", "was", "were", "been", "being", "have", "has", "had", "does", "did", "will", "would", "could", "should", "may", "might", "must", "shall", "can", "there", "their", "they", "them", "these", "those", "some", "any", "all", "each", "every", "both", "few", "more", "most", "other", "such", "only", "same", "into", "over", "after", "before", "between", "under", "again", "then", "once", "here", "just", "also", "very", "even", "back", "well", "much", "still", "own", "see", "now", "get", "got", "getting", "soviets", "americans", "british", "information", "documents", "files"}
+                    if len(word_clean) >= 3 and word_clean not in common_words:
+                        phrase_terms_to_add.append(word_clean)
+        
+        # CRITICAL: Check if the query mentions important multi-word terms that the LLM may have missed
+        # These are technical/historical terms that should be searched as phrases
+        important_phrases = [
+            "proximity fuse", "vt fuse", "radio fuse",
+            "atomic bomb", "atomic energy", "manhattan project",
+            "spy ring", "spy network", "espionage network",
+            "white notebook", "black notebook", "yellow notebook",
+            "code name", "cover name",
+        ]
+        query_lower = (plan_dict.get("query", {}).get("raw", "") or "").lower()
+        for phrase in important_phrases:
+            if phrase in query_lower:
+                # Check if this phrase is already in primitives
+                existing_phrases = {
+                    (p.get("value") or "").lower() for p in prims 
+                    if isinstance(p, dict) and p.get("type") == "PHRASE"
+                }
+                existing_terms = {
+                    (p.get("value") or "").lower() for p in prims 
+                    if isinstance(p, dict) and p.get("type") == "TERM"
+                }
+                # Add as both PHRASE and TERM for maximum coverage
+                if phrase not in existing_phrases:
+                    prims.append({"type": "PHRASE", "value": phrase})
+                    print(f"  Added missing PHRASE: '{phrase}'", file=sys.stderr)
+                # Also add individual words as terms
+                for word in phrase.split():
+                    if word not in existing_terms and len(word) >= 3:
+                        prims.append({"type": "TERM", "value": word})
+                        print(f"  Added TERM fallback: '{word}'", file=sys.stderr)
+        
+        existing_terms = {
+            (p.get("value") or "").lower() for p in prims 
+            if isinstance(p, dict) and p.get("type") == "TERM" and p.get("value")
+        }
+        
+        for term in phrase_terms_to_add:
+            if term not in existing_terms:
+                prims.append({"type": "TERM", "value": term})
+                existing_terms.add(term)
+                print(f"  Added TERM fallback: '{term}' (from PHRASE)", file=sys.stderr)
+        
+        # Now add concept-expanded primitives
+        if concept_primitives:
+            # Merge expanded primitives, avoiding duplicates
+            existing_entity_ids = {
+                p.get("entity_id") for p in prims 
+                if isinstance(p, dict) and p.get("type") in ("ENTITY", "RELATED_ENTITIES") and p.get("entity_id")
+            }
+            
+            for cp in concept_primitives:
+                if cp.get("type") in ("ENTITY", "RELATED_ENTITIES"):
+                    if cp.get("entity_id") not in existing_entity_ids:
+                        prims.append(cp)
+                        existing_entity_ids.add(cp.get("entity_id"))
+                elif cp.get("type") == "TERM":
+                    term_lower = (cp.get("value") or "").lower()
+                    if term_lower and term_lower not in existing_terms:
+                        prims.append(cp)
+                        existing_terms.add(term_lower)
+                else:
+                    prims.append(cp)
+            
+            plan_dict["query"]["primitives"] = prims
+            print(f"  Injected {len(concept_primitives)} concept-expanded primitives", file=sys.stderr)
+        else:
+            plan_dict["query"]["primitives"] = prims
+        
+        # Ensure hybrid search is used by default for semantic queries
+        # Only skip hybrid if explicitly set to "lex" or "index" or if using pure index primitives
+        has_search_type = any(
+            isinstance(p, dict) and p.get("type") == "SET_SEARCH_TYPE"
+            for p in prims
+        )
+        has_index_only = all(
+            isinstance(p, dict) and p.get("type") in (
+                "FIRST_MENTION", "MENTIONS", "FIRST_CO_MENTION", 
+                "DATE_MENTIONS", "PLACE_MENTIONS", "FILTER_COLLECTION",
+                "FILTER_DOCUMENT", "SET_TOP_K", "SET_RETRIEVAL_MODE"
+            )
+            for p in prims if isinstance(p, dict) and p.get("type")
+        )
+        
+        if not has_search_type and not has_index_only:
+            # Default to hybrid search for all semantic queries
+            prims.append({"type": "SET_SEARCH_TYPE", "value": "hybrid"})
+            plan_dict["query"]["primitives"] = prims
+            print("  Using hybrid search (vector + lexical) by default", file=sys.stderr)
 
         # Initial validation (envelope not required yet - it will be built next)
         plan_dict, errors = validate_and_normalize(plan_dict)

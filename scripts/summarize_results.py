@@ -76,12 +76,13 @@ def get_chunks_text(conn, chunk_ids: List[int], limit: int = 50) -> List[Dict[st
             SELECT 
                 c.id,
                 c.text,
-                c.document_id,
-                d.title as doc_title,
+                cm.document_id,
+                d.source_name as doc_title,
                 col.slug as collection_slug
             FROM chunks c
-            JOIN documents d ON d.id = c.document_id
-            JOIN collections col ON col.id = d.collection_id
+            LEFT JOIN chunk_metadata cm ON cm.chunk_id = c.id
+            LEFT JOIN documents d ON d.id = cm.document_id
+            LEFT JOIN collections col ON col.id = d.collection_id
             WHERE c.id = ANY(%s)
             ORDER BY array_position(%s, c.id)
             """,
@@ -93,8 +94,8 @@ def get_chunks_text(conn, chunk_ids: List[int], limit: int = 50) -> List[Dict[st
                 "chunk_id": row[0],
                 "text": row[1][:1000] if row[1] else "",  # Truncate long chunks
                 "document_id": row[2],
-                "document_title": row[3],
-                "collection": row[4],
+                "document_title": row[3] or "Unknown",
+                "collection": row[4] or "unknown",
             }
             for row in cur.fetchall()
         ]

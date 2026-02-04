@@ -32,11 +32,13 @@ Usage examples:
 import os
 import re
 import sys
+import time
 import argparse
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 import psycopg2
+from psycopg2.extras import execute_values
 
 # ---------- DB config ----------
 DB_HOST = os.getenv("DB_HOST", "localhost")
@@ -179,7 +181,25 @@ def delete_chunks_for_document(cur, document_id: int, pipeline_version: str):
     """
     Delete derived chunks for this document and this pipeline version.
     chunk_pages rows delete via ON DELETE CASCADE (through chunks).
+    
+    Also cleans up retrieval_run_chunk_evidence first (FK has ON DELETE RESTRICT).
     """
+    # First, delete from retrieval_run_chunk_evidence (FK is ON DELETE RESTRICT)
+    cur.execute(
+        """
+        DELETE FROM retrieval_run_chunk_evidence
+        WHERE chunk_id IN (
+            SELECT c.id
+            FROM chunks c
+            JOIN chunk_pages cp ON cp.chunk_id = c.id
+            JOIN pages p ON p.id = cp.page_id
+            WHERE c.pipeline_version = %s
+              AND p.document_id = %s
+        )
+        """,
+        (pipeline_version, document_id),
+    )
+    # Now delete the chunks
     cur.execute(
         """
         DELETE FROM chunks
@@ -193,6 +213,60 @@ def delete_chunks_for_document(cur, document_id: int, pipeline_version: str):
         """,
         (pipeline_version, document_id),
     )
+
+
+def document_has_chunks(cur, document_id: int, pipeline_version: str) -> bool:
+    """
+    Check if this document already has chunks for this pipeline version.
+    """
+    cur.execute(
+        """
+        SELECT EXISTS (
+            SELECT 1
+            FROM chunks c
+            JOIN chunk_pages cp ON cp.chunk_id = c.id
+            JOIN pages p ON p.id = cp.page_id
+            WHERE p.document_id = %s
+              AND c.pipeline_version = %s
+            LIMIT 1
+        )
+        """,
+        (document_id, pipeline_version),
+    )
+    return bool(cur.fetchone()[0])
+
+
+def get_documents_with_chunks(cur, collection_slug: Optional[str], pipeline_version: str) -> set:
+    """
+    Get all document IDs that already have chunks for this pipeline version.
+    Returns a set for O(1) lookup.
+    """
+    if collection_slug:
+        cur.execute(
+            """
+            SELECT DISTINCT p.document_id
+            FROM chunks c
+            JOIN chunk_pages cp ON cp.chunk_id = c.id
+            JOIN pages p ON p.id = cp.page_id
+            JOIN documents d ON d.id = p.document_id
+            JOIN collections col ON col.id = d.collection_id
+            WHERE c.pipeline_version = %s
+              AND col.slug = %s
+            """,
+            (pipeline_version, collection_slug),
+        )
+    else:
+        cur.execute(
+            """
+            SELECT DISTINCT p.document_id
+            FROM chunks c
+            JOIN chunk_pages cp ON cp.chunk_id = c.id
+            JOIN pages p ON p.id = cp.page_id
+            WHERE c.pipeline_version = %s
+            """,
+            (pipeline_version,),
+        )
+    return {row[0] for row in cur.fetchall()}
 
 
 def insert_chunk(cur, text: str, clean_text: str, pipeline_version: str) -> int:
@@ -217,6 +291,57 @@ def insert_chunk_pages(cur, chunk_id: int, page_ids_in_order: List[int]):
             """,
             (chunk_id, page_id, i),
         )
+
+
+def batch_insert_chunks(cur, chunk_specs: List[ChunkSpec], pipeline_version: str) -> List[int]:
+    """
+    Batch insert all chunks in a single query using execute_values.
+    Returns list of chunk_ids in same order as chunk_specs.
+    """
+    if not chunk_specs:
+        return []
+    
+    # Filter empty chunks and track their indices
+    valid_specs = [(i, spec) for i, spec in enumerate(chunk_specs) if spec.text.strip()]
+    if not valid_specs:
+        return []
+    
+    # Prepare data for batch insert
+    values = [(spec.text, spec.clean_text, pipeline_version) for _, spec in valid_specs]
+    
+    # Use execute_values with RETURNING to get all IDs in one round-trip
+    result = execute_values(
+        cur,
+        """
+        INSERT INTO chunks (text, clean_text, pipeline_version)
+        VALUES %s
+        RETURNING id
+        """,
+        values,
+        fetch=True
+    )
+    
+    chunk_ids = [row[0] for row in result]
+    return [(valid_specs[i][0], chunk_ids[i], valid_specs[i][1]) for i in range(len(chunk_ids))]
+
+
+def batch_insert_chunk_pages(cur, chunk_page_data: List[Tuple[int, int, int]]):
+    """
+    Batch insert all chunk_pages in a single query.
+    chunk_page_data is list of (chunk_id, page_id, span_order).
+    """
+    if not chunk_page_data:
+        return
+    
+    execute_values(
+        cur,
+        """
+        INSERT INTO chunk_pages (chunk_id, page_id, span_order)
+        VALUES %s
+        """,
+        chunk_page_data,
+        page_size=1000
+    )
 
 
 # ---------- Strategy routing ----------
@@ -266,13 +391,13 @@ def chunk_venona_one_message_per_page(
             else:
                 chunk_text = "\n\n".join(cur_parts).strip()
                 if chunk_text:
-                    out.append(ChunkSpec(text=chunk_text, page_ids_in_order=[p.id]))
+                    out.append(ChunkSpec(text=chunk_text, clean_text=chunk_text, page_ids_in_order=[p.id]))
                 cur_parts = [para]
 
         # flush last
         chunk_text = "\n\n".join(cur_parts).strip()
         if chunk_text:
-            out.append(ChunkSpec(text=chunk_text, page_ids_in_order=[p.id]))
+            out.append(ChunkSpec(text=chunk_text, clean_text=chunk_text, page_ids_in_order=[p.id]))
 
     return out
 
@@ -656,6 +781,8 @@ def main():
     ap.add_argument("--max-chars", type=int, default=4000, help="soft max chars per chunk (used for vassiliev and fallback)")
     ap.add_argument("--venona-max-chars", type=int, default=24000, help="oversize fallback cap for venona message chunks")
     ap.add_argument("--limit-docs", type=int, default=None, help="limit number of documents processed (debug)")
+    ap.add_argument("--resume", action="store_true", help="skip documents that already have chunks for this pipeline_version")
+    ap.add_argument("--force", action="store_true", help="re-chunk even if chunks exist (delete and recreate)")
     args = ap.parse_args()
 
     if args.collection is None and args.document_id is None:
@@ -675,19 +802,41 @@ def main():
             print("No matching documents found.")
             return
 
+        # For resume mode, fetch all already-chunked document IDs upfront (one query)
+        already_chunked = set()
+        if args.resume:
+            print(f"Checking for already-chunked documents...", flush=True)
+            already_chunked = get_documents_with_chunks(cur, args.collection, pipeline_version)
+            print(f"Found {len(already_chunked)} documents already chunked for pipeline={pipeline_version}", flush=True)
+
         total_docs = 0
         total_chunks = 0
+        num_docs = len(docs)
+        to_process = num_docs - len(already_chunked) if args.resume else num_docs
+        print(f"Processing {to_process} documents (total={num_docs}, skipping={len(already_chunked)})...", flush=True)
 
-        for (document_id, collection_slug) in docs:
+        skipped = 0
+        processed = 0
+        for idx, (document_id, collection_slug) in enumerate(docs, 1):
+            # Resume mode: skip documents that already have chunks
+            if args.resume and document_id in already_chunked:
+                skipped += 1
+                continue
+
+            processed += 1
+            print(f"[{processed}/{to_process}] doc_id={document_id}: loading pages...", end="", flush=True)
             pages = load_pages_for_document(cur, document_id)
             if not pages:
-                print(f"[skip] document_id={document_id} has 0 pages")
+                print(f" [skip] 0 pages", flush=True)
                 continue
+
+            print(f" {len(pages)} pages, chunking...", end="", flush=True)
 
             strategy = pick_strategy(collection_slug)
 
             # Rerun safety: delete existing derived chunks for this doc + pipeline
-            delete_chunks_for_document(cur, document_id, pipeline_version)
+            if args.force or not args.resume:
+                delete_chunks_for_document(cur, document_id, pipeline_version)
 
             if strategy == "venona_message":
                 chunk_specs = chunk_venona_one_message_per_page(pages, oversize_max_chars=venona_max_chars)
@@ -698,24 +847,38 @@ def main():
             else:
                 chunk_specs = chunk_fallback_paragraph(pages, max_chars=max_chars)
 
-            inserted = 0
-            for spec in chunk_specs:
-                if not spec.text.strip():
-                    continue
-                chunk_id = insert_chunk(cur, spec.text, spec.clean_text, pipeline_version)
-                insert_chunk_pages(cur, chunk_id, spec.page_ids_in_order)
-                inserted += 1
+            num_chunks = len(chunk_specs)
+            print(f" {num_chunks} chunks", flush=True)
 
+            insert_start = time.time()
+            print(f"    batch inserting chunks...", end="", flush=True)
+            
+            # Batch insert all chunks at once
+            chunk_results = batch_insert_chunks(cur, chunk_specs, pipeline_version)
+            inserted = len(chunk_results)
+            
+            # Prepare all chunk_pages data
+            chunk_page_data = []
+            for orig_idx, chunk_id, spec in chunk_results:
+                for span_order, page_id in enumerate(spec.page_ids_in_order, start=1):
+                    chunk_page_data.append((chunk_id, page_id, span_order))
+            
+            # Batch insert all chunk_pages at once
+            batch_insert_chunk_pages(cur, chunk_page_data)
+            
+            elapsed = time.time() - insert_start
+            print(f"\r    inserted {inserted}/{num_chunks} chunks + {len(chunk_page_data)} page links in {elapsed:.1f}s, committing...", end="", flush=True)
             conn.commit()
 
             total_docs += 1
             total_chunks += inserted
-            print(
-                f"[ok] document_id={document_id} collection={collection_slug} "
-                f"pages={len(pages)} chunks={inserted} pipeline={pipeline_version} strategy={strategy}"
-            )
+            print(f" done!", flush=True)
 
-        print(f"Done. documents={total_docs} total_chunks={total_chunks} pipeline_version={pipeline_version}")
+        print()  # newline after progress indicator
+        if args.resume and skipped > 0:
+            print(f"Done. documents={total_docs} total_chunks={total_chunks} skipped={skipped} (already chunked) pipeline_version={pipeline_version}", flush=True)
+        else:
+            print(f"Done. documents={total_docs} total_chunks={total_chunks} pipeline_version={pipeline_version}", flush=True)
 
 
 if __name__ == "__main__":

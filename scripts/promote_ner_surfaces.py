@@ -6,23 +6,37 @@ After running a corpus sweep, this script promotes high-confidence surfaces
 to alias_lexicon_index for use in entity matching.
 
 Usage:
+    # Show summary of NER surface stats
+    python scripts/promote_ner_surfaces.py --summary
+    
+    # Export tier 1+2 surfaces for review (sorted by priority)
+    python scripts/promote_ner_surfaces.py --export review.csv
+    
+    # Export only tier 1 surfaces
+    python scripts/promote_ner_surfaces.py --export review.csv --tier 1
+    
+    # Export ALL surfaces including rejected (for re-evaluation)
+    python scripts/promote_ner_surfaces.py --export review.csv --include-rejected
+    
     # Promote all tier 1 surfaces
     python scripts/promote_ner_surfaces.py --tier 1
     
-    # Promote specific surfaces by ID
-    python scripts/promote_ner_surfaces.py --ids 1,2,3
-    
     # Preview what would be promoted
     python scripts/promote_ner_surfaces.py --tier 1 --dry-run
-    
-    # Export for review
-    python scripts/promote_ner_surfaces.py --export review_surfaces.csv
+
+Priority scoring factors:
+    - doc_count: More documents = higher priority (log scale)
+    - mention_count: More mentions = higher priority
+    - label_consistency: More consistent NER labels = more reliable
+    - avg_accept_score: Higher NER confidence = more reliable
+    - has_fuzzy_match: Good candidate match = easier to link = prioritize
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import math
 import os
 import sys
 from datetime import datetime
@@ -160,7 +174,11 @@ def promote_to_lexicon(
 
 
 def find_potential_matches(conn, surface_norm: str, limit: int = 3) -> List[dict]:
-    """Find potential fuzzy matches in existing aliases for a surface."""
+    """Find potential fuzzy matches in existing aliases for a surface.
+    
+    Returns one match per entity (the best-matching alias for each entity),
+    deduplicated by entity_id.
+    """
     cur = conn.cursor(cursor_factory=RealDictCursor)
     
     # Skip very short surfaces
@@ -168,8 +186,9 @@ def find_potential_matches(conn, surface_norm: str, limit: int = 3) -> List[dict
         return []
     
     try:
+        # Use DISTINCT ON to get only the best match per entity
         cur.execute("""
-            SELECT 
+            SELECT DISTINCT ON (ea.entity_id)
                 ea.alias_norm,
                 ea.entity_id,
                 e.canonical_name,
@@ -179,13 +198,52 @@ def find_potential_matches(conn, surface_norm: str, limit: int = 3) -> List[dict
             JOIN entities e ON e.id = ea.entity_id
             WHERE ea.is_matchable = true
               AND similarity(ea.alias_norm, %s) > 0.4
-            ORDER BY similarity(ea.alias_norm, %s) DESC
-            LIMIT %s
-        """, (surface_norm, surface_norm, surface_norm, limit))
-        return [dict(row) for row in cur.fetchall()]
+            ORDER BY ea.entity_id, similarity(ea.alias_norm, %s) DESC
+        """, (surface_norm, surface_norm, surface_norm))
+        
+        # Now sort by sim_score and limit
+        results = [dict(row) for row in cur.fetchall()]
+        results.sort(key=lambda x: x['sim_score'], reverse=True)
+        return results[:limit]
     except Exception:
         # If similarity function not available, return empty
         return []
+
+
+def compute_priority_score(row: dict, has_fuzzy_match: bool, best_match_score: float) -> float:
+    """
+    Compute a priority score for review ordering.
+    
+    Higher score = review first. Factors:
+    - doc_count: More documents = more important (log scale to avoid domination)
+    - mention_count: More mentions = more important  
+    - label_consistency: More consistent NER labels = more reliable
+    - avg_accept_score: Higher NER confidence = more reliable
+    - has_fuzzy_match: If there's a good candidate, easier to link = prioritize
+    
+    Score range: roughly 0-100
+    """
+    # Convert to float to handle Decimal types from DB
+    doc_count = float(row.get('doc_count', 1) or 1)
+    mention_count = float(row.get('mention_count', 1) or 1)
+    consistency = float(row.get('label_consistency', 0.5) or 0.5)
+    accept_score = float(row.get('avg_accept_score', 0.5) or 0.5)
+    
+    # Log scale for counts to prevent huge values from dominating
+    doc_score = min(math.log2(doc_count + 1) * 5, 25)  # 0-25 points
+    mention_score = min(math.log2(mention_count + 1) * 3, 15)  # 0-15 points
+    
+    # Consistency and NER confidence
+    consistency_score = consistency * 20  # 0-20 points
+    ner_score = accept_score * 15  # 0-15 points
+    
+    # Bonus for having a good fuzzy match (easier to link)
+    match_bonus = 0.0
+    if has_fuzzy_match:
+        match_bonus = float(best_match_score) * 25  # 0-25 points
+    
+    total = doc_score + mention_score + consistency_score + ner_score + match_bonus
+    return round(total, 1)
 
 
 def export_for_review(
@@ -193,6 +251,7 @@ def export_for_review(
     output_path: str,
     tier: Optional[int] = None,
     min_docs: int = 1,
+    include_rejected: bool = False,
 ) -> int:
     """Export surfaces to CSV for human review with potential entity matches."""
     cur = conn.cursor(cursor_factory=RealDictCursor)
@@ -203,6 +262,9 @@ def export_for_review(
     if tier:
         conditions.append("proposed_tier = %s")
         params.append(tier)
+    elif not include_rejected:
+        # By default, only include tiered surfaces (not rejected)
+        conditions.append("proposed_tier IS NOT NULL")
     
     if min_docs:
         conditions.append("doc_count >= %s")
@@ -236,9 +298,14 @@ def export_for_review(
     
     # Fieldnames optimized for reviewer workflow
     fieldnames = [
+        # Priority for sorting
+        'priority',
+        'tier',
+        
         # Key info first
         'surface_norm',
         'doc_count',
+        'mention_count',
         'ner_type',  # Renamed for clarity
         'consistency',  # Shortened
         
@@ -267,24 +334,58 @@ def export_for_review(
         'notes',
         
         # Metadata (at end, less important)
-        'id', 'mention_count', 'tier_reason',
+        'id', 'tier_reason',
     ]
+    
+    # First pass: compute priority scores and find matches
+    print("Computing priority scores and finding matches...")
+    enriched_rows = []
+    for i, row in enumerate(rows):
+        # Find potential fuzzy matches
+        matches = find_potential_matches(conn, row['surface_norm'])
+        
+        # Compute priority score
+        has_match = len(matches) > 0
+        best_score = matches[0]['sim_score'] if matches else 0
+        priority = compute_priority_score(row, has_match, best_score)
+        
+        enriched_rows.append({
+            'row': row,
+            'matches': matches,
+            'priority': priority,
+        })
+        
+        # Progress
+        if (i + 1) % max(1, n // 20) == 0:
+            print(f"  Computing: {i + 1}/{n} surfaces...", end='\r')
+            sys.stdout.flush()
+    
+    print(f"  Computing: {n}/{n} surfaces done.      ")
+    
+    # Sort by priority (highest first)
+    enriched_rows.sort(key=lambda x: x['priority'], reverse=True)
     
     with open(output_path, 'w', newline='', encoding='utf-8') as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         
-        for i, row in enumerate(rows):
+        for i, item in enumerate(enriched_rows):
+            row = item['row']
+            matches = item['matches']
+            priority = item['priority']
+            
             out = {}
+            
+            # Priority and tier
+            out['priority'] = priority
+            out['tier'] = row['proposed_tier'] or 'rejected'
             
             # Key info
             out['surface_norm'] = row['surface_norm']
             out['doc_count'] = row['doc_count']
+            out['mention_count'] = row['mention_count']
             out['ner_type'] = row['inferred_type'] or row['primary_label']
             out['consistency'] = f"{row['label_consistency']:.0%}" if row['label_consistency'] else ''
-            
-            # Find potential fuzzy matches
-            matches = find_potential_matches(conn, row['surface_norm'])
             
             # Fill candidate columns
             for idx in range(3):
@@ -336,18 +437,17 @@ def export_for_review(
             
             # Metadata
             out['id'] = row['id']
-            out['mention_count'] = row['mention_count']
             out['tier_reason'] = row['tier_reason']
             
             writer.writerow(out)
             
-            # Progress every 1%
+            # Progress every 5%
             percent = ((i + 1) * 100) // n
-            if percent > 0 and (i + 1) % max(1, n // 100) == 0:
-                print(f"  Progress: {percent}% ({i + 1}/{n} surfaces)", end='\r')
+            if percent > 0 and (i + 1) % max(1, n // 20) == 0:
+                print(f"  Writing: {percent}% ({i + 1}/{n} surfaces)", end='\r')
                 sys.stdout.flush()
     
-    print(f"  Progress: 100% ({n}/{n} surfaces)      ")  # Clear the line
+    print(f"  Writing: 100% ({n}/{n} surfaces)      ")  # Clear the line
     
     print(f"\nExported {len(rows)} surfaces to {output_path}")
     print(f"\n" + "="*60)
@@ -445,6 +545,8 @@ def main():
     # Actions
     parser.add_argument('--export', type=str,
                        help='Export to CSV for review')
+    parser.add_argument('--include-rejected', action='store_true',
+                       help='Include rejected surfaces in export (default: only tiered)')
     parser.add_argument('--summary', action='store_true',
                        help='Show summary statistics')
     parser.add_argument('--dry-run', action='store_true',
@@ -461,7 +563,13 @@ def main():
     
     # Export mode
     if args.export:
-        export_for_review(conn, args.export, tier=args.tier, min_docs=args.min_docs or 1)
+        export_for_review(
+            conn, 
+            args.export, 
+            tier=args.tier, 
+            min_docs=args.min_docs or 1,
+            include_rejected=args.include_rejected,
+        )
         return
     
     # Promotion mode
