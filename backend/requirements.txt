@@ -13,5 +13,8 @@ pydantic>=2.7.0
 # Local .env support (dev convenience)
 python-dotenv>=1.0.1
 
+# LLM / AI
+openai>=1.0.0
+
 # CORS middleware (included with FastAPI)
 # starlette  # auto-installed with fastapi
