@@ -1263,7 +1263,7 @@ V7 Query Examples (DEFAULT - with citation enforcement):
   who handled Julius Rosenberg?                      (plain queries use V7 by default)
 """)
 
-def interactive_mode(session_id: int, auto_execute: bool = False):
+def interactive_mode(session_id: int, auto_execute: bool = False, pre_bundling_mode: str = "off"):
     """Run interactive CLI mode."""
     conn = get_conn()
     
@@ -1732,6 +1732,7 @@ def interactive_mode(session_id: int, auto_execute: bool = False):
                         max_bottleneck_spans=40,
                         max_rounds=5,
                         verbose=True,
+                        pre_bundling_mode=pre_bundling_mode,
                     )
                     
                     # Print formatted answer
@@ -1830,6 +1831,7 @@ def interactive_mode(session_id: int, auto_execute: bool = False):
                         max_rounds=5,
                         drop_uncited_claims=True,
                         verbose=True,
+                        pre_bundling_mode=pre_bundling_mode,
                     )
                     
                     # Print formatted result
@@ -2050,6 +2052,7 @@ def interactive_mode(session_id: int, auto_execute: bool = False):
                 max_rounds=5,
                 drop_uncited_claims=True,
                 verbose=True,
+                pre_bundling_mode=pre_bundling_mode,
             )
             
             # Print formatted V7 result
@@ -2207,7 +2210,7 @@ def interactive_mode(session_id: int, auto_execute: bool = False):
 # One-Shot Mode
 # =============================================================================
 
-def one_shot_query(session_label: str, query: str, auto_execute: bool = True, force_agentic: bool = False, force_v2: bool = False):
+def one_shot_query(session_label: str, query: str, auto_execute: bool = True, force_agentic: bool = False, force_v2: bool = False, pre_bundling_mode: str = "off"):
     """Execute a single query and print results."""
     conn = get_conn()
     
@@ -2359,6 +2362,12 @@ Examples:
         action="store_true",
         help="List recent sessions and exit"
     )
+    parser.add_argument(
+        "--pre-bundling",
+        choices=["off", "passthrough", "micro", "semantic"],
+        default="off",
+        help="Pre-bundling mode for concordance-aware evidence grouping (default: off)"
+    )
     
     args = parser.parse_args()
     
@@ -2388,9 +2397,9 @@ Examples:
     
     # One-shot or interactive
     if args.query:
-        one_shot_query(args.session, args.query, args.auto_execute, force_agentic=args.agentic, force_v2=args.v2)
+        one_shot_query(args.session, args.query, args.auto_execute, force_agentic=args.agentic, force_v2=args.v2, pre_bundling_mode=args.pre_bundling)
     else:
-        interactive_mode(session_id, args.auto_execute)
+        interactive_mode(session_id, args.auto_execute, pre_bundling_mode=args.pre_bundling)
 
 
 if __name__ == "__main__":

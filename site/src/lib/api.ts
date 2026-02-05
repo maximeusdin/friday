@@ -21,9 +21,10 @@ import type {
   ErrorResponse,
 } from '@/types/api';
 
-// API_BASE is the root URL of the API server (e.g., http://api.fridayarchive.org)
+// API_BASE is the root URL of the API server (e.g., https://api.fridayarchive.org)
 // All API routes are prefixed with /api on the backend
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || '';
+// NOTE: Must use HTTPS in production to avoid mixed-content errors
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'https://api.fridayarchive.org';
 
 class ApiError extends Error {
   constructor(

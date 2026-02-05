@@ -4,26 +4,26 @@ import { useState } from 'react';
 import { SessionList } from '@/components/SessionList';
 import { Conversation } from '@/components/Conversation';
 import { RightPane } from '@/components/RightPane';
-import type { Session, EvidenceRef } from '@/types/api';
+import type { Session, EvidenceRef, V6Stats } from '@/types/api';
 import { api } from '@/lib/api';
 
 export default function Home() {
   const [activeSession, setActiveSession] = useState<Session | null>(null);
-  const [activePlanId, setActivePlanId] = useState<number | null>(null);
   const [activeResultSetId, setActiveResultSetId] = useState<number | null>(null);
   const [activeEvidence, setActiveEvidence] = useState<EvidenceRef | null>(null);
+  const [latestV6Stats, setLatestV6Stats] = useState<V6Stats | null>(null);
+  const [isProcessing, setIsProcessing] = useState(false);
 
   const handleSessionSelect = (session: Session) => {
     setActiveSession(session);
-    setActivePlanId(null);
     setActiveResultSetId(null);
     setActiveEvidence(null);
+    setLatestV6Stats(null);
 
-    // Rehydrate right pane with latest known plan/result for this session
+    // Rehydrate right pane with latest known result for this session
     api
       .getSessionState(session.id)
       .then((state) => {
-        setActivePlanId(state.latest_plan_id ?? null);
         setActiveResultSetId(state.latest_result_set_id ?? null);
       })
       .catch(() => {
@@ -31,8 +31,16 @@ export default function Home() {
       });
   };
 
-  const handlePlanIdUpdate = (planId: number) => {
-    setActivePlanId(planId);
+  const handleResultSetUpdate = (resultSetId: number | null) => {
+    setActiveResultSetId(resultSetId);
+  };
+
+  const handleV6StatsUpdate = (stats: V6Stats | null) => {
+    setLatestV6Stats(stats);
+  };
+
+  const handleProcessingChange = (processing: boolean) => {
+    setIsProcessing(processing);
   };
 
   const handleEvidenceClick = (evidence: EvidenceRef) => {
@@ -52,24 +60,34 @@ export default function Home() {
         </div>
       </div>
 
-      {/* Center Pane: Conversation */}
-      <div className="pane">
+      {/* Center Pane: Chat Conversation */}
+      <div className="pane pane-center">
         <div className="pane-header">
-          {activeSession ? activeSession.label : 'Select a session'}
+          {activeSession ? (
+            <>
+              <span>{activeSession.label}</span>
+              <span className="header-badge">V7 Citation-Enforced</span>
+            </>
+          ) : (
+            'Friday Research Console'
+          )}
         </div>
         <Conversation
           session={activeSession}
-          onPlanIdUpdate={handlePlanIdUpdate}
+          onResultSetUpdate={handleResultSetUpdate}
+          onV6StatsUpdate={handleV6StatsUpdate}
+          onProcessingChange={handleProcessingChange}
+          onEvidenceClick={handleEvidenceClick}
         />
       </div>
 
-      {/* Right Pane: Plan + Results + Evidence */}
+      {/* Right Pane: Workflow + Results + Evidence */}
       <div className="pane" style={{ borderRight: 'none' }}>
         <RightPane
-          planId={activePlanId}
+          v6Stats={latestV6Stats}
+          isProcessing={isProcessing}
           resultSetId={activeResultSetId}
           activeEvidence={activeEvidence}
-          onPlanIdUpdate={setActivePlanId}
           onResultSetIdUpdate={setActiveResultSetId}
           onEvidenceClick={handleEvidenceClick}
         />

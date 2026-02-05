@@ -106,6 +106,16 @@ export function EvidenceViewer({ evidence, onClose }: EvidenceViewerProps) {
         <div className="flex-1" />
         
         <a
+          href={pdfBaseUrl}
+          download
+          className="btn-secondary"
+          style={{ textDecoration: 'none' }}
+          title="Download PDF"
+        >
+          ↓ Download
+        </a>
+        
+        <a
           href={pdfUrl}
           target="_blank"
           rel="noopener noreferrer"

@@ -193,3 +193,102 @@ export interface ErrorResponse {
     details?: unknown;
   };
 }
+
+// =============================================================================
+// V6 Chat Types
+// =============================================================================
+
+/**
+ * A citation reference for a claim in V6 responses.
+ */
+export interface ChatCitation {
+  span_id: string;
+  chunk_id?: number;
+  document_id?: number;
+  page_number?: number;
+  quote: string;
+  source_name?: string;
+  relevance_score?: number;
+}
+
+/**
+ * A claim with evidence citations from V6 workflow.
+ */
+export interface ChatClaim {
+  text: string;
+  confidence: 'supported' | 'partial' | 'unsupported';
+  citations: ChatCitation[];
+}
+
+/**
+ * An identified member (for roster queries).
+ */
+export interface ChatMember {
+  name: string;
+  citations: ChatCitation[];
+}
+
+/**
+ * A single action/step in the V6 workflow.
+ */
+export interface WorkflowAction {
+  step: string;
+  status: 'running' | 'completed' | 'skipped' | 'error';
+  message: string;
+  details?: Record<string, unknown>;
+  elapsed_ms?: number;
+}
+
+/**
+ * Statistics about the V6/V7 workflow execution.
+ */
+export interface V6Stats {
+  task_type: string;
+  rounds_executed: number;
+  total_spans: number;
+  unique_docs: number;
+  elapsed_ms: number;
+  entity_linking: {
+    total_linked?: number;
+    used_for_retrieval?: number;
+  };
+  responsiveness: string;
+  actions: WorkflowAction[];
+  // V7-specific fields
+  citation_validation_passed?: boolean;
+  claims_extracted?: number;
+  claims_valid?: number;
+  claims_dropped?: number;
+}
+
+/**
+ * A message in the chat history with V6 metadata.
+ */
+export interface ChatMessage {
+  id: number;
+  session_id: number;
+  role: 'user' | 'assistant';
+  content: string;
+  claims?: ChatClaim[];
+  members?: ChatMember[];
+  v6_stats?: V6Stats;
+  result_set_id?: number;
+  created_at: string;
+}
+
+/**
+ * Request to send a chat message.
+ */
+export interface ChatRequest {
+  message: string;
+}
+
+/**
+ * Response from the V6 chat endpoint.
+ */
+export interface ChatResponse {
+  user_message: ChatMessage;
+  assistant_message: ChatMessage;
+  is_responsive: boolean;
+  result_set_id?: number;
+}

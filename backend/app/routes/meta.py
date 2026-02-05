@@ -12,8 +12,9 @@ API_VERSION = "0.1.0"
 
 
 def get_git_sha() -> str:
-    """Get current git SHA for build info."""
-    sha = (os.getenv("GIT_SHA") or os.getenv("FRIDAY_GIT_SHA") or "").strip()
+    """Get current build SHA for build info."""
+    # Check BUILD_SHA first (set by Docker), then fallback to GIT_SHA for backwards compat
+    sha = (os.getenv("BUILD_SHA") or os.getenv("GIT_SHA") or "").strip()
     if sha:
         return sha
     try:

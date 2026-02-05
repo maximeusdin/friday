@@ -15,7 +15,7 @@ from fastapi import HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from app.routes import sessions, plans, results, documents, meta
+from app.routes import sessions, plans, results, documents, meta, chat
 from app.services.db import ConfigError
 from app.services.db import get_conn
 
@@ -116,6 +116,7 @@ app.add_middleware(
 # Include routers
 app.include_router(meta.router, prefix="/api", tags=["meta"])
 app.include_router(sessions.router, prefix="/api/sessions", tags=["sessions"])
+app.include_router(chat.router, prefix="/api/sessions", tags=["chat"])  # V6 chat endpoint
 app.include_router(plans.router, prefix="/api/plans", tags=["plans"])
 app.include_router(results.router, prefix="/api/result-sets", tags=["results"])
 app.include_router(documents.router, prefix="/api", tags=["documents"])

@@ -42,6 +42,9 @@ Set the `NEXT_PUBLIC_API_URL` environment variable to your deployed backend API 
 # For local development (if backend runs on localhost:8000)
 export NEXT_PUBLIC_API_URL=http://localhost:8000/api
 
+# For production (always use HTTPS)
+export NEXT_PUBLIC_API_URL=https://api.fridayarchive.org
+
 # For production (replace with your actual API URL)
 export NEXT_PUBLIC_API_URL=https://api.friday.example.com/api
 ```

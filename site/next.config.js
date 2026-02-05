@@ -19,9 +19,9 @@ const nextConfig = {
 
   // Environment variables to bake into the build
   env: {
-    // Set this to your deployed backend API URL
-    // e.g., https://api.friday.example.com or API Gateway URL
-    NEXT_PUBLIC_API_URL: process.env.NEXT_PUBLIC_API_URL || '',
+    // Production API URL - must be HTTPS
+    // Can be overridden at build time via environment variable
+    NEXT_PUBLIC_API_URL: process.env.NEXT_PUBLIC_API_URL || 'https://api.fridayarchive.org',
   },
 };
 
