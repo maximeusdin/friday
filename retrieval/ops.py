@@ -599,6 +599,11 @@ class SearchFilters:
     document_id: Optional[int] = None  
     date_from: Optional[str] = None  # YYYY-MM-DD
     date_to: Optional[str] = None    # YYYY-MM-DD
+    
+    # exclusion filters (for pagination/novelty - V7 Phase 2)
+    exclude_chunk_ids: Optional[List[int]] = None      # granular exclusion
+    exclude_page_ids: Optional[List[int]] = None       # reduces near-duplicate churn
+    exclude_document_ids: Optional[List[int]] = None   # broader exclusion
 
 
 @dataclass
@@ -1162,6 +1167,19 @@ def _build_where(filters: SearchFilters, params: Dict[str, Any]) -> str:
     if filters.date_to:
         where.append("(cm.date_min IS NULL OR cm.date_min <= %(date_to)s::date)")
         params["date_to"] = filters.date_to
+
+    # Exclusion filters (V7 Phase 2 - pagination/novelty controls)
+    if filters.exclude_chunk_ids:
+        where.append("c.id != ALL(%(exclude_chunk_ids)s)")
+        params["exclude_chunk_ids"] = filters.exclude_chunk_ids
+
+    if filters.exclude_page_ids:
+        where.append("cm.first_page_id != ALL(%(exclude_page_ids)s)")
+        params["exclude_page_ids"] = filters.exclude_page_ids
+
+    if filters.exclude_document_ids:
+        where.append("cm.document_id != ALL(%(exclude_document_ids)s)")
+        params["exclude_document_ids"] = filters.exclude_document_ids
 
     return " AND ".join(where)
 
@@ -2734,3 +2752,223 @@ def compute_thorough_rank(results: List[ThresholdSearchResult]) -> List[Threshol
         result.rank = i
     
     return sorted_results
+
+
+# =============================================================================
+# V7 Phase 2: Chunk Neighbors / Continuation
+# =============================================================================
+
+@dataclass
+class ChunkNeighbor:
+    """A neighboring chunk with position relative to the seed chunk."""
+    chunk_id: int
+    text: str
+    position: int  # Negative = before seed, positive = after seed, 0 = seed itself
+    document_id: Optional[int] = None
+    page_id: Optional[int] = None
+    collection_slug: Optional[str] = None
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "chunk_id": self.chunk_id,
+            "text": self.text,
+            "position": self.position,
+            "document_id": self.document_id,
+            "page_id": self.page_id,
+            "collection_slug": self.collection_slug,
+        }
+
+
+def get_chunk_neighbors(
+    conn,
+    chunk_id: int,
+    before: int = 2,
+    after: int = 2,
+    include_seed: bool = True,
+) -> List[ChunkNeighbor]:
+    """
+    V7 Phase 2: Get neighboring chunks from the same document.
+    
+    This enables the agent to expand context around a relevant chunk,
+    supporting "continuation" and "context expansion" patterns.
+    
+    Args:
+        conn: Database connection
+        chunk_id: The seed chunk ID
+        before: Number of chunks to retrieve before the seed
+        after: Number of chunks to retrieve after the seed
+        include_seed: Whether to include the seed chunk in results
+        
+    Returns:
+        List of ChunkNeighbor objects in document order (before → seed → after)
+        
+    Algorithm:
+        1. Find the document_id of the seed chunk
+        2. Find chunks in the same document, ordered by page_id and chunk_id
+        3. Return the window around the seed chunk
+    """
+    
+    if before < 0 or after < 0:
+        raise ValueError("before and after must be non-negative")
+    
+    neighbors: List[ChunkNeighbor] = []
+    
+    try:
+        with conn.cursor() as cur:
+            # First, get the seed chunk's document_id and ordering info
+            cur.execute("""
+                SELECT cm.document_id, cm.first_page_id, c.id
+                FROM chunks c
+                JOIN chunk_metadata cm ON cm.chunk_id = c.id
+                WHERE c.id = %s
+            """, (chunk_id,))
+            
+            seed_row = cur.fetchone()
+            if not seed_row:
+                return []  # Seed chunk not found
+            
+            document_id, seed_page_id, _ = seed_row
+            
+            if not document_id:
+                # No document_id - can only return the seed chunk itself
+                if include_seed:
+                    cur.execute("""
+                        SELECT c.id, COALESCE(c.clean_text, c.text), cm.document_id, 
+                               cm.first_page_id, cm.collection_slug
+                        FROM chunks c
+                        LEFT JOIN chunk_metadata cm ON cm.chunk_id = c.id
+                        WHERE c.id = %s
+                    """, (chunk_id,))
+                    row = cur.fetchone()
+                    if row:
+                        neighbors.append(ChunkNeighbor(
+                            chunk_id=row[0],
+                            text=row[1] or "",
+                            position=0,
+                            document_id=row[2],
+                            page_id=row[3],
+                            collection_slug=row[4],
+                        ))
+                return neighbors
+            
+            # Get all chunks from the same document, ordered by page_id and chunk_id
+            cur.execute("""
+                SELECT c.id, COALESCE(c.clean_text, c.text), cm.document_id,
+                       cm.first_page_id, cm.collection_slug
+                FROM chunks c
+                JOIN chunk_metadata cm ON cm.chunk_id = c.id
+                WHERE cm.document_id = %s
+                ORDER BY cm.first_page_id NULLS LAST, c.id ASC
+            """, (document_id,))
+            
+            doc_chunks = cur.fetchall()
+            
+            # Find the index of the seed chunk
+            seed_index = None
+            for i, row in enumerate(doc_chunks):
+                if row[0] == chunk_id:
+                    seed_index = i
+                    break
+            
+            if seed_index is None:
+                return []  # Seed chunk not found in document (shouldn't happen)
+            
+            # Calculate window bounds
+            start_index = max(0, seed_index - before)
+            end_index = min(len(doc_chunks), seed_index + after + 1)
+            
+            # Build neighbor list with positions relative to seed
+            for i in range(start_index, end_index):
+                row = doc_chunks[i]
+                position = i - seed_index
+                
+                # Skip seed if not including it
+                if position == 0 and not include_seed:
+                    continue
+                
+                neighbors.append(ChunkNeighbor(
+                    chunk_id=row[0],
+                    text=row[1] or "",
+                    position=position,
+                    document_id=row[2],
+                    page_id=row[3],
+                    collection_slug=row[4],
+                ))
+            
+            return neighbors
+            
+    except Exception as e:
+        # Rollback on error
+        try:
+            conn.rollback()
+        except:
+            pass
+        raise
+
+
+def get_document_chunks(
+    conn,
+    document_id: int,
+    page_id: Optional[int] = None,
+    limit: int = 50,
+) -> List[ChunkNeighbor]:
+    """
+    V7 Phase 2: Get all chunks from a document, optionally filtered by page.
+    
+    Useful when the agent wants to read a full document or page.
+    
+    Args:
+        conn: Database connection
+        document_id: The document to retrieve chunks from
+        page_id: Optional page_id to filter to a specific page
+        limit: Maximum number of chunks to return
+        
+    Returns:
+        List of ChunkNeighbor objects in document order
+    """
+    
+    chunks: List[ChunkNeighbor] = []
+    
+    try:
+        with conn.cursor() as cur:
+            if page_id is not None:
+                cur.execute("""
+                    SELECT c.id, COALESCE(c.clean_text, c.text), cm.document_id,
+                           cm.first_page_id, cm.collection_slug
+                    FROM chunks c
+                    JOIN chunk_metadata cm ON cm.chunk_id = c.id
+                    WHERE cm.document_id = %s AND cm.first_page_id = %s
+                    ORDER BY c.id ASC
+                    LIMIT %s
+                """, (document_id, page_id, limit))
+            else:
+                cur.execute("""
+                    SELECT c.id, COALESCE(c.clean_text, c.text), cm.document_id,
+                           cm.first_page_id, cm.collection_slug
+                    FROM chunks c
+                    JOIN chunk_metadata cm ON cm.chunk_id = c.id
+                    WHERE cm.document_id = %s
+                    ORDER BY cm.first_page_id NULLS LAST, c.id ASC
+                    LIMIT %s
+                """, (document_id, limit))
+            
+            rows = cur.fetchall()
+            
+            for i, row in enumerate(rows):
+                chunks.append(ChunkNeighbor(
+                    chunk_id=row[0],
+                    text=row[1] or "",
+                    position=i,  # Position in document order
+                    document_id=row[2],
+                    page_id=row[3],
+                    collection_slug=row[4],
+                ))
+            
+            return chunks
+            
+    except Exception as e:
+        try:
+            conn.rollback()
+        except:
+            pass
+        raise

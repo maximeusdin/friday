@@ -1188,18 +1188,18 @@ def print_help():
     """Print help message."""
     print("""
 Commands:
-  <query>       Submit a research query (uses V6 by default)
+  <query>       Submit a research query (uses V7 by default)
   
-  === V6 is now the DEFAULT ===
-  V6 features:
-    - Parses query into CONTROL tokens vs CONTENT tokens
-    - Entity-links ONLY content tokens (avoids "Provide" -> entity)
-    - ENFORCES scope constraints (collections filter is mandatory)
-    - Hard evidence bottleneck (30-50 spans max before synthesis)
-    - Responsiveness verification (does answer satisfy question?)
-    - Deduplicates tool calls (LLM can't repeat same search)
+  === V7 is now the DEFAULT (V6 + Citation Enforcement) ===
+  V7 features:
+    - All V6 features (CONTROL/CONTENT parsing, entity linking, bottleneck)
+    - PLUS citation enforcement: every claim MUST have citations
+    - Claim enumeration: extracts atomic claims from answer
+    - Stop gate validation: verifies all claims are grounded
+    - Expanded summary: output shows claims with their citations
   
-  /v6 <query>   Explicitly use V6 (same as plain query)
+  /v7 <query>   Explicitly use V7 with citation enforcement (same as plain query)
+  /v6 <query>   Use V6 (no citation enforcement)
   /v4 <query>   Use V4.2 agentic workflow (reasoning-first + discovery loop)
                 Flags: --dump-plan, --dump-evidence, --dump-verify, --dump-discovery
                        --no-discovery, --thorough
@@ -1240,6 +1240,12 @@ Workflow Modes:
                 - Hard bottleneck forces convergence to 30-50 spans
                 - Responsiveness check: does answer actually satisfy question?
                 - Progress-gated rounds: stop if no quality evidence gained
+  V7 (/v7):     V6 + Citation Enforcement (DEFAULT):
+                - All V6 features plus strict citation requirements
+                - Claim enumeration: extracts atomic claims from answer
+                - Stop gate: validates all claims have valid citations
+                - Expanded summary: output shows claims with references
+                - Dropped claims: uncited claims are removed from output
 
 V4.2 Query Examples:
   /v4 who were members of the Silvermaster network  (roster query with discovery)
@@ -1250,6 +1256,11 @@ V4.2 Query Examples:
 V6 Query Examples:
   /v6 who were members of the Silvermaster network? Provide citations from Vassiliev.
   /v6 list Soviet agents in the Treasury Department
+
+V7 Query Examples (DEFAULT - with citation enforcement):
+  /v7 who were members of the Silvermaster network?  (all claims will have citations)
+  /v7 list Soviet agents in the Treasury Department  (unsupported claims are dropped)
+  who handled Julius Rosenberg?                      (plain queries use V7 by default)
 """)
 
 def interactive_mode(session_id: int, auto_execute: bool = False):
@@ -1462,8 +1473,10 @@ def interactive_mode(session_id: int, auto_execute: bool = False):
                     print("No current result set. Submit a query first.")
             
             elif cmd == "/mode":
-                print(f"\nDefault mode: V6 (Principled Agentic)")
-                print("  V6 is now the default for all plain queries.")
+                print(f"\nDefault mode: V7 (V6 + Citation Enforcement)")
+                print("  V7 is now the default for all plain queries.")
+                print("  Use /v7 <query> for explicit V7 (citation enforcement)")
+                print("  Use /v6 <query> for V6 (no citation enforcement)")
                 print("  Use /v4 <query> for V4 workflow")
                 print("  Use /v3 <query> for V3 workflow")
                 print("  Use /traditional <query> for traditional (non-agentic) workflow")
@@ -1785,6 +1798,100 @@ def interactive_mode(session_id: int, auto_execute: bool = False):
                     print()
                 continue
             
+            elif cmd == "/v7":
+                if not arg:
+                    print("Usage: /v7 <query>")
+                    print("V7 extends V6 with citation enforcement (DEFAULT mode)")
+                    print("Examples:")
+                    print("  /v7 who were members of the Silvermaster network?")
+                    print("  /v7 list Soviet agents in the Treasury Department")
+                    print("\nV7 features (all V6 features PLUS):")
+                    print("  - Claim enumeration: extracts atomic claims from answer")
+                    print("  - Stop gate: validates all claims have citations")
+                    print("  - Expanded summary: output shows claims with references")
+                    print("  - Citation enforcement: uncited claims are dropped")
+                    continue
+                
+                query_text = arg.strip()
+                
+                if not query_text:
+                    print("Error: Please provide a query text after /v7")
+                    continue
+                
+                # Use V7 workflow
+                print(f"\n[V7 Citation Enforcement Mode] Processing: \"{query_text}\"...")
+                try:
+                    from retrieval.agent.v7_runner import run_v7_query, format_v7_result
+                    
+                    result = run_v7_query(
+                        conn=conn,
+                        question=query_text,
+                        max_bottleneck_spans=40,
+                        max_rounds=5,
+                        drop_uncited_claims=True,
+                        verbose=True,
+                    )
+                    
+                    # Print formatted result
+                    print(format_v7_result(result, include_evidence=False, include_v6_trace=False))
+                    
+                    # Create result_set for /summarize compatibility
+                    if result.trace and result.trace.v6_trace and result.trace.v6_trace.rounds:
+                        try:
+                            from retrieval.ops import log_retrieval_run
+                            from scripts.execute_plan import create_result_set
+                            
+                            # Get chunk IDs from bottlenecked spans
+                            chunk_ids = []
+                            spans = getattr(result.trace.v6_trace, 'bottleneck_spans', None) or []
+                            for span in spans:
+                                cid = getattr(span, 'chunk_id', None)
+                                if cid and cid not in chunk_ids:
+                                    chunk_ids.append(cid)
+                            
+                            if chunk_ids:
+                                chunk_pv = os.getenv("DEFAULT_CHUNK_PV", "chunk_v1_full")
+                                
+                                run_id = log_retrieval_run(
+                                    conn,
+                                    query_text=f"[AGENTIC_V7] {query_text}",
+                                    search_type="hybrid",
+                                    chunk_pv=chunk_pv,
+                                    embedding_model=None,
+                                    top_k=len(chunk_ids),
+                                    returned_chunk_ids=chunk_ids,
+                                    retrieval_config_json={
+                                        "mode": "agentic_v7",
+                                        "citation_validation_passed": result.citation_validation_passed,
+                                        "claims_valid": result.trace.claims_valid if result.trace else 0,
+                                        "claims_dropped": result.trace.claims_unsupported if result.trace else 0,
+                                    },
+                                    auto_commit=False,
+                                    session_id=session_id,
+                                )
+                                conn.commit()
+                                
+                                result_set_id_v7 = create_result_set(
+                                    conn,
+                                    run_id=run_id,
+                                    chunk_ids=chunk_ids,
+                                    name=f"V7: {query_text[:40]}... (run {run_id})",
+                                    session_id=session_id,
+                                )
+                                current_result_set_id = result_set_id_v7
+                                print(f"\n  Created result set #{result_set_id_v7}", file=sys.stderr)
+                        except Exception as e:
+                            print(f"  Warning: Could not create result set: {e}", file=sys.stderr)
+                    
+                    print()
+                        
+                except Exception as e:
+                    print(f"\nV7 workflow error: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    print()
+                continue
+            
             elif cmd == "/discover":
                 if not arg:
                     print("Usage: /discover <query> [--thorough]")
@@ -1925,53 +2032,32 @@ def interactive_mode(session_id: int, auto_execute: bool = False):
             
             continue
         
-        # Process as a query - V6 is now the DEFAULT for all queries
-        # (Old agentic mode available via /v1 command if needed)
+        # Process as a query - V7 is now the DEFAULT for all queries
+        # (V6 available via /v6 command, old agentic modes via /v1-/v4)
         
-        # DEFAULT: V6 Principled Mode
-        # Plain text queries now go through V6 by default
+        # DEFAULT: V7 Citation Enforcement Mode
+        # Plain text queries now go through V7 by default
         query_text = user_input
-        print(f"\n[V6 Mode] Processing: \"{query_text}\"...")
+        print(f"\n[V7 Mode] Processing: \"{query_text}\"...")
         
         try:
-            from retrieval.agent.v6_runner import run_v6_query
+            from retrieval.agent.v7_runner import run_v7_query, format_v7_result
             
-            result = run_v6_query(
+            result = run_v7_query(
                 conn=conn,
                 question=query_text,
                 max_bottleneck_spans=40,
                 max_rounds=5,
+                drop_uncited_claims=True,
                 verbose=True,
             )
             
-            # Print formatted answer
-            print("\n" + "=" * 60)
-            print("ANSWER:")
-            print("=" * 60)
-            print(result.answer)
-            print()
-            
-            if result.responsiveness_status:
-                print(f"Responsiveness: {result.responsiveness_status}")
-            
-            # Show V6 parsing info
-            if result.trace and result.trace.parsed_query:
-                pq = result.trace.parsed_query
-                print("\n" + "=" * 50)
-                print("V6 QUERY PARSING:")
-                print("=" * 50)
-                print(f"  Task type: {pq.task_type.value}")
-                print(f"  Topic terms (CONTENT - used for search):")
-                for t in pq.topic_terms[:5]:
-                    print(f"    → \"{t}\"")
-                print(f"  Control tokens (NOT entity-linked):")
-                for t in list(pq.control_tokens)[:5]:
-                    print(f"    ✗ \"{t}\"")
-                print()
+            # Print formatted V7 result
+            print(format_v7_result(result, include_evidence=False, include_v6_trace=False))
             
             # Show members for roster queries
             if result.members_identified:
-                print("MEMBERS IDENTIFIED:")
+                print("\nMEMBERS IDENTIFIED:")
                 for m in result.members_identified[:20]:
                     print(f"  • {m}")
                 if len(result.members_identified) > 20:
@@ -1979,11 +2065,11 @@ def interactive_mode(session_id: int, auto_execute: bool = False):
                 print()
             
             # Create result set for summarize compatibility
-            if result.trace:
+            if result.trace and result.trace.v6_trace:
                 try:
                     chunk_ids = []
-                    # Try both attribute names for compatibility
-                    spans = getattr(result.trace, 'bottleneck_spans', None) or getattr(result.trace, 'all_bottleneck_spans', []) or []
+                    # Get chunk IDs from bottlenecked spans
+                    spans = getattr(result.trace.v6_trace, 'bottleneck_spans', None) or []
                     for span in spans:
                         cid = getattr(span, 'chunk_id', None)
                         if cid and cid not in chunk_ids:
@@ -1999,7 +2085,7 @@ def interactive_mode(session_id: int, auto_execute: bool = False):
                         
                         if chunk_pv:
                             from retrieval.ops import log_retrieval_run
-                            from backend.app.services.result_sets import create_result_set
+                            from scripts.execute_plan import create_result_set
                             
                             run_id = log_retrieval_run(
                                 conn=conn,
@@ -2010,33 +2096,32 @@ def interactive_mode(session_id: int, auto_execute: bool = False):
                                 top_k=len(chunk_ids),
                                 returned_chunk_ids=chunk_ids,
                                 retrieval_config_json={
-                                    "mode": "agentic_v6",
-                                    "task_type": result.trace.parsed_query.task_type.value if result.trace.parsed_query else "unknown",
-                                    "rounds": len(result.trace.rounds),
-                                    "responsiveness": result.responsiveness_status,
-                                    "members_found": len(result.members_identified),
+                                    "mode": "agentic_v7",
+                                    "citation_validation_passed": result.citation_validation_passed,
+                                    "claims_valid": result.trace.claims_valid if result.trace else 0,
+                                    "claims_dropped": result.trace.claims_unsupported if result.trace else 0,
                                 },
                                 auto_commit=False,
                                 session_id=session_id,
                             )
                             conn.commit()
                             
-                            result_set_id_v6 = create_result_set(
+                            result_set_id_v7 = create_result_set(
                                 conn,
                                 run_id=run_id,
                                 chunk_ids=chunk_ids,
-                                name=f"V6: {query_text[:40]}... (run {run_id})",
+                                name=f"V7: {query_text[:40]}... (run {run_id})",
                                 session_id=session_id,
                             )
-                            current_result_set_id = result_set_id_v6
-                            print(f"  Created result set #{result_set_id_v6}", file=sys.stderr)
+                            current_result_set_id = result_set_id_v7
+                            print(f"  Created result set #{result_set_id_v7}", file=sys.stderr)
                 except Exception as e:
                     print(f"  Warning: Could not create result set: {e}", file=sys.stderr)
             
             print()
                 
         except Exception as e:
-            print(f"\nV6 workflow error: {e}")
+            print(f"\nV7 workflow error: {e}")
             import traceback
             traceback.print_exc()
             print()

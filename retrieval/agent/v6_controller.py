@@ -16,15 +16,19 @@ import os
 import json
 import sys
 import time
-from typing import List, Dict, Any, Optional, Set
+from typing import List, Dict, Any, Optional, Set, Callable
 from dataclasses import dataclass, field
 
 from retrieval.agent.v6_query_parser import QueryParser, ParsedQuery, TaskType
 from retrieval.agent.v6_entity_linker import EntityLinker, EntityLinkingResult, LinkedEntity
-from retrieval.agent.v6_evidence_bottleneck import EvidenceBottleneck, BottleneckResult
+from retrieval.agent.v6_evidence_bottleneck import (
+    EvidenceBottleneck, BottleneckResult, GradingMode, DEFAULT_GRADING_MODE,
+    TOURNAMENT_BATCH_BY_DEFAULT,
+)
 from retrieval.agent.v6_responsiveness import ResponsivenessVerifier, ResponsivenessResult, ResponsivenessStatus
 from retrieval.agent.v6_progress_gate import ProgressGate, ProgressResult, RoundDecision
 from retrieval.agent.tools import TOOL_REGISTRY, ToolResult, get_tools_for_prompt
+from retrieval.agent.v7_types import RoundSummary
 
 
 # =============================================================================
@@ -37,6 +41,10 @@ class V6Config:
     
     # Bottleneck
     max_bottleneck_spans: int = 40
+    # Grading mode: "tournament" (default, pairwise comparison) or "absolute" (0-10 scoring)
+    bottleneck_grading_mode: GradingMode = DEFAULT_GRADING_MODE
+    # Tournament batching: True = batch matchups for speed, False = 1 API call per matchup (slower but more accurate)
+    tournament_batch: bool = TOURNAMENT_BATCH_BY_DEFAULT
     
     # Rounds
     max_rounds: int = 5
@@ -53,6 +61,21 @@ class V6Config:
     synthesis_model: str = "gpt-4o"
     
     verbose: bool = True
+    
+    # Progress callback for streaming updates
+    # Called with (step: str, status: str, message: str, details: dict)
+    progress_callback: Optional[Callable[[str, str, str, Dict[str, Any]], None]] = None
+    
+    # V7 Phase 2: Novelty controls
+    # off = no exclusion, soft = exclude but allow override, hard = always exclude
+    exclude_seen_mode: str = "soft"  # off | soft | hard
+    # Multiplier for top_k when exclusion is active (to ensure enough results)
+    top_k_budget_multiplier: float = 1.5
+    
+    # V7 Phase 2: Round summary
+    # If True, generate RoundSummary after each round for smarter decision-making
+    enable_round_summary: bool = True
+    round_summary_model: str = "gpt-4o-mini"
 
 
 # =============================================================================
@@ -134,6 +157,8 @@ class V6Controller:
         )
         self.bottleneck = EvidenceBottleneck(
             max_spans=self.config.max_bottleneck_spans,
+            grading_mode=self.config.bottleneck_grading_mode,
+            batch_tournament=self.config.tournament_batch,
             verbose=self.config.verbose,
         )
         self.responsiveness_verifier = ResponsivenessVerifier(verbose=self.config.verbose)
@@ -148,6 +173,33 @@ class V6Controller:
         self.trace = V6Trace()
         self.all_bottleneck_spans: List[Any] = []
         self.all_members_found: Set[str] = set()
+        
+        # V7 Phase 2: Track seen chunk IDs for novelty control
+        self.seen_chunk_ids: Set[int] = set()
+        self.seen_page_ids: Set[int] = set()
+        self.seen_document_ids: Set[int] = set()
+        
+        # V7 Phase 2: Round summary
+        self.round_summary_generator = None
+        self.previous_round_summary: Optional[RoundSummary] = None
+        self.round_observations: List[Dict[str, Any]] = []  # Tool observations for current round
+        if self.config.enable_round_summary:
+            try:
+                from retrieval.agent.v7_controller import RoundSummaryGenerator
+                self.round_summary_generator = RoundSummaryGenerator(
+                    verbose=self.config.verbose,
+                    model=self.config.round_summary_model,
+                )
+            except ImportError:
+                pass  # V7 controller not available
+    
+    def _emit_progress(self, step: str, status: str, message: str, details: Optional[Dict[str, Any]] = None):
+        """Emit a progress event if callback is configured."""
+        if self.config.progress_callback:
+            try:
+                self.config.progress_callback(step, status, message, details or {})
+            except Exception:
+                pass  # Don't let callback errors break the workflow
     
     def run(
         self,
@@ -170,6 +222,13 @@ class V6Controller:
         
         parsed = self.parser.parse(question)
         self.trace.parsed_query = parsed
+        
+        # Emit progress for query parsing
+        self._emit_progress("query_parsing", "completed", f"Parsed as {parsed.task_type.value} task", {
+            "task_type": parsed.task_type.value,
+            "topic_terms": parsed.topic_terms[:5],
+            "control_tokens_count": len(parsed.control_tokens),
+        })
         
         # EXPLICIT: Show exactly what the model classified
         if self.config.verbose:
@@ -203,6 +262,15 @@ class V6Controller:
         
         # Get retrieval entity IDs (only those marked for retrieval)
         retrieval_entity_ids = linking.get_retrieval_entity_ids()
+        
+        # Emit progress for entity linking
+        retrieval_entities = [{"name": e.canonical_name, "id": e.entity_id} for e in linking.retrieval_entities[:5]]
+        self._emit_progress("entity_linking", "completed", f"Linked {linking.total_linked} entities, {linking.used_for_retrieval} for retrieval", {
+            "total_linked": linking.total_linked,
+            "used_for_retrieval": linking.used_for_retrieval,
+            "rejected_control_tokens": len(linking.rejected_control_tokens),
+            "retrieval_entities": retrieval_entities,
+        })
         
         # EXPLICIT: Show exactly what was linked and what will be used
         if self.config.verbose:
@@ -259,8 +327,16 @@ class V6Controller:
             round_num += 1
             round_start = time.time()
             
+            # V7 Phase 2: Reset round observations
+            self.round_observations = []
+            
             if self.config.verbose:
                 print(f"\n  [Round {round_num}]", file=sys.stderr)
+            
+            # Emit round start
+            self._emit_progress(f"retrieval_round_{round_num}", "running", f"Starting retrieval round {round_num}", {
+                "round": round_num,
+            })
             
             # Retrieve
             chunks = self._retrieve(parsed, linking, conn, round_num)
@@ -275,6 +351,27 @@ class V6Controller:
             
             self.all_members_found.update(bottleneck_result.members_identified)
             
+            # V7 Phase 2: Generate round summary for smarter decision-making
+            if self.round_summary_generator:
+                try:
+                    chunk_dicts = [{"text": c.get("text", ""), "source_label": c.get("source_label", ""), "page": c.get("page", "")} for c in chunks]
+                    round_summary = self.round_summary_generator.generate(
+                        round_number=round_num,
+                        question=parsed.original_query,
+                        evidence_chunks=chunk_dicts,
+                        previous_summary=self.previous_round_summary,
+                        tool_observations=self.round_observations,
+                    )
+                    self.previous_round_summary = round_summary
+                    
+                    if self.config.verbose:
+                        print(f"    [RoundSummary] {round_summary.decision.value}: {round_summary.decision_rationale}", file=sys.stderr)
+                        if round_summary.actionable_leads:
+                            print(f"    [RoundSummary] {len(round_summary.actionable_leads)} leads identified", file=sys.stderr)
+                except Exception as e:
+                    if self.config.verbose:
+                        print(f"    [RoundSummary] Error: {e}", file=sys.stderr)
+            
             # Record round
             round_data = {
                 "round": round_num,
@@ -284,7 +381,19 @@ class V6Controller:
                 "members_found": list(self.all_members_found),
                 "elapsed_ms": (time.time() - round_start) * 1000,
             }
+            # V7 Phase 2: Include round summary in trace
+            if self.previous_round_summary:
+                round_data["round_summary"] = self.previous_round_summary.to_dict()
             self.trace.rounds.append(round_data)
+            
+            # Emit round complete
+            self._emit_progress(f"retrieval_round_{round_num}", "completed", f"Round {round_num}: {len(chunks)} chunks → {bottleneck_result.spans_passed} spans ({len(self.all_bottleneck_spans)} total)", {
+                "round": round_num,
+                "chunks_retrieved": len(chunks),
+                "spans_after_bottleneck": bottleneck_result.spans_passed,
+                "total_spans": len(self.all_bottleneck_spans),
+                "members_found": len(self.all_members_found),
+            })
             
             # Progress gate
             progress = self.progress_gate.evaluate(
@@ -316,16 +425,32 @@ class V6Controller:
             print(f"\n[Step 5] Synthesizing from {len(self.all_bottleneck_spans)} bottlenecked spans...", 
                   file=sys.stderr)
         
+        self._emit_progress("synthesis", "running", f"Synthesizing answer from {len(self.all_bottleneck_spans)} spans...", {
+            "total_spans": len(self.all_bottleneck_spans),
+        })
+        
         answer, claims = self._synthesize(parsed)
         self.trace.final_answer = answer
         self.trace.final_claims = claims
+        
+        self._emit_progress("synthesis", "completed", f"Generated answer with {len(claims)} claims", {
+            "claims_count": len(claims),
+            "answer_length": len(answer),
+        })
         
         # Step 6: VERIFY RESPONSIVENESS
         if self.config.verbose:
             print(f"\n[Step 6] Verifying responsiveness...", file=sys.stderr)
         
+        self._emit_progress("responsiveness", "running", "Verifying answer responsiveness...", {})
+        
         responsiveness = self.responsiveness_verifier.verify(answer, claims, parsed)
         self.trace.responsiveness = responsiveness
+        
+        self._emit_progress("responsiveness", "completed", f"Responsiveness: {responsiveness.status.value}", {
+            "status": responsiveness.status.value,
+            "members_with_citations": len(responsiveness.members_with_citations) if responsiveness.members_with_citations else 0,
+        })
         
         # Determine outcome
         if responsiveness.status == ResponsivenessStatus.RESPONSIVE:
@@ -477,6 +602,18 @@ class V6Controller:
                     if filtered_out > 0 and self.config.verbose:
                         print(f"    [Scope] FILTERED {filtered_out} chunks outside {scope_collections}", file=sys.stderr)
                 
+                # V7 Phase 2: Record seen chunk IDs for novelty control
+                for chunk in chunks:
+                    cid = chunk.get("id")
+                    if cid:
+                        self.seen_chunk_ids.add(cid)
+                    page_id = chunk.get("page_id")
+                    if page_id:
+                        self.seen_page_ids.add(page_id)
+                    doc_id = chunk.get("doc_id")
+                    if doc_id:
+                        self.seen_document_ids.add(doc_id)
+                
                 if self.config.verbose:
                     print(f"             → {len(chunks)} chunks", file=sys.stderr)
                 
@@ -498,6 +635,9 @@ class V6Controller:
                     if self.config.verbose:
                         print(f"    [Searcher] 4+ failed calls, stopping retrieval loop", file=sys.stderr)
                     break
+        
+        # V7 Phase 2: Save observations for round summary generation
+        self.round_observations = observations.copy()
         
         # Deduplicate by chunk_id
         seen = set()
@@ -546,6 +686,22 @@ class V6Controller:
             "- Use approved entity IDs for entity_mentions/co_mentions",
             "- Do NOT search for control tokens like 'provide', 'cite', collection names as content",
         ])
+        
+        # V7 Phase 2: Include previous round summary if available
+        if self.previous_round_summary:
+            lines.extend([
+                "",
+                "=== PREVIOUS ROUND INSIGHTS ===",
+                self.previous_round_summary.format_for_context(),
+            ])
+            
+            # Highlight high-priority leads
+            high_priority = self.previous_round_summary.get_high_priority_leads()
+            if high_priority:
+                lines.append("\nRECOMMENDED NEXT ACTIONS:")
+                for lead in high_priority[:3]:
+                    tool_hint = f" (try: {lead.suggested_tool})" if lead.suggested_tool else ""
+                    lines.append(f"  → {lead.lead_type}: {lead.target}{tool_hint}")
         
         return "\n".join(lines)
     
@@ -671,6 +827,27 @@ IMPORTANT:
         
         tool_spec = TOOL_REGISTRY[tool_name]
         
+        # V7 Phase 2: Auto-inject exclusion params for search tools
+        search_tools = {"hybrid_search", "vector_search", "lexical_search", "lexical_exact"}
+        if tool_name in search_tools and self.config.exclude_seen_mode != "off":
+            # Inject exclude_chunk_ids if we have seen chunks
+            if self.seen_chunk_ids:
+                # Only inject if not already provided (soft mode allows override)
+                if self.config.exclude_seen_mode == "hard" or "exclude_chunk_ids" not in params:
+                    params["exclude_chunk_ids"] = list(self.seen_chunk_ids)
+                    if self.config.verbose:
+                        print(f"    [Novelty] Injected exclude_chunk_ids ({len(self.seen_chunk_ids)} IDs)", file=sys.stderr)
+            
+            # Optionally inject page-level exclusion for broader deduplication
+            if self.seen_page_ids and len(self.seen_page_ids) < 500:  # Reasonable limit
+                if self.config.exclude_seen_mode == "hard" or "exclude_page_ids" not in params:
+                    params["exclude_page_ids"] = list(self.seen_page_ids)
+            
+            # Apply top_k budget multiplier when exclusion is active
+            if self.seen_chunk_ids and "top_k" in params:
+                original_k = params.get("top_k", 200)
+                params["top_k"] = min(int(original_k * self.config.top_k_budget_multiplier), 500)
+        
         try:
             result = tool_spec.fn(conn, **params)
             # Log if the result indicates an error
@@ -726,6 +903,7 @@ IMPORTANT:
                         "id": row[0],
                         "text": row[1] or "",
                         "doc_id": row[2],
+                        "page_id": row[3],  # V7 Phase 2: Include raw page_id for seen tracking
                         "page": f"p{row[3]}" if row[3] else "",
                         "source_label": row[4] or "",
                     }

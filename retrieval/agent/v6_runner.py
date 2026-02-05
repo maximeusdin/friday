@@ -45,6 +45,9 @@ class V6Result:
     # Trace
     trace: Optional[V6Trace] = None
     
+    # Bottleneck spans - needed for citation document linking
+    bottleneck_spans: List[Any] = field(default_factory=list)
+    
     def format_answer(self) -> str:
         """Format the answer with citations and V6-specific information."""
         
@@ -121,6 +124,7 @@ class V6Runner:
             answer=trace.final_answer,
             claims=trace.final_claims,
             trace=trace,
+            bottleneck_spans=trace.bottleneck_spans or [],
         )
         
         # Set responsiveness

@@ -47,6 +47,10 @@ from retrieval.ops import (
     SearchFilters,
     ChunkHit,
     concordance_expand_terms,
+    # V7 Phase 2: Neighbor/continuation functions
+    get_chunk_neighbors,
+    get_document_chunks,
+    ChunkNeighbor,
 )
 
 
@@ -61,6 +65,10 @@ class ToolResult:
     elapsed_ms: float
     success: bool = True
     error: Optional[str] = None
+    # Pagination metadata (V7 Phase 2)
+    next_cursor: Optional[str] = None      # Opaque token for next page
+    has_more: bool = False                 # More results available
+    total_available: Optional[int] = None  # Total matching results (if known)
     
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -72,6 +80,9 @@ class ToolResult:
             "elapsed_ms": self.elapsed_ms,
             "success": self.success,
             "error": self.error,
+            "next_cursor": self.next_cursor,
+            "has_more": self.has_more,
+            "total_available": self.total_available,
         }
 
 
@@ -89,6 +100,9 @@ def _build_filters(
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
     document_id: Optional[int] = None,
+    exclude_chunk_ids: Optional[List[int]] = None,
+    exclude_page_ids: Optional[List[int]] = None,
+    exclude_document_ids: Optional[List[int]] = None,
 ) -> SearchFilters:
     """Build SearchFilters from common parameters."""
     return SearchFilters(
@@ -96,6 +110,9 @@ def _build_filters(
         date_from=date_from,
         date_to=date_to,
         document_id=document_id,
+        exclude_chunk_ids=exclude_chunk_ids,
+        exclude_page_ids=exclude_page_ids,
+        exclude_document_ids=exclude_document_ids,
     )
 
 
@@ -125,6 +142,10 @@ def hybrid_search_tool(
     date_to: Optional[str] = None,
     expand_concordance: bool = True,
     fuzzy_enabled: bool = True,
+    # V7 Phase 2: Exclusion/pagination params
+    exclude_chunk_ids: Optional[List[int]] = None,
+    exclude_page_ids: Optional[List[int]] = None,
+    exclude_document_ids: Optional[List[int]] = None,
 ) -> ToolResult:
     """
     Hybrid search combining vector + lexical via Reciprocal Rank Fusion.
@@ -132,6 +153,9 @@ def hybrid_search_tool(
     This is the primary search tool for most queries.
     ALWAYS expands concordance aliases automatically.
     GRACEFUL: Validates inputs and never crashes.
+    
+    V7 Phase 2: Supports exclude_chunk_ids, exclude_page_ids, exclude_document_ids
+    for pagination and novelty control.
     """
     start = time.time()
     
@@ -153,7 +177,7 @@ def hybrid_search_tool(
             success=True,  # Graceful empty result
         )
     
-    # Validate top_k
+    # Validate top_k (server cap at 500)
     if not isinstance(top_k, int):
         try:
             top_k = int(top_k)
@@ -162,7 +186,12 @@ def hybrid_search_tool(
     top_k = min(max(top_k, 1), 500)
     
     try:
-        filters = _build_filters(collections, date_from, date_to)
+        filters = _build_filters(
+            collections, date_from, date_to,
+            exclude_chunk_ids=exclude_chunk_ids,
+            exclude_page_ids=exclude_page_ids,
+            exclude_document_ids=exclude_document_ids,
+        )
         
         # First, get the aliases that will be expanded (for reporting)
         expanded_aliases = []
@@ -176,15 +205,22 @@ def hybrid_search_tool(
             except Exception:
                 pass
         
+        # Request more than top_k to determine if there are more results
+        fetch_k = top_k + 1
         hits = hybrid_rrf(
             conn=conn,
             query=query,
             filters=filters,
-            k=top_k,
+            k=fetch_k,
             expand_concordance=expand_concordance,
             fuzzy_lex_enabled=fuzzy_enabled,
             log_run=False,  # We log at tool level
         )
+        
+        # Determine if there are more results
+        has_more = len(hits) > top_k
+        if has_more:
+            hits = hits[:top_k]
         
         chunk_ids, scores = _extract_chunk_hits(hits)
         
@@ -196,6 +232,9 @@ def hybrid_search_tool(
                 "query": query,
                 "top_k": top_k,
                 "collections": collections,
+                "exclude_chunk_ids": exclude_chunk_ids,
+                "exclude_page_ids": exclude_page_ids,
+                "exclude_document_ids": exclude_document_ids,
             },
             chunk_ids=chunk_ids,
             scores=scores,
@@ -207,6 +246,7 @@ def hybrid_search_tool(
                 "total_alias_count": len(expanded_aliases),
             },
             elapsed_ms=elapsed,
+            has_more=has_more,
         )
         
     except Exception as e:
@@ -235,6 +275,10 @@ def vector_search_tool(
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
     expand_concordance: bool = True,
+    # V7 Phase 2: Exclusion/pagination params
+    exclude_chunk_ids: Optional[List[int]] = None,
+    exclude_page_ids: Optional[List[int]] = None,
+    exclude_document_ids: Optional[List[int]] = None,
 ) -> ToolResult:
     """
     Pure vector similarity search.
@@ -242,6 +286,9 @@ def vector_search_tool(
     Best for semantic queries where exact term matching isn't critical.
     ALWAYS expands concordance aliases for the embedding query.
     GRACEFUL: Validates inputs and never crashes.
+    
+    V7 Phase 2: Supports exclude_chunk_ids, exclude_page_ids, exclude_document_ids
+    for pagination and novelty control.
     """
     start = time.time()
     
@@ -263,7 +310,7 @@ def vector_search_tool(
             success=True,  # Graceful empty result
         )
     
-    # Validate top_k
+    # Validate top_k (server cap at 500)
     if not isinstance(top_k, int):
         try:
             top_k = int(top_k)
@@ -272,7 +319,12 @@ def vector_search_tool(
     top_k = min(max(top_k, 1), 500)
     
     try:
-        filters = _build_filters(collections, date_from, date_to)
+        filters = _build_filters(
+            collections, date_from, date_to,
+            exclude_chunk_ids=exclude_chunk_ids,
+            exclude_page_ids=exclude_page_ids,
+            exclude_document_ids=exclude_document_ids,
+        )
         
         # Get aliases for reporting
         expanded_aliases = []
@@ -286,14 +338,21 @@ def vector_search_tool(
             except Exception:
                 pass
         
+        # Request more than top_k to determine if there are more results
+        fetch_k = top_k + 1
         hits = ops_vector_search(
             conn=conn,
             query=query,
             filters=filters,
-            k=top_k,
+            k=fetch_k,
             expand_concordance=expand_concordance,
             log_run=False,
         )
+        
+        # Determine if there are more results
+        has_more = len(hits) > top_k
+        if has_more:
+            hits = hits[:top_k]
         
         chunk_ids, scores = _extract_chunk_hits(hits)
         
@@ -305,6 +364,9 @@ def vector_search_tool(
                 "query": query,
                 "top_k": top_k,
                 "collections": collections,
+                "exclude_chunk_ids": exclude_chunk_ids,
+                "exclude_page_ids": exclude_page_ids,
+                "exclude_document_ids": exclude_document_ids,
             },
             chunk_ids=chunk_ids,
             scores=scores,
@@ -315,6 +377,7 @@ def vector_search_tool(
                 "total_alias_count": len(expanded_aliases),
             },
             elapsed_ms=elapsed,
+            has_more=has_more,
         )
         
     except Exception as e:
@@ -343,6 +406,10 @@ def lexical_search_tool(
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
     expand_aliases: bool = True,
+    # V7 Phase 2: Exclusion/pagination params
+    exclude_chunk_ids: Optional[List[int]] = None,
+    exclude_page_ids: Optional[List[int]] = None,
+    exclude_document_ids: Optional[List[int]] = None,
 ) -> ToolResult:
     """
     Lexical search WITH automatic alias expansion.
@@ -352,8 +419,16 @@ def lexical_search_tool(
     
     Automatically expands concordance aliases for each term.
     Best for precise queries where specific terms must be present.
+    
+    V7 Phase 2: Supports exclude_chunk_ids, exclude_page_ids, exclude_document_ids
+    for pagination and novelty control.
     """
     start = time.time()
+    
+    # Auto-convert string to list (common LLM mistake)
+    if isinstance(terms, str):
+        # Split on whitespace to make a best-effort list
+        terms = [t.strip() for t in terms.split() if t.strip()]
     
     # Validate terms
     if not terms or not isinstance(terms, list):
@@ -381,7 +456,12 @@ def lexical_search_tool(
         )
     
     try:
-        filters = _build_filters(collections, date_from, date_to)
+        filters = _build_filters(
+            collections, date_from, date_to,
+            exclude_chunk_ids=exclude_chunk_ids,
+            exclude_page_ids=exclude_page_ids,
+            exclude_document_ids=exclude_document_ids,
+        )
         
         # Expand aliases for each term
         all_search_variants = []  # List of (original_term, [aliases])
@@ -474,6 +554,8 @@ def lexical_search_tool(
                             except Exception:
                                 pass
         
+        # Determine if there are more results
+        has_more = len(all_chunk_ids) > top_k
         chunk_ids = list(all_chunk_ids)[:top_k]
         scores = {cid: all_scores[cid] for cid in chunk_ids}
         
@@ -491,6 +573,9 @@ def lexical_search_tool(
                 "terms": terms,
                 "top_k": top_k,
                 "expand_aliases": expand_aliases,
+                "exclude_chunk_ids": exclude_chunk_ids,
+                "exclude_page_ids": exclude_page_ids,
+                "exclude_document_ids": exclude_document_ids,
             },
             chunk_ids=chunk_ids,
             scores=scores,
@@ -502,6 +587,7 @@ def lexical_search_tool(
                 "alias_summary": alias_summary,
             },
             elapsed_ms=elapsed,
+            has_more=has_more,
         )
         
     except Exception as e:
@@ -529,6 +615,10 @@ def lexical_exact_tool(
     collections: Optional[List[str]] = None,
     case_sensitive: bool = False,
     expand_aliases: bool = True,
+    # V7 Phase 2: Exclusion/pagination params
+    exclude_chunk_ids: Optional[List[int]] = None,
+    exclude_page_ids: Optional[List[int]] = None,
+    exclude_document_ids: Optional[List[int]] = None,
 ) -> ToolResult:
     """
     Exact substring match search WITH automatic alias expansion.
@@ -536,6 +626,9 @@ def lexical_exact_tool(
     Best for finding specific phrases or names.
     Automatically expands concordance aliases and searches for all variants.
     GRACEFUL: Validates inputs and never crashes.
+    
+    V7 Phase 2: Supports exclude_chunk_ids, exclude_page_ids, exclude_document_ids
+    for pagination and novelty control.
     """
     start = time.time()
     
@@ -557,7 +650,7 @@ def lexical_exact_tool(
             success=True,  # Graceful empty result
         )
     
-    # Validate top_k
+    # Validate top_k (server cap at 500)
     if not isinstance(top_k, int):
         try:
             top_k = int(top_k)
@@ -566,7 +659,12 @@ def lexical_exact_tool(
     top_k = min(max(top_k, 1), 500)
     
     try:
-        filters = _build_filters(collections)
+        filters = _build_filters(
+            collections,
+            exclude_chunk_ids=exclude_chunk_ids,
+            exclude_page_ids=exclude_page_ids,
+            exclude_document_ids=exclude_document_ids,
+        )
         
         # Expand aliases from concordance
         search_terms = [term]
@@ -611,6 +709,8 @@ def lexical_exact_tool(
                     # Boost score for chunks hit by multiple aliases
                     all_scores[cid] = min(all_scores.get(cid, 0.5) + 0.1, 1.0)
         
+        # Determine if there are more results
+        has_more = len(all_chunk_ids) > top_k
         chunk_ids = list(all_chunk_ids)[:top_k]
         scores = {cid: all_scores[cid] for cid in chunk_ids}
         
@@ -622,6 +722,9 @@ def lexical_exact_tool(
                 "term": term,
                 "top_k": top_k,
                 "expand_aliases": expand_aliases,
+                "exclude_chunk_ids": exclude_chunk_ids,
+                "exclude_page_ids": exclude_page_ids,
+                "exclude_document_ids": exclude_document_ids,
             },
             chunk_ids=chunk_ids,
             scores=scores,
@@ -633,6 +736,7 @@ def lexical_exact_tool(
                 "alias_count": len(search_terms) - 1,
             },
             elapsed_ms=elapsed,
+            has_more=has_more,
         )
         
     except Exception as e:
@@ -1444,53 +1548,264 @@ def first_mention_tool(
 
 
 # =============================================================================
+# V7 Phase 2: Neighbor/Continuation Tools
+# =============================================================================
+
+def chunk_neighbors_tool(
+    conn,
+    chunk_id: int,
+    before: int = 2,
+    after: int = 2,
+    include_seed: bool = True,
+) -> ToolResult:
+    """
+    V7 Phase 2: Get neighboring chunks from the same document.
+    
+    Enables the agent to expand context around a relevant chunk.
+    Returns chunks before and after the seed chunk in document order.
+    
+    GRACEFUL: Returns empty results if chunk not found.
+    """
+    start = time.time()
+    
+    # Validate inputs
+    if chunk_id is None or not isinstance(chunk_id, int):
+        return ToolResult(
+            tool_name="chunk_neighbors",
+            params={"chunk_id": chunk_id},
+            chunk_ids=[],
+            scores={},
+            metadata={"message": "chunk_id must be an integer"},
+            elapsed_ms=0,
+            success=True,  # Graceful
+        )
+    
+    # Clamp before/after to reasonable values
+    before = max(0, min(before, 10))
+    after = max(0, min(after, 10))
+    
+    try:
+        neighbors = get_chunk_neighbors(
+            conn=conn,
+            chunk_id=chunk_id,
+            before=before,
+            after=after,
+            include_seed=include_seed,
+        )
+        
+        elapsed = (time.time() - start) * 1000
+        
+        if not neighbors:
+            return ToolResult(
+                tool_name="chunk_neighbors",
+                params={"chunk_id": chunk_id, "before": before, "after": after},
+                chunk_ids=[],
+                scores={},
+                metadata={"message": f"Chunk {chunk_id} not found"},
+                elapsed_ms=elapsed,
+                success=True,  # Graceful
+            )
+        
+        chunk_ids = [n.chunk_id for n in neighbors]
+        # Score based on distance from seed (closer = higher score)
+        scores = {n.chunk_id: max(0.5, 1.0 - abs(n.position) * 0.1) for n in neighbors}
+        
+        # Build detailed neighbor info
+        neighbor_info = [
+            {
+                "chunk_id": n.chunk_id,
+                "position": n.position,
+                "text_preview": n.text[:200] if n.text else "",
+                "page_id": n.page_id,
+            }
+            for n in neighbors
+        ]
+        
+        return ToolResult(
+            tool_name="chunk_neighbors",
+            params={"chunk_id": chunk_id, "before": before, "after": after},
+            chunk_ids=chunk_ids,
+            scores=scores,
+            metadata={
+                "seed_chunk_id": chunk_id,
+                "total_neighbors": len(neighbors),
+                "before_count": len([n for n in neighbors if n.position < 0]),
+                "after_count": len([n for n in neighbors if n.position > 0]),
+                "document_id": neighbors[0].document_id if neighbors else None,
+                "neighbors": neighbor_info,
+            },
+            elapsed_ms=elapsed,
+        )
+        
+    except Exception as e:
+        elapsed = (time.time() - start) * 1000
+        try:
+            conn.rollback()
+        except:
+            pass
+        return ToolResult(
+            tool_name="chunk_neighbors",
+            params={"chunk_id": chunk_id, "before": before, "after": after},
+            chunk_ids=[],
+            scores={},
+            metadata={"error_type": type(e).__name__},
+            elapsed_ms=elapsed,
+            success=False,
+            error=str(e),
+        )
+
+
+def document_chunks_tool(
+    conn,
+    document_id: int,
+    page_id: Optional[int] = None,
+    limit: int = 30,
+) -> ToolResult:
+    """
+    V7 Phase 2: Get all chunks from a document, optionally filtered by page.
+    
+    Useful when the agent wants to read a full document or page.
+    
+    GRACEFUL: Returns empty results if document not found.
+    """
+    start = time.time()
+    
+    # Validate inputs
+    if document_id is None or not isinstance(document_id, int):
+        return ToolResult(
+            tool_name="document_chunks",
+            params={"document_id": document_id},
+            chunk_ids=[],
+            scores={},
+            metadata={"message": "document_id must be an integer"},
+            elapsed_ms=0,
+            success=True,  # Graceful
+        )
+    
+    # Clamp limit
+    limit = max(1, min(limit, 100))
+    
+    try:
+        chunks = get_document_chunks(
+            conn=conn,
+            document_id=document_id,
+            page_id=page_id,
+            limit=limit,
+        )
+        
+        elapsed = (time.time() - start) * 1000
+        
+        if not chunks:
+            return ToolResult(
+                tool_name="document_chunks",
+                params={"document_id": document_id, "page_id": page_id},
+                chunk_ids=[],
+                scores={},
+                metadata={"message": f"Document {document_id} not found or has no chunks"},
+                elapsed_ms=elapsed,
+                success=True,  # Graceful
+            )
+        
+        chunk_ids = [c.chunk_id for c in chunks]
+        # Score by position in document (earlier = higher score)
+        scores = {c.chunk_id: max(0.3, 1.0 - c.position * 0.02) for c in chunks}
+        
+        return ToolResult(
+            tool_name="document_chunks",
+            params={"document_id": document_id, "page_id": page_id, "limit": limit},
+            chunk_ids=chunk_ids,
+            scores=scores,
+            metadata={
+                "document_id": document_id,
+                "page_id": page_id,
+                "total_chunks": len(chunks),
+                "collection_slug": chunks[0].collection_slug if chunks else None,
+            },
+            elapsed_ms=elapsed,
+        )
+        
+    except Exception as e:
+        elapsed = (time.time() - start) * 1000
+        try:
+            conn.rollback()
+        except:
+            pass
+        return ToolResult(
+            tool_name="document_chunks",
+            params={"document_id": document_id, "page_id": page_id},
+            chunk_ids=[],
+            scores={},
+            metadata={"error_type": type(e).__name__},
+            elapsed_ms=elapsed,
+            success=False,
+            error=str(e),
+        )
+
+
+# =============================================================================
 # Tool Registry
 # =============================================================================
 
 TOOL_REGISTRY: Dict[str, ToolSpec] = {
     "hybrid_search": ToolSpec(
         name="hybrid_search",
-        description="Combines vector + lexical search via RRF. Best general-purpose search.",
+        description="Combines vector + lexical search via RRF. Best general-purpose search. Supports exclude params for pagination.",
         params_schema={
             "query": {"type": "string", "required": True},
-            "top_k": {"type": "integer", "default": 200},
+            "top_k": {"type": "integer", "default": 200, "max": 500},
             "collections": {"type": "array", "items": "string"},
             "date_from": {"type": "string", "format": "date"},
             "date_to": {"type": "string", "format": "date"},
             "expand_concordance": {"type": "boolean", "default": True},
             "fuzzy_enabled": {"type": "boolean", "default": True},
+            # V7 Phase 2: Exclusion params for pagination/novelty
+            "exclude_chunk_ids": {"type": "array", "items": "integer", "description": "Chunk IDs to exclude from results"},
+            "exclude_page_ids": {"type": "array", "items": "integer", "description": "Page IDs to exclude (reduces near-duplicate churn)"},
+            "exclude_document_ids": {"type": "array", "items": "integer", "description": "Document IDs to exclude (broader exclusion)"},
         },
         fn=hybrid_search_tool,
     ),
     "vector_search": ToolSpec(
         name="vector_search",
-        description="Pure vector similarity search. Best for semantic queries.",
+        description="Pure vector similarity search. Best for semantic queries. Supports exclude params for pagination.",
         params_schema={
             "query": {"type": "string", "required": True},
-            "top_k": {"type": "integer", "default": 200},
+            "top_k": {"type": "integer", "default": 200, "max": 500},
             "collections": {"type": "array", "items": "string"},
             "expand_concordance": {"type": "boolean", "default": True},
+            # V7 Phase 2: Exclusion params for pagination/novelty
+            "exclude_chunk_ids": {"type": "array", "items": "integer", "description": "Chunk IDs to exclude from results"},
+            "exclude_page_ids": {"type": "array", "items": "integer", "description": "Page IDs to exclude (reduces near-duplicate churn)"},
+            "exclude_document_ids": {"type": "array", "items": "integer", "description": "Document IDs to exclude (broader exclusion)"},
         },
         fn=vector_search_tool,
     ),
     "lexical_search": ToolSpec(
         name="lexical_search",
-        description="All terms must appear in chunk. Best for precise term matching.",
+        description="All terms must appear in chunk. Best for precise term matching. Supports exclude params for pagination.",
         params_schema={
-            "terms": {"type": "array", "items": "string", "required": True},
-            "top_k": {"type": "integer", "default": 200},
+            "terms": {"type": "array", "items": "string", "required": True, "description": "List of terms that must ALL appear, e.g. ['Silvermaster', 'network']. NOT a string."},
+            "top_k": {"type": "integer", "default": 200, "max": 500},
             "collections": {"type": "array", "items": "string"},
+            # V7 Phase 2: Exclusion params for pagination/novelty
+            "exclude_chunk_ids": {"type": "array", "items": "integer", "description": "Chunk IDs to exclude from results"},
+            "exclude_page_ids": {"type": "array", "items": "integer", "description": "Page IDs to exclude (reduces near-duplicate churn)"},
+            "exclude_document_ids": {"type": "array", "items": "integer", "description": "Document IDs to exclude (broader exclusion)"},
         },
         fn=lexical_search_tool,
     ),
     "lexical_exact": ToolSpec(
         name="lexical_exact",
-        description="Exact substring match. Best for specific phrases or names.",
+        description="Exact substring match. Best for specific phrases or names. Supports exclude params for pagination.",
         params_schema={
             "term": {"type": "string", "required": True},
-            "top_k": {"type": "integer", "default": 200},
+            "top_k": {"type": "integer", "default": 200, "max": 500},
             "collections": {"type": "array", "items": "string"},
             "case_sensitive": {"type": "boolean", "default": False},
+            # V7 Phase 2: Exclusion params for pagination/novelty
+            "exclude_chunk_ids": {"type": "array", "items": "integer", "description": "Chunk IDs to exclude from results"},
+            "exclude_page_ids": {"type": "array", "items": "integer", "description": "Page IDs to exclude (reduces near-duplicate churn)"},
+            "exclude_document_ids": {"type": "array", "items": "integer", "description": "Document IDs to exclude (broader exclusion)"},
         },
         fn=lexical_exact_tool,
     ),
@@ -1548,6 +1863,28 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
             "name": {"type": "string", "required": False},  # Alternative to entity_id
         },
         fn=first_mention_tool,
+    ),
+    # V7 Phase 2: Neighbor/continuation tools
+    "chunk_neighbors": ToolSpec(
+        name="chunk_neighbors",
+        description="Get neighboring chunks from the same document. Use to expand context around a relevant chunk.",
+        params_schema={
+            "chunk_id": {"type": "integer", "required": True, "description": "The seed chunk to find neighbors for"},
+            "before": {"type": "integer", "default": 2, "description": "Number of chunks before the seed"},
+            "after": {"type": "integer", "default": 2, "description": "Number of chunks after the seed"},
+            "include_seed": {"type": "boolean", "default": True, "description": "Include the seed chunk in results"},
+        },
+        fn=chunk_neighbors_tool,
+    ),
+    "document_chunks": ToolSpec(
+        name="document_chunks",
+        description="Get all chunks from a document or specific page. Use when you need full document context.",
+        params_schema={
+            "document_id": {"type": "integer", "required": True, "description": "The document to retrieve"},
+            "page_id": {"type": "integer", "required": False, "description": "Optional: filter to specific page"},
+            "limit": {"type": "integer", "default": 30, "description": "Maximum chunks to return (max 100)"},
+        },
+        fn=document_chunks_tool,
     ),
 }
 
@@ -1634,6 +1971,19 @@ def get_tools_for_prompt() -> str:
         "    - Use returned aliases for subsequent searches",
         "    - Example: expand_aliases(term='Silvermaster') -> {aliases: ['PAL', ...]}",
         "",
+        "## NEIGHBOR/CONTINUATION TOOLS (V7 Phase 2)",
+        "",
+        "11. chunk_neighbors(chunk_id, before=2, after=2)",
+        "    - Get neighboring chunks from the same document",
+        "    - Use to expand context around a relevant chunk",
+        "    - Returns: chunks before and after the seed in document order",
+        "    - Example: chunk_neighbors(chunk_id=12345, before=3, after=3)",
+        "",
+        "12. document_chunks(document_id, page_id=None, limit=30)",
+        "    - Get all chunks from a document or specific page",
+        "    - Use when you need full document context",
+        "    - Example: document_chunks(document_id=100, page_id=5)",
+        "",
         "=" * 60,
         "TOOL STRATEGIES (use name parameter directly!)",
         "=" * 60,
@@ -1656,6 +2006,10 @@ def get_tools_for_prompt() -> str:
         "For TIMELINE queries (e.g., 'when did X happen'):",
         "  1. first_mention(name='Entity') for chronological anchor",
         "  2. entity_mentions(name='Entity') for full context",
+        "",
+        "For CONTEXT EXPANSION (when you need more text around a hit):",
+        "  1. chunk_neighbors(chunk_id=123, before=3, after=3)",
+        "  2. document_chunks(document_id=N) for full document",
         "",
         "IMPORTANT: Use name='...' directly in entity tools. Do NOT use placeholder",
         "variable names like 'silvermaster_id'. Use the actual entity name string.",
