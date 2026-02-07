@@ -3,11 +3,13 @@ Result set endpoints
 """
 from datetime import datetime
 from typing import Optional, List
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
+from app.routes.auth_cognito import require_user
 from app.services.db import get_conn
 from app.services.evidence import build_evidence_refs_from_chunk
+from app.services.session_ownership import assert_result_set_owned
 
 router = APIRouter()
 
@@ -98,8 +100,9 @@ class ResultSetResponse(BaseModel):
 # =============================================================================
 
 @router.get("/{result_set_id}", response_model=ResultSetResponse)
-def get_result_set(result_set_id: int):
+def get_result_set(result_set_id: int, user=Depends(require_user)):
     """Get a result set with all items and evidence refs."""
+    assert_result_set_owned(result_set_id, user["sub"])
     conn = get_conn()
     try:
         with conn.cursor() as cur:
@@ -221,6 +224,7 @@ class AggregateResponse(BaseModel):
 @router.get("/{result_set_id}/aggregate", response_model=AggregateResponse)
 def aggregate_result_set(
     result_set_id: int,
+    user=Depends(require_user),
     group_by: Optional[str] = Query(
         None, 
         description="Group results by: entity, document, collection, or None for total count"
@@ -231,6 +235,7 @@ def aggregate_result_set(
     
     Useful for "how many X in this result set?" queries.
     """
+    assert_result_set_owned(result_set_id, user["sub"])
     conn = get_conn()
     try:
         with conn.cursor() as cur:
@@ -371,6 +376,7 @@ def aggregate_result_set(
 
 @router.get("/stats/global", response_model=AggregateResponse)
 def get_global_stats(
+    user=Depends(require_user),
     group_by: str = Query(
         "collection",
         description="Group by: collection, document, entity"
@@ -483,6 +489,7 @@ class SummaryResponse(BaseModel):
 def summarize_result_set_endpoint(
     result_set_id: int,
     req: SummarizeRequest,
+    user=Depends(require_user),
 ):
     """
     Generate an LLM summary of a result set.
@@ -492,6 +499,7 @@ def summarize_result_set_endpoint(
     - detailed: Comprehensive summary with key findings
     - thematic: Organized by themes/topics
     """
+    assert_result_set_owned(result_set_id, user["sub"])
     import sys
     import os
     from pathlib import Path
@@ -591,6 +599,7 @@ from app.services.summarizer.models import (
 def summarize_result_set_v2(
     result_set_id: int,
     req: SummarizeRequestV2,
+    user=Depends(require_user),
 ):
     """
     Generate a structured LLM summary with citation-backed claims.
@@ -608,6 +617,7 @@ def summarize_result_set_v2(
     - document_summary: Single document deep dive
     - quick_answer: Fast, minimal evidence
     """
+    assert_result_set_owned(result_set_id, user["sub"])
     import os
     
     # Check for OpenAI API key early
@@ -867,6 +877,7 @@ def get_claim_evidence(
     result_set_id: int,
     summary_id: str,
     claim_id: str,
+    user=Depends(require_user),
     full: bool = Query(False, description="Include full chunk text (larger response)"),
 ):
     """
@@ -879,6 +890,7 @@ def get_claim_evidence(
     
     Use this for drill-down UX when user wants to verify a claim.
     """
+    assert_result_set_owned(result_set_id, user["sub"])
     conn = get_conn()
     try:
         # Look up summary
@@ -1012,12 +1024,14 @@ def get_claim_evidence(
 def get_summary(
     result_set_id: int,
     summary_id: str,
+    user=Depends(require_user),
 ):
     """
     Retrieve a previously generated summary by ID.
     
     Returns the full SummaryArtifact as stored.
     """
+    assert_result_set_owned(result_set_id, user["sub"])
     conn = get_conn()
     try:
         with conn.cursor() as cur:
@@ -1045,6 +1059,7 @@ def get_summary(
 @router.get("/{result_set_id}/summaries")
 def list_summaries(
     result_set_id: int,
+    user=Depends(require_user),
     limit: int = Query(10, ge=1, le=50),
 ):
     """
@@ -1052,6 +1067,7 @@ def list_summaries(
     
     Returns summary metadata without full output (for listing UI).
     """
+    assert_result_set_owned(result_set_id, user["sub"])
     conn = get_conn()
     try:
         with conn.cursor() as cur:
@@ -1341,6 +1357,7 @@ class ChunksResponseWithContext(BaseModel):
 @router.get("/{result_set_id}/chunks")
 def get_result_set_chunks_paginated(
     result_set_id: int,
+    user=Depends(require_user),
     offset: Optional[int] = Query(None, ge=0),
     limit: int = Query(100, ge=1, le=500),
     after_rank: Optional[int] = Query(None, ge=0),
@@ -1366,6 +1383,7 @@ def get_result_set_chunks_paginated(
     - year=1944: Filter to chunks from specific year
     - place_id=123: Filter to chunks mentioning specific place
     """
+    assert_result_set_owned(result_set_id, user["sub"])
     conn = get_conn()
     try:
         meta = _get_result_set_metadata(conn, result_set_id)
@@ -1529,6 +1547,7 @@ class ExpandResponse(BaseModel):
 @router.get("/{result_set_id}/expand")
 def expand_result_set(
     result_set_id: int,
+    user=Depends(require_user),
     limit: int = Query(50, ge=1, le=500, description="Number of additional results"),
 ):
     """
@@ -1547,6 +1566,7 @@ def expand_result_set(
     Returns:
         Expanded result set info with preserved_config showing what was reused.
     """
+    assert_result_set_owned(result_set_id, user["sub"])
     conn = get_conn()
     try:
         meta = _get_result_set_metadata(conn, result_set_id)
@@ -1603,6 +1623,7 @@ def expand_result_set(
 @router.get("/{result_set_id}/match-traces", response_model=MatchTracesResponse)
 def get_match_traces(
     result_set_id: int,
+    user=Depends(require_user),
     chunk_ids: Optional[str] = Query(None, description="Comma-separated chunk IDs"),
     include_audit: bool = Query(False),
 ):
@@ -1612,6 +1633,7 @@ def get_match_traces(
     Default: returns hot columns only (fast).
     With include_audit=True: returns full primitive_matches JSONB.
     """
+    assert_result_set_owned(result_set_id, user["sub"])
     conn = get_conn()
     try:
         meta = _get_result_set_metadata(conn, result_set_id)
@@ -1669,6 +1691,7 @@ def get_match_traces(
 @router.get("/chunks/{chunk_id}/highlights", response_model=HighlightsResponse)
 def get_chunk_highlights(
     chunk_id: int,
+    user=Depends(require_user),
     phrases: str = Query(..., description="Comma-separated phrases to highlight"),
     context_chars: int = Query(50, ge=0, le=200),
     case_sensitive: bool = Query(False),
@@ -1737,6 +1760,7 @@ def get_chunk_highlights(
 @router.get("/chunks/{chunk_id}/line-context", response_model=LineContextResponse)
 def get_line_context(
     chunk_id: int,
+    user=Depends(require_user),
     start_char: int = Query(..., ge=0, description="Start character offset in chunk text"),
     end_char: int = Query(..., ge=0, description="End character offset in chunk text"),
     lines_before: int = Query(1, ge=0, le=5, description="Number of lines before highlight"),
@@ -1850,10 +1874,12 @@ def get_line_context(
 @router.get("/{result_set_id}/entities", response_model=EntitiesResponse)
 def get_result_set_entities(
     result_set_id: int,
+    user=Depends(require_user),
     limit: int = Query(50, ge=1, le=200),
     entity_type: Optional[str] = Query(None),
 ):
     """Top entities mentioned in this result set."""
+    assert_result_set_owned(result_set_id, user["sub"])
     conn = get_conn()
     try:
         meta = _get_result_set_metadata(conn, result_set_id)
@@ -1900,11 +1926,13 @@ def get_result_set_entities(
 @router.get("/{result_set_id}/co-mentions", response_model=CoMentionsResponse)
 def get_co_mentioned_entities(
     result_set_id: int,
+    user=Depends(require_user),
     entity_id: int = Query(...),
     window: str = Query("document", regex="^(chunk|document)$"),
     limit: int = Query(20, ge=1, le=100),
 ):
     """Entities that co-occur with target entity within result set."""
+    assert_result_set_owned(result_set_id, user["sub"])
     conn = get_conn()
     try:
         meta = _get_result_set_metadata(conn, result_set_id)
@@ -1971,6 +1999,7 @@ def get_co_mentioned_entities(
 @router.get("/{result_set_id}/date-facets", response_model=DateFacetsResponse)
 def get_date_facets(
     result_set_id: int,
+    user=Depends(require_user),
     granularity: str = Query("year", regex="^(year|month)$"),
     time_basis: str = Query("mentioned_date", regex="^(mentioned_date|document_date)$"),
     limit: int = Query(50, ge=1, le=200),
@@ -1983,6 +2012,7 @@ def get_date_facets(
     
     Returns buckets ordered by date (earliest first).
     """
+    assert_result_set_owned(result_set_id, user["sub"])
     conn = get_conn()
     try:
         meta = _get_result_set_metadata(conn, result_set_id)
@@ -2083,6 +2113,7 @@ def get_date_facets(
 @router.get("/{result_set_id}/place-facets", response_model=PlaceFacetsResponse)
 def get_place_facets(
     result_set_id: int,
+    user=Depends(require_user),
     limit: int = Query(30, ge=1, le=100),
 ):
     """
@@ -2090,6 +2121,7 @@ def get_place_facets(
     
     Returns top places mentioned in the result set, ordered by mention count.
     """
+    assert_result_set_owned(result_set_id, user["sub"])
     conn = get_conn()
     try:
         meta = _get_result_set_metadata(conn, result_set_id)

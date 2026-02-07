@@ -9,6 +9,7 @@ V7 features (extends V6):
 - Stop gate validation: verifies all claims are grounded
 - Expanded summary: output includes claims with their citations
 """
+import math
 import sys
 import os
 import time
@@ -28,7 +29,10 @@ REPO_ROOT = Path(__file__).parent.parent.parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from app.routes.auth_cognito import require_user
 from app.services.db import get_conn
+from app.services.session_ownership import assert_session_owned
+from fastapi import Depends
 
 router = APIRouter()
 
@@ -40,7 +44,8 @@ router = APIRouter()
 class ChatRequest(BaseModel):
     """Request to send a chat message."""
     message: str
-    pre_bundling_mode: str = "off"  # "off", "passthrough", "micro", "semantic"
+    pre_bundling_mode: str = "micro"  # "off", "passthrough", "micro", "semantic" (default: micro)
+    bottleneck_grading_mode: str = "score"  # "score", "absolute", "tournament" (default: score - fastest)
 
 
 class Citation(BaseModel):
@@ -93,6 +98,29 @@ class V7Stats(BaseModel):
     claims_dropped: int = 0
 
 
+class CitationDetail(BaseModel):
+    """Detail for a single citation label, mapping to a document + page."""
+    chunk_id: int
+    document_id: Optional[int] = None
+    page: Optional[int] = None
+
+
+class V9Meta(BaseModel):
+    """V9-specific metadata attached to assistant messages."""
+    intent: Optional[str] = None
+    confidence: Optional[str] = None
+    can_think_deeper: bool = False
+    remaining_gaps: List[str] = []
+    suggestion: str = ""
+    elapsed_ms: float = 0.0
+    run_id: Optional[int] = None
+    evidence_set_id: Optional[int] = None
+    cited_chunk_ids: List[int] = []
+    citation_map: Dict[str, CitationDetail] = {}
+    scope_meta: Optional[Dict[str, Any]] = None
+    escalations: List[Dict[str, Any]] = []
+
+
 class ChatMessage(BaseModel):
     """A message in the chat history."""
     id: int
@@ -102,6 +130,7 @@ class ChatMessage(BaseModel):
     claims: Optional[List[Claim]] = None
     members: Optional[List[Member]] = None
     v7_stats: Optional[V7Stats] = None
+    v9_meta: Optional[V9Meta] = None
     result_set_id: Optional[int] = None
     created_at: datetime
 
@@ -135,7 +164,7 @@ def _parse_page_number(page: Any) -> Optional[int]:
 
 
 
-def run_v7_chat_query(conn, session_id: int, question: str, pre_bundling_mode: str = "off") -> Dict[str, Any]:
+def run_v7_chat_query(conn, session_id: int, question: str, pre_bundling_mode: str = "micro", bottleneck_grading_mode: str = "score") -> Dict[str, Any]:
     """
     Run the V7 workflow (V6 + citation enforcement) and return structured results.
     
@@ -144,6 +173,7 @@ def run_v7_chat_query(conn, session_id: int, question: str, pre_bundling_mode: s
         session_id: Session ID for result set creation
         question: User's question
         pre_bundling_mode: Pre-bundling mode for concordance-aware evidence grouping
+        bottleneck_grading_mode: How to score evidence at bottleneck (score, absolute, tournament)
     
     Returns:
         Dictionary with answer, claims, members, stats, and result_set_id
@@ -184,6 +214,7 @@ def run_v7_chat_query(conn, session_id: int, question: str, pre_bundling_mode: s
         drop_uncited_claims=True,
         verbose=True,  # Enable logging to see what's happening
         pre_bundling_mode=pre_bundling_mode,
+        bottleneck_grading_mode=bottleneck_grading_mode,
     )
     
     elapsed_ms = (time.time() - start_time) * 1000
@@ -467,7 +498,7 @@ def build_workflow_actions_v7(result, total_elapsed_ms: float) -> List[WorkflowA
 # =============================================================================
 
 @router.post("/{session_id}/chat", response_model=ChatResponse)
-def chat(session_id: int, req: ChatRequest):
+def chat(session_id: int, req: ChatRequest, user=Depends(require_user)):
     """
     Send a chat message and get a V7-powered response.
     
@@ -485,6 +516,7 @@ def chat(session_id: int, req: ChatRequest):
     Returns:
         ChatResponse with user message, assistant response, and V7 stats
     """
+    assert_session_owned(session_id, user["sub"])
     message = req.message.strip()
     if not message:
         raise HTTPException(status_code=400, detail="Message cannot be empty")
@@ -517,7 +549,7 @@ def chat(session_id: int, req: ChatRequest):
             conn.commit()
         
         # Run V7 workflow
-        v7_result = run_v7_chat_query(conn, session_id, message, pre_bundling_mode=req.pre_bundling_mode)
+        v7_result = run_v7_chat_query(conn, session_id, message, pre_bundling_mode=req.pre_bundling_mode, bottleneck_grading_mode=req.bottleneck_grading_mode)
         
         with conn.cursor() as cur:
             # Store assistant message with V7 results
@@ -528,6 +560,7 @@ def chat(session_id: int, req: ChatRequest):
                 "is_responsive": v7_result["is_responsive"],
                 "citation_validation_passed": v7_result["stats"].citation_validation_passed,
                 "pre_bundling_mode": req.pre_bundling_mode,
+                "bottleneck_grading_mode": req.bottleneck_grading_mode,
             }
             
             cur.execute(
@@ -573,20 +606,17 @@ def chat(session_id: int, req: ChatRequest):
 
 
 @router.get("/{session_id}/chat/history", response_model=List[ChatMessage])
-def get_chat_history(session_id: int):
+def get_chat_history(session_id: int, user=Depends(require_user)):
     """
     Get the chat history for a session.
     
     Returns messages with their V7 metadata (claims, members, stats) reconstructed
     from the stored metadata.
     """
+    assert_session_owned(session_id, user["sub"])
     conn = get_conn()
     try:
         with conn.cursor() as cur:
-            # Verify session exists
-            cur.execute("SELECT 1 FROM research_sessions WHERE id = %s", (session_id,))
-            if not cur.fetchone():
-                raise HTTPException(status_code=404, detail="Session not found")
             
             cur.execute(
                 """
@@ -625,6 +655,34 @@ def get_chat_history(session_id: int):
                 # Extract claims and members from metadata
                 claims = metadata.get("claims", [])
                 members = metadata.get("members", [])
+
+                # Build V9 metadata if present
+                v9_meta = None
+                if metadata.get("v9"):
+                    # Reconstruct citation_map from stored metadata
+                    stored_cit_map = metadata.get("citation_map", {})
+                    cit_details = {}
+                    for label, detail in stored_cit_map.items():
+                        if isinstance(detail, dict):
+                            cit_details[label] = CitationDetail(
+                                chunk_id=detail.get("chunk_id", 0),
+                                document_id=detail.get("document_id"),
+                                page=detail.get("page"),
+                            )
+                    v9_meta = V9Meta(
+                        intent=metadata.get("intent"),
+                        confidence=metadata.get("confidence"),
+                        can_think_deeper=metadata.get("can_think_deeper", False),
+                        remaining_gaps=metadata.get("remaining_gaps", []),
+                        suggestion=metadata.get("suggestion", ""),
+                        elapsed_ms=metadata.get("elapsed_ms", 0.0),
+                        run_id=metadata.get("run_id"),
+                        evidence_set_id=metadata.get("evidence_set_id"),
+                        cited_chunk_ids=metadata.get("cited_chunk_ids", []),
+                        citation_map=cit_details,
+                        scope_meta=metadata.get("scope_meta"),
+                        escalations=metadata.get("escalations", []),
+                    )
                 
                 messages.append(ChatMessage(
                     id=row[0],
@@ -635,6 +693,7 @@ def get_chat_history(session_id: int):
                     members=members if members else None,
                     result_set_id=row[4],
                     v7_stats=v7_stats,
+                    v9_meta=v9_meta,
                     created_at=row[6],
                 ))
             
@@ -644,7 +703,7 @@ def get_chat_history(session_id: int):
 
 
 @router.get("/debug/openai-test")
-def test_openai_connection():
+def test_openai_connection(user=Depends(require_user)):
     """
     Diagnostic endpoint to test OpenAI API connectivity.
     
@@ -707,7 +766,8 @@ def _run_v7_with_progress(
     session_id: int,
     question: str,
     progress_queue: queue.Queue,
-    pre_bundling_mode: str = "off",
+    pre_bundling_mode: str = "micro",
+    bottleneck_grading_mode: str = "score",
 ) -> Dict[str, Any]:
     """
     Run V7 query with progress callback that pushes events to queue.
@@ -745,6 +805,7 @@ def _run_v7_with_progress(
             verbose=True,
             progress_callback=progress_callback,
             pre_bundling_mode=pre_bundling_mode,
+            bottleneck_grading_mode=bottleneck_grading_mode,
         )
         
         elapsed_ms = (time.time() - start_time) * 1000
@@ -760,7 +821,7 @@ def _run_v7_with_progress(
                     "span_id": str(span_idx),
                     "chunk_id": span.chunk_id,
                     "document_id": span.doc_id,
-                    "page_number": span.page if isinstance(span.page, int) else None,
+                    "page_number": _parse_page_number(span.page) if hasattr(span, 'page') else None,
                     "quote": span.span_text[:200] if hasattr(span, 'span_text') else "",
                     "source_name": span.source_label if hasattr(span, 'source_label') else None,
                 }
@@ -769,7 +830,7 @@ def _run_v7_with_progress(
                     "span_id": str(span_idx),
                     "chunk_id": span.get('chunk_id'),
                     "document_id": span.get('doc_id'),
-                    "page_number": span.get('page'),
+                    "page_number": _parse_page_number(span.get('page')),
                     "quote": span.get('span_text', '')[:200],
                     "source_name": span.get('source_label'),
                 }
@@ -939,7 +1000,8 @@ def _run_v7_with_progress(
 def _sse_event_stream(
     session_id: int,
     message: str,
-    pre_bundling_mode: str = "off",
+    pre_bundling_mode: str = "micro",
+    bottleneck_grading_mode: str = "score",
 ) -> Generator[str, None, None]:
     """
     Generator that yields SSE events as V7 progresses.
@@ -950,7 +1012,7 @@ def _sse_event_stream(
     
     def run_v7_thread():
         """Run V7 in a thread, pushing progress to queue."""
-        result = _run_v7_with_progress(conn, session_id, message, progress_queue, pre_bundling_mode=pre_bundling_mode)
+        result = _run_v7_with_progress(conn, session_id, message, progress_queue, pre_bundling_mode=pre_bundling_mode, bottleneck_grading_mode=bottleneck_grading_mode)
         result_holder.append(result)
         progress_queue.put({"type": "done"})
     
@@ -1007,8 +1069,47 @@ def _sse_event_stream(
     conn.close()
 
 
+@router.delete("/{session_id}/chat/last-pending")
+def delete_last_pending_message(session_id: int, user=Depends(require_user)):
+    """
+    Delete the last user message in a session if it has no assistant response after it.
+
+    This is used by the frontend when a streaming request is aborted, so the
+    orphaned user message (which was stored before the SSE stream started)
+    doesn't linger in the chat history.
+    """
+    assert_session_owned(session_id, user["sub"])
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+
+            # Get the most recent message in this session
+            cur.execute(
+                """
+                SELECT id, role FROM research_messages
+                WHERE session_id = %s
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (session_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return {"deleted": False, "reason": "no messages"}
+
+            msg_id, role = row
+            if role != "user":
+                return {"deleted": False, "reason": "last message is not a user message"}
+
+            cur.execute("DELETE FROM research_messages WHERE id = %s", (msg_id,))
+            conn.commit()
+            return {"deleted": True, "message_id": msg_id}
+    finally:
+        conn.close()
+
+
 @router.post("/{session_id}/chat/stream")
-def chat_stream(session_id: int, req: ChatRequest):
+def chat_stream(session_id: int, req: ChatRequest, user=Depends(require_user)):
     """
     Streaming chat endpoint that yields Server-Sent Events (SSE) as V7 progresses.
     
@@ -1020,6 +1121,7 @@ def chat_stream(session_id: int, req: ChatRequest):
     
     Use EventSource in the browser to receive these events.
     """
+    assert_session_owned(session_id, user["sub"])
     message = req.message.strip()
     if not message:
         raise HTTPException(status_code=400, detail="Message cannot be empty")
@@ -1051,7 +1153,7 @@ def chat_stream(session_id: int, req: ChatRequest):
         conn.close()
     
     return StreamingResponse(
-        _sse_event_stream(session_id, message, pre_bundling_mode=req.pre_bundling_mode),
+        _sse_event_stream(session_id, message, pre_bundling_mode=req.pre_bundling_mode, bottleneck_grading_mode=req.bottleneck_grading_mode),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -1059,3 +1161,566 @@ def chat_stream(session_id: int, req: ChatRequest):
             "X-Accel-Buffering": "no",  # Disable nginx buffering
         },
     )
+
+
+# =============================================================================
+# V9 Session-Aware Chat Endpoint
+# =============================================================================
+
+class V9ChatRequest(BaseModel):
+    """Request for V9 session-aware chat."""
+    text: str
+    action: Optional[str] = "default"  # "default" | "think_deeper"
+    carry_context: Optional[Dict[str, Any]] = None  # forwarded entity/intent context for escalations
+
+
+class V9RunSummary(BaseModel):
+    """Compact run summary for UI run history."""
+    run_id: int
+    query_index: int
+    query_text: str
+    label: Optional[str] = None
+    status: str = "completed"
+    evidence_set_id: Optional[int] = None
+    evidence_summary: Optional[str] = None
+
+
+class ScopeMetaResponse(BaseModel):
+    """Evidence set scope context for follow-up answers."""
+    origin_query: str
+    origin_run_id: Optional[int] = None
+    evidence_set_id: int
+    chunk_count: int
+    document_count: int
+    top_entities: List[Dict[str, Any]] = []
+    time_range: Optional[str] = None
+
+
+class EscalationOptionResponse(BaseModel):
+    """A structured next-action offered when follow-up evidence is insufficient."""
+    action: str          # "think_deeper" | "new_retrieval" | "show_evidence"
+    label: str
+    description: str
+    prefilled_query: Optional[str] = None
+    carry_entities: List[Dict[str, Any]] = []
+    recommended: bool = False
+
+
+class ScopeOverrideInfoResponse(BaseModel):
+    """Whether the query overrode the user-selected scope."""
+    overridden: bool = False
+    selected_scope: Optional[Dict[str, Any]] = None
+    run_scope: Optional[Dict[str, Any]] = None
+
+
+class ExpansionInfoResponse(BaseModel):
+    """Stage 1.5 concordance expansion status."""
+    policy: str = "venona_vassiliev_only"
+    collections: List[str] = []
+    triggered: bool = False
+    reason: Optional[str] = None
+
+
+class V9ChatResponse(BaseModel):
+    """Response from V9 session-aware chat."""
+    intent: str                         # "new_retrieval" | "follow_up" | "think_deeper"
+    answer: str
+    cited_chunk_ids: List[int] = []
+    confidence: str = "medium"
+
+    # Run metadata
+    active_run_id: Optional[int] = None
+    active_run_status: str = "completed"
+    active_evidence_set_id: Optional[int] = None
+    referenced_run_id: Optional[int] = None
+    referenced_evidence_set_id: Optional[int] = None
+    can_think_deeper: bool = False
+
+    # Sufficiency (remaining gaps + suggested next actions)
+    remaining_gaps: List[str] = []
+    next_best_actions: List[str] = []
+
+    # Run history for UI (recent runs in this session)
+    run_history: List[V9RunSummary] = []
+
+    # Routing info
+    routing_reasoning: str = ""
+    routing_confidence: float = 0.0
+
+    # Citation map: inline label -> {chunk_id, document_id, page} for PDF viewer links
+    citation_map: Dict[str, CitationDetail] = {}
+
+    # Follow-up suggestion
+    suggestion: str = ""
+
+    # Follow-up scope context (only present for follow_up intent)
+    scope_meta: Optional[ScopeMetaResponse] = None
+    escalations: List[EscalationOptionResponse] = []
+
+    # Scope override info (present for new_retrieval when scope differs from session)
+    scope_override: Optional[ScopeOverrideInfoResponse] = None
+    expansion_info: Optional[ExpansionInfoResponse] = None
+
+    # Timing
+    elapsed_ms: float = 0.0
+
+
+@router.post("/{session_id}/v9/message/stream")
+async def v9_message_stream(session_id: int, req: V9ChatRequest, user=Depends(require_user)):
+    """
+    V9 session-aware message endpoint with SSE streaming progress.
+
+    Returns a Server-Sent Events stream with:
+    - event: progress — step-by-step status updates (routing, entity_resolution, tool_call, etc.)
+    - event: evidence_update — newly discovered evidence bullets with source links
+    - event: result — final V9ChatResponse JSON (same schema as the sync endpoint)
+    - event: error — if something goes wrong
+
+    Body:
+        { "text": "...", "action": "default" | "think_deeper" }
+    """
+    assert_session_owned(session_id, user["sub"])
+    text = req.text.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Text cannot be empty")
+
+    explicit_action = None
+    if req.action == "think_deeper":
+        explicit_action = "think_deeper"
+    carry_context = req.carry_context
+
+    conn = get_conn()
+
+    # Verify session + persist user message (same as sync endpoint)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM research_sessions WHERE id = %s", (session_id,))
+            if not cur.fetchone():
+                conn.close()
+                raise HTTPException(status_code=404, detail="Session not found")
+            cur.execute(
+                "INSERT INTO research_messages (session_id, role, content) "
+                "VALUES (%s, 'user', %s) RETURNING id",
+                (session_id, text),
+            )
+            user_msg_id = cur.fetchone()[0]
+            conn.commit()
+    except HTTPException:
+        raise
+    except Exception as e:
+        conn.close()
+        raise HTTPException(status_code=500, detail=f"DB error: {e}")
+
+    progress_queue: queue.Queue = queue.Queue()
+
+    def progress_callback(step, status, message, details=None):
+        """Push progress events onto the queue for the SSE generator."""
+        progress_queue.put({
+            "type": "progress" if step != "evidence_update" else "evidence_update",
+            "step": step,
+            "status": status,
+            "message": message,
+            "details": details or {},
+            "timestamp": time.time(),
+        })
+
+    def run_v9_thread():
+        """Run V9 dispatch in a background thread."""
+        try:
+            from retrieval.agent.v9_dispatch import dispatch_message
+            result = dispatch_message(
+                conn, session_id, text,
+                explicit_action=explicit_action,
+                carry_context=carry_context,
+                verbose=True,
+                progress_callback=progress_callback,
+            )
+            progress_queue.put({"type": "done", "result": result})
+        except Exception as e:
+            import traceback
+            progress_queue.put({
+                "type": "error",
+                "message": str(e),
+                "traceback": traceback.format_exc(),
+            })
+
+    # Start V9 in background thread
+    v9_thread = threading.Thread(target=run_v9_thread, daemon=True)
+    v9_thread.start()
+
+    def _safe_float(x, default: float = 0.0) -> float:
+        if x is None:
+            return default
+        try:
+            f = float(x)
+            return f if math.isfinite(f) else default
+        except (TypeError, ValueError):
+            return default
+
+    def event_generator():
+        """Yield SSE events from the progress queue."""
+        try:
+            while True:
+                try:
+                    event = progress_queue.get(timeout=120)
+                except queue.Empty:
+                    # Keepalive to prevent ALB timeout
+                    yield ": keepalive\n\n"
+                    continue
+
+                if event["type"] == "progress":
+                    yield f"event: progress\ndata: {json.dumps(event)}\n\n"
+
+                elif event["type"] == "evidence_update":
+                    yield f"event: evidence_update\ndata: {json.dumps(event)}\n\n"
+
+                elif event["type"] == "done":
+                    result = event["result"]
+
+                    # Build citation map for storage
+                    raw_cit_map = result.citation_map or {}
+                    cit_map_for_storage = {
+                        label: {"chunk_id": d["chunk_id"], "document_id": d.get("document_id"), "page": d.get("page")}
+                        for label, d in raw_cit_map.items()
+                    }
+
+                    # Persist assistant message
+                    try:
+                        v9_metadata = {
+                            "v9": True,
+                            "intent": result.intent,
+                            "confidence": result.confidence,
+                            "cited_chunk_ids": result.cited_chunk_ids,
+                            "can_think_deeper": result.can_think_deeper,
+                            "suggestion": result.suggestion,
+                            "elapsed_ms": _safe_float(result.elapsed_ms),
+                            "run_id": result.run_id,
+                            "evidence_set_id": result.evidence_set_id,
+                            "citation_map": cit_map_for_storage,
+                            "scope_meta": result.scope_meta.to_dict() if result.scope_meta else None,
+                            "escalations": [e.to_dict() for e in result.escalations] if result.escalations else [],
+                        }
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                "INSERT INTO research_messages (session_id, role, content, metadata) "
+                                "VALUES (%s, 'assistant', %s, %s)",
+                                (session_id, result.answer, Json(v9_metadata)),
+                            )
+                            conn.commit()
+                    except Exception as save_err:
+                        print(f"[V9 Stream] Error saving assistant message: {save_err}", file=sys.stderr)
+
+                    # Build final response (same structure as sync endpoint)
+                    from retrieval.agent.v9_session import load_recent_runs
+                    remaining_gaps: List[str] = []
+                    next_best_actions: List[str] = []
+                    if result.v9_result and result.v9_result.sufficiency:
+                        suf = result.v9_result.sufficiency
+                        remaining_gaps = suf.remaining_gaps or []
+                        next_best_actions = suf.next_best_actions_if_more_time or []
+
+                    run_history: List[Dict] = []
+                    try:
+                        recent = load_recent_runs(conn, session_id, limit=10)
+                        for run in recent.runs:
+                            run_history.append({
+                                "run_id": run.run_id,
+                                "query_index": run.query_index,
+                                "query_text": run.query_text,
+                                "label": run.label,
+                                "status": run.status,
+                                "evidence_set_id": run.evidence_set_id,
+                                "evidence_summary": run.evidence_summary,
+                            })
+                    except Exception:
+                        pass
+
+                    # Build scope_meta and escalations for follow-up responses
+                    scope_meta_dict = None
+                    if result.scope_meta:
+                        scope_meta_dict = result.scope_meta.to_dict()
+                    escalations_list = [e.to_dict() for e in result.escalations] if result.escalations else []
+
+                    # Build scope override and expansion info for new_retrieval runs
+                    scope_override_dict = None
+                    expansion_info_dict = None
+                    if result.intent == "new_retrieval" and result.run_id:
+                        try:
+                            from retrieval.agent.v9_session import load_session as _ls, load_run as _lr, normalize_scope as _ns
+                            _session = _ls(conn, session_id)
+                            _run = _lr(conn, result.run_id)
+                            if _session and _run and _run.run_scope_json:
+                                rsj = _run.run_scope_json
+                                overridden = _ns(_session.scope_json) != _ns(rsj)
+                                scope_override_dict = {
+                                    "overridden": overridden,
+                                    "selected_scope": _session.scope_json if overridden else None,
+                                    "run_scope": rsj if overridden else None,
+                                }
+                                exp = rsj.get("expansion")
+                                if exp:
+                                    expansion_info_dict = {
+                                        "policy": exp.get("policy", "venona_vassiliev_only"),
+                                        "collections": exp.get("collections", []),
+                                        "triggered": exp.get("triggered", False),
+                                        "reason": exp.get("reason"),
+                                    }
+                        except Exception as _scope_err:
+                            print(f"[SSE] Error building scope info: {_scope_err}", file=sys.stderr)
+
+                    routing = result.router_decision
+                    response_dict = {
+                        "intent": result.intent,
+                        "answer": result.answer,
+                        "cited_chunk_ids": result.cited_chunk_ids or [],
+                        "confidence": result.confidence,
+                        "active_run_id": result.run_id,
+                        "active_run_status": result.run_status,
+                        "active_evidence_set_id": result.evidence_set_id,
+                        "referenced_run_id": routing.ref_run_id if routing else None,
+                        "referenced_evidence_set_id": routing.ref_evidence_set_id if routing else None,
+                        "can_think_deeper": result.can_think_deeper,
+                        "remaining_gaps": remaining_gaps,
+                        "next_best_actions": next_best_actions,
+                        "run_history": run_history,
+                        "routing_reasoning": routing.reasoning if routing else "",
+                        "routing_confidence": _safe_float(routing.confidence if routing else None, 0.0),
+                        "citation_map": cit_map_for_storage,
+                        "suggestion": result.suggestion or "",
+                        "scope_meta": scope_meta_dict,
+                        "escalations": escalations_list,
+                        "scope_override": scope_override_dict,
+                        "expansion_info": expansion_info_dict,
+                        "elapsed_ms": _safe_float(result.elapsed_ms),
+                    }
+                    yield f"event: result\ndata: {json.dumps(response_dict)}\n\n"
+                    break
+
+                elif event["type"] == "error":
+                    yield f"event: error\ndata: {json.dumps({'error': event['message']})}\n\n"
+                    break
+        finally:
+            conn.close()
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
+@router.post("/{session_id}/v9/message", response_model=V9ChatResponse)
+def v9_message(session_id: int, req: V9ChatRequest, user=Depends(require_user)):
+    """
+    V9 session-aware message endpoint.
+
+    Routes to one of three execution paths:
+    - NEW_RETRIEVAL: full search with evidence set creation (default)
+    - FOLLOW_UP: answer from existing evidence set, no tools
+    - THINK_DEEPER: resume paused run with extended budget
+
+    Body:
+        { "text": "...", "action": "default" | "think_deeper" }
+
+    Response includes intent, answer, citations, run metadata, and
+    a can_think_deeper flag indicating whether the run can be resumed.
+    """
+    assert_session_owned(session_id, user["sub"])
+    text = req.text.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Text cannot be empty")
+
+    # Map action
+    explicit_action = None
+    if req.action == "think_deeper":
+        explicit_action = "think_deeper"
+
+    conn = get_conn()
+    try:
+        # Verify session exists
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM research_sessions WHERE id = %s", (session_id,))
+            if not cur.fetchone():
+                raise HTTPException(status_code=404, detail="Session not found")
+
+            # Persist user message into research_messages so chat history works
+            cur.execute(
+                "INSERT INTO research_messages (session_id, role, content) "
+                "VALUES (%s, 'user', %s) RETURNING id",
+                (session_id, text),
+            )
+            user_msg_id = cur.fetchone()[0]
+            conn.commit()
+
+        from retrieval.agent.v9_dispatch import dispatch_message
+        from retrieval.agent.v9_session import load_recent_runs
+
+        result = dispatch_message(
+            conn, session_id, text,
+            explicit_action=explicit_action,
+            carry_context=req.carry_context,
+            verbose=True,
+        )
+
+        # Extract sufficiency data if available
+        remaining_gaps: List[str] = []
+        next_best_actions: List[str] = []
+        if result.v9_result and result.v9_result.sufficiency:
+            suf = result.v9_result.sufficiency
+            remaining_gaps = suf.remaining_gaps or []
+            next_best_actions = suf.next_best_actions_if_more_time or []
+
+        # Load run history for UI
+        run_history: List[V9RunSummary] = []
+        try:
+            recent = load_recent_runs(conn, session_id, limit=10)
+            for run in recent.runs:
+                run_history.append(V9RunSummary(
+                    run_id=run.run_id,
+                    query_index=run.query_index,
+                    query_text=run.query_text,
+                    label=run.label,
+                    status=run.status,
+                    evidence_set_id=run.evidence_set_id,
+                    evidence_summary=run.evidence_summary,
+                ))
+        except Exception:
+            pass  # run history is best-effort
+
+        # Persist assistant message first so the user sees the answer even if response fails later
+        def _safe_float(x, default: float = 0.0) -> float:
+            if x is None:
+                return default
+            try:
+                f = float(x)
+                return f if math.isfinite(f) else default
+            except (TypeError, ValueError):
+                return default
+
+        # Convert citation_map to serializable format
+        raw_cit_map = result.citation_map or {}
+        cit_map_for_storage = {
+            label: {"chunk_id": d["chunk_id"], "document_id": d.get("document_id"), "page": d.get("page")}
+            for label, d in raw_cit_map.items()
+        }
+
+        try:
+            v9_metadata = {
+                "v9": True,
+                "intent": result.intent,
+                "confidence": result.confidence,
+                "cited_chunk_ids": result.cited_chunk_ids,
+                "can_think_deeper": result.can_think_deeper,
+                "remaining_gaps": remaining_gaps,
+                "suggestion": result.suggestion,
+                "elapsed_ms": _safe_float(result.elapsed_ms),
+                "run_id": result.run_id,
+                "evidence_set_id": result.evidence_set_id,
+                "citation_map": cit_map_for_storage,
+                "scope_meta": result.scope_meta.to_dict() if result.scope_meta else None,
+                "escalations": [e.to_dict() for e in result.escalations] if result.escalations else [],
+            }
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO research_messages (session_id, role, content, metadata) "
+                    "VALUES (%s, 'assistant', %s, %s)",
+                    (session_id, result.answer, Json(v9_metadata)),
+                )
+                conn.commit()
+        except Exception as save_err:
+            print(f"[V9] Error saving assistant message: {save_err}", file=sys.stderr)
+
+        # Build CitationDetail objects for the response
+        cit_details = {
+            label: CitationDetail(**d) for label, d in cit_map_for_storage.items()
+        }
+
+        # Build scope_meta and escalations for follow-up responses
+        scope_meta_resp = None
+        escalations_resp = []
+        if result.scope_meta:
+            scope_meta_resp = ScopeMetaResponse(
+                origin_query=result.scope_meta.origin_query,
+                origin_run_id=result.scope_meta.origin_run_id,
+                evidence_set_id=result.scope_meta.evidence_set_id,
+                chunk_count=result.scope_meta.chunk_count,
+                document_count=result.scope_meta.document_count,
+                top_entities=result.scope_meta.top_entities,
+                time_range=result.scope_meta.time_range,
+            )
+        if result.escalations:
+            escalations_resp = [
+                EscalationOptionResponse(
+                    action=e.action,
+                    label=e.label,
+                    description=e.description,
+                    prefilled_query=e.prefilled_query,
+                    carry_entities=e.carry_entities,
+                    recommended=e.recommended,
+                )
+                for e in result.escalations
+            ]
+
+        # Build scope override and expansion info for new_retrieval runs
+        scope_override_resp = None
+        expansion_info_resp = None
+        if result.intent == "new_retrieval" and result.run_id:
+            try:
+                from retrieval.agent.v9_session import load_session, load_run, normalize_scope
+                session = load_session(conn, session_id)
+                run_record = load_run(conn, result.run_id)
+                if session and run_record and run_record.run_scope_json:
+                    rsj = run_record.run_scope_json
+                    overridden = normalize_scope(session.scope_json) != normalize_scope(rsj)
+                    scope_override_resp = ScopeOverrideInfoResponse(
+                        overridden=overridden,
+                        selected_scope=session.scope_json if overridden else None,
+                        run_scope=rsj if overridden else None,
+                    )
+                    # Expansion info
+                    exp = rsj.get("expansion")
+                    if exp:
+                        expansion_info_resp = ExpansionInfoResponse(
+                            policy=exp.get("policy", "venona_vassiliev_only"),
+                            collections=exp.get("collections", []),
+                            triggered=exp.get("triggered", False),
+                            reason=exp.get("reason"),
+                        )
+            except Exception as scope_err:
+                print(f"[V9] Error building scope info: {scope_err}", file=sys.stderr)
+
+        # Build response with JSON-safe numbers (no NaN/Inf) so client never gets 500 on serialize
+        routing = result.router_decision
+        response = V9ChatResponse(
+            intent=result.intent,
+            answer=result.answer,
+            cited_chunk_ids=result.cited_chunk_ids or [],
+            confidence=result.confidence,
+            active_run_id=result.run_id,
+            active_run_status=result.run_status,
+            active_evidence_set_id=result.evidence_set_id,
+            referenced_run_id=routing.ref_run_id if routing else None,
+            referenced_evidence_set_id=routing.ref_evidence_set_id if routing else None,
+            can_think_deeper=result.can_think_deeper,
+            remaining_gaps=remaining_gaps,
+            next_best_actions=next_best_actions,
+            run_history=run_history,
+            routing_reasoning=routing.reasoning if routing else "",
+            routing_confidence=_safe_float(routing.confidence if routing else None, 0.0),
+            citation_map=cit_details,
+            suggestion=result.suggestion or "",
+            scope_meta=scope_meta_resp,
+            escalations=escalations_resp,
+            scope_override=scope_override_resp,
+            expansion_info=expansion_info_resp,
+            elapsed_ms=_safe_float(result.elapsed_ms),
+        )
+        return response
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=500,
+            detail=f"V9 dispatch error: {str(e)}",
+        )
+    finally:
+        conn.close()

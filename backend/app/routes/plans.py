@@ -7,11 +7,15 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from psycopg2.extras import Json
 
+from fastapi import Depends
+
+from app.routes.auth_cognito import require_user
 from app.services.db import get_conn
 from app.services.planner import render_plan_summary, propose_plan
 from app.services.executor import execute_plan
 from app.services.db import get_dsn
 from app.services.schema import get_table_columns, plan_user_utterance_expr, has_column
+from app.services.session_ownership import assert_plan_owned
 import json
 
 router = APIRouter()
@@ -83,8 +87,9 @@ class ClarifyPlanRequest(BaseModel):
 # =============================================================================
 
 @router.get("/{plan_id}", response_model=Plan)
-def get_plan(plan_id: int):
+def get_plan(plan_id: int, user=Depends(require_user)):
     """Get a plan by ID."""
+    assert_plan_owned(plan_id, user["sub"])
     conn = get_conn()
     try:
         cols = get_table_columns(get_dsn(), "research_plans")
@@ -136,8 +141,9 @@ def get_plan(plan_id: int):
 
 
 @router.post("/{plan_id}/approve", response_model=Plan)
-def approve_plan(plan_id: int):
+def approve_plan(plan_id: int, user=Depends(require_user)):
     """Approve a proposed plan."""
+    assert_plan_owned(plan_id, user["sub"])
     conn = get_conn()
     try:
         cols = get_table_columns(get_dsn(), "research_plans")
@@ -238,8 +244,9 @@ def approve_plan(plan_id: int):
 
 
 @router.post("/{plan_id}/execute", response_model=ExecutePlanResponse)
-def execute_plan_endpoint(plan_id: int):
+def execute_plan_endpoint(plan_id: int, user=Depends(require_user)):
     """Execute an approved plan."""
+    assert_plan_owned(plan_id, user["sub"])
     conn = get_conn()
     try:
         cols = get_table_columns(get_dsn(), "research_plans")
@@ -313,12 +320,13 @@ def execute_plan_endpoint(plan_id: int):
 
 
 @router.post("/{plan_id}/clarify", response_model=Plan)
-def clarify_plan(plan_id: int, req: ClarifyPlanRequest):
+def clarify_plan(plan_id: int, req: ClarifyPlanRequest, user=Depends(require_user)):
     """
     Resolve a clarification request for a plan by choosing one option.
 
     This creates a new plan (via planner) in the same session, and returns it.
     """
+    assert_plan_owned(plan_id, user["sub"])
     if req.choice_id is None and (req.choice_text is None or not req.choice_text.strip()):
         raise HTTPException(status_code=400, detail="Provide choice_id or choice_text")
 

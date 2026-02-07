@@ -78,6 +78,7 @@ export interface Session {
   created_at: string;
   message_count?: number;
   last_activity?: string;
+  scope_json?: UserSelectedScope;
 }
 
 /**
@@ -129,6 +130,7 @@ export interface Document {
   source_ref?: string;
   volume?: string;
   page_count?: number;
+  pdf_url?: string;
   metadata?: Record<string, unknown>;
   created_at: string;
 }
@@ -262,7 +264,36 @@ export interface V6Stats {
 }
 
 /**
- * A message in the chat history with V6 metadata.
+ * Detail for a single inline citation label, mapping to a document + page.
+ */
+export interface CitationDetail {
+  chunk_id: number;
+  document_id?: number;
+  page?: number;
+}
+
+/**
+ * V9-specific metadata attached to assistant messages.
+ */
+export interface V9Meta {
+  intent?: string;
+  confidence?: string;
+  can_think_deeper: boolean;
+  remaining_gaps: string[];
+  suggestion: string;
+  elapsed_ms: number;
+  run_id?: number;
+  evidence_set_id?: number;
+  cited_chunk_ids: number[];
+  citation_map?: Record<string, CitationDetail>;
+  scope_meta?: ScopeMeta;
+  escalations?: EscalationOption[];
+  scope_override?: ScopeOverrideInfo;
+  expansion_info?: ExpansionInfo;
+}
+
+/**
+ * A message in the chat history with V6/V9 metadata.
  */
 export interface ChatMessage {
   id: number;
@@ -272,6 +303,7 @@ export interface ChatMessage {
   claims?: ChatClaim[];
   members?: ChatMember[];
   v6_stats?: V6Stats;
+  v9_meta?: V9Meta;
   result_set_id?: number;
   created_at: string;
 }
@@ -291,4 +323,191 @@ export interface ChatResponse {
   assistant_message: ChatMessage;
   is_responsive: boolean;
   result_set_id?: number;
+}
+
+// =============================================================================
+// V9 Scope & Escalation Types
+// =============================================================================
+
+/**
+ * Evidence set scope context shown during follow-up answers.
+ * Tells the user what "lens" the follow-up is operating within.
+ */
+export interface ScopeMeta {
+  origin_query: string;
+  origin_run_id?: number;
+  evidence_set_id: number;
+  chunk_count: number;
+  document_count: number;
+  top_entities: Array<{ canonical_name: string; aliases: string[] }>;
+  time_range?: string;
+}
+
+/**
+ * A structured next-action offered when follow-up evidence is insufficient.
+ */
+export interface EscalationOption {
+  action: 'think_deeper' | 'new_retrieval' | 'show_evidence';
+  label: string;
+  description: string;
+  prefilled_query?: string;
+  carry_entities: Array<{ canonical_name: string; aliases: string[] }>;
+  recommended: boolean;
+}
+
+// =============================================================================
+// Scope Window Types
+// =============================================================================
+
+export interface CollectionNode {
+  id: number;
+  slug: string;
+  title: string;
+  description?: string;
+  document_count: number;
+  chunk_count?: number;          // only with ?include_counts=1
+  documents?: DocumentNode[];    // lazy-loaded via GET /collections/{id}/documents
+  _docsLoaded?: boolean;         // client-side flag: true once documents fetched
+}
+
+export interface DocumentNode {
+  id: number;
+  source_name: string;
+  source_ref?: string;
+  volume?: string;
+  chunk_count?: number;
+}
+
+export type ScopeMode = 'full_archive' | 'custom';
+
+export interface UserSelectedScope {
+  mode: ScopeMode;
+  included_collection_ids?: number[];
+  included_document_ids?: number[];
+}
+
+export interface RunScopeInfo {
+  mode: ScopeMode;
+  included_collection_ids?: number[];
+  included_document_ids?: number[];
+  source: 'user_selected' | 'query_override';
+  reason?: string;
+  filters?: { date_from?: string; date_to?: string };
+  expansion?: ExpansionInfo;
+}
+
+export interface ExpansionInfo {
+  policy: string;
+  collections: string[];
+  triggered: boolean;
+  reason?: string;
+}
+
+export interface ScopeOverrideInfo {
+  overridden: boolean;
+  selected_scope?: UserSelectedScope;
+  run_scope?: RunScopeInfo;
+}
+
+
+// =============================================================================
+// V9 Session-Aware Types
+// =============================================================================
+
+export interface V9ChatRequest {
+  text: string;
+  action?: 'default' | 'think_deeper';
+  carry_context?: { entities?: Array<{ canonical_name: string; aliases: string[] }>; intent_hint?: string };
+}
+
+export interface V9RunSummary {
+  run_id: number;
+  query_index: number;
+  query_text: string;
+  label?: string;
+  status: string;
+  evidence_set_id?: number;
+  evidence_summary?: string;
+}
+
+export interface V9ChatResponse {
+  intent: 'new_retrieval' | 'follow_up' | 'think_deeper';
+  answer: string;
+  cited_chunk_ids: number[];
+  confidence: string;
+
+  active_run_id?: number;
+  active_run_status: string;
+  active_evidence_set_id?: number;
+  referenced_run_id?: number;
+  referenced_evidence_set_id?: number;
+  can_think_deeper: boolean;
+
+  remaining_gaps: string[];
+  next_best_actions: string[];
+
+  run_history: V9RunSummary[];
+
+  routing_reasoning: string;
+  routing_confidence: number;
+
+  /** Maps inline citation labels (e.g. "Vassiliev P4") to document details for PDF viewer linking. */
+  citation_map?: Record<string, CitationDetail>;
+
+  suggestion: string;
+
+  /** Evidence set scope context (only present for follow_up intent). */
+  scope_meta?: ScopeMeta;
+
+  /** Structured escalation options when follow-up confidence is low/insufficient. */
+  escalations?: EscalationOption[];
+
+  /** Scope override info (present for new_retrieval when scope differs from session). */
+  scope_override?: ScopeOverrideInfo;
+
+  /** Stage 1.5 concordance expansion status. */
+  expansion_info?: ExpansionInfo;
+
+  elapsed_ms: number;
+}
+
+// =============================================================================
+// V9 SSE Streaming Types
+// =============================================================================
+
+/**
+ * Progress event from V9 investigation workflow streaming.
+ */
+export interface V9ProgressEvent {
+  type: 'progress';
+  step: string;
+  status: string;
+  message: string;
+  details: Record<string, unknown>;
+  timestamp: number;
+}
+
+/**
+ * An evidence bullet discovered during investigation.
+ */
+export interface V9EvidenceBullet {
+  text: string;
+  tags: string[];
+  chunk_ids: number[];
+  doc_ids: number[];
+}
+
+/**
+ * Evidence update event carrying actual discovered evidence.
+ */
+export interface V9EvidenceUpdateEvent {
+  type: 'evidence_update';
+  step: string;
+  message: string;
+  details: {
+    bullets: V9EvidenceBullet[];
+    open_questions: string[];
+    leads: string[];
+    total_bullet_count: number;
+  };
 }

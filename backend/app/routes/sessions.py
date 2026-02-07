@@ -3,13 +3,15 @@ Session and Message endpoints
 """
 from typing import List, Optional
 from datetime import datetime
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from psycopg2.extras import Json
 
+from app.routes.auth_cognito import require_user
 from app.services.db import get_conn, get_dsn
 from app.services.planner import propose_plan, render_plan_summary
 from app.services.schema import get_table_columns, has_column
+from app.services.session_ownership import assert_session_owned
 
 router = APIRouter()
 
@@ -80,22 +82,22 @@ class SessionState(BaseModel):
 # =============================================================================
 
 @router.post("", response_model=Session)
-def create_session(req: CreateSessionRequest):
+def create_session(req: CreateSessionRequest, user=Depends(require_user)):
     """Create a new research session."""
     label = req.label.strip()
     if not label:
         raise HTTPException(status_code=400, detail="Label cannot be empty")
-    
+    sub = user["sub"]
     conn = get_conn()
     try:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO research_sessions (label)
-                VALUES (%s)
+                INSERT INTO research_sessions (label, user_sub)
+                VALUES (%s, %s)
                 RETURNING id, label, created_at
                 """,
-                (label,),
+                (label, sub),
             )
             row = cur.fetchone()
             conn.commit()
@@ -109,8 +111,9 @@ def create_session(req: CreateSessionRequest):
 
 
 @router.get("", response_model=List[Session])
-def list_sessions():
-    """List all sessions with message counts."""
+def list_sessions(user=Depends(require_user)):
+    """List all sessions with message counts (owned by current user)."""
+    sub = user["sub"]
     conn = get_conn()
     try:
         with conn.cursor() as cur:
@@ -124,9 +127,11 @@ def list_sessions():
                     MAX(m.created_at) AS last_activity
                 FROM research_sessions s
                 LEFT JOIN research_messages m ON m.session_id = s.id
+                WHERE s.user_sub = %s
                 GROUP BY s.id
                 ORDER BY COALESCE(MAX(m.created_at), s.created_at) DESC
-                """
+                """,
+                (sub,),
             )
             rows = cur.fetchall()
             return [
@@ -144,8 +149,9 @@ def list_sessions():
 
 
 @router.get("/{session_id}", response_model=Session)
-def get_session(session_id: int):
-    """Get a single session."""
+def get_session(session_id: int, user=Depends(require_user)):
+    """Get a single session including scope_json."""
+    assert_session_owned(session_id, user["sub"])
     conn = get_conn()
     try:
         with conn.cursor() as cur:
@@ -156,38 +162,118 @@ def get_session(session_id: int):
                     s.label,
                     s.created_at,
                     COUNT(m.id) AS message_count,
-                    MAX(m.created_at) AS last_activity
+                    MAX(m.created_at) AS last_activity,
+                    s.scope_json
                 FROM research_sessions s
                 LEFT JOIN research_messages m ON m.session_id = s.id
-                WHERE s.id = %s
-                GROUP BY s.id
+                WHERE s.id = %s AND s.user_sub = %s
+                GROUP BY s.id, s.scope_json
                 """,
-                (session_id,),
+                (session_id, user["sub"]),
             )
             row = cur.fetchone()
             if not row:
                 raise HTTPException(status_code=404, detail="Session not found")
+            scope = row[5]
+            if isinstance(scope, str):
+                import json as _json
+                try:
+                    scope = _json.loads(scope)
+                except Exception:
+                    scope = {"mode": "full_archive"}
+            elif scope is None:
+                scope = {"mode": "full_archive"}
             return Session(
                 id=row[0],
                 label=row[1],
                 created_at=row[2],
                 message_count=row[3],
                 last_activity=row[4],
+                scope_json=scope,
             )
     finally:
         conn.close()
 
 
-@router.get("/{session_id}/messages", response_model=List[Message])
-def get_messages(session_id: int):
-    """Get all messages in a session."""
+@router.delete("/{session_id}")
+def delete_session(session_id: int, user=Depends(require_user)):
+    """
+    Delete a session and all its related data (messages, plans).
+    """
+    assert_session_owned(session_id, user["sub"])
     conn = get_conn()
     try:
         with conn.cursor() as cur:
-            # Verify session exists
-            cur.execute("SELECT 1 FROM research_sessions WHERE id = %s", (session_id,))
-            if not cur.fetchone():
-                raise HTTPException(status_code=404, detail="Session not found")
+            cur.execute("DELETE FROM research_messages WHERE session_id = %s", (session_id,))
+            cur.execute("DELETE FROM research_plans WHERE session_id = %s", (session_id,))
+            cur.execute("DELETE FROM research_sessions WHERE id = %s AND user_sub = %s", (session_id, user["sub"]))
+            conn.commit()
+        return {"ok": True}
+    finally:
+        conn.close()
+
+
+# =============================================================================
+# Scope Management
+# =============================================================================
+
+class UpdateScopeRequest(BaseModel):
+    mode: str  # "full_archive" | "custom"
+    included_collection_ids: Optional[List[int]] = None
+    included_document_ids: Optional[List[int]] = None
+
+
+@router.post("/{session_id}/scope")
+def update_session_scope(session_id: int, req: UpdateScopeRequest, user=Depends(require_user)):
+    """Update the user-selected scope for a session.
+
+    Empty-selection guard: if mode=custom and both collection_ids and
+    document_ids are empty, rejects with 400 to prevent "search nothing" states.
+    """
+    assert_session_owned(session_id, user["sub"])
+
+    if req.mode not in ("full_archive", "custom"):
+        raise HTTPException(status_code=400, detail="mode must be 'full_archive' or 'custom'")
+
+    if req.mode == "custom":
+        has_collections = req.included_collection_ids and len(req.included_collection_ids) > 0
+        has_documents = req.included_document_ids and len(req.included_document_ids) > 0
+        if not has_collections and not has_documents:
+            raise HTTPException(
+                status_code=400,
+                detail="Custom scope requires at least one collection or document selected",
+            )
+
+    scope_json = {
+        "mode": req.mode,
+        "included_collection_ids": req.included_collection_ids or [],
+        "included_document_ids": req.included_document_ids or [],
+    }
+
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE research_sessions
+                SET scope_json = %s, updated_at = now()
+                WHERE id = %s AND user_sub = %s
+                """,
+                (Json(scope_json), session_id, user["sub"]),
+            )
+            conn.commit()
+        return {"ok": True, "scope_json": scope_json}
+    finally:
+        conn.close()
+
+
+@router.get("/{session_id}/messages", response_model=List[Message])
+def get_messages(session_id: int, user=Depends(require_user)):
+    """Get all messages in a session."""
+    assert_session_owned(session_id, user["sub"])
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
             
             cur.execute(
                 """
@@ -217,20 +303,17 @@ def get_messages(session_id: int):
 
 
 @router.get("/{session_id}/state", response_model=SessionState)
-def get_session_state(session_id: int):
+def get_session_state(session_id: int, user=Depends(require_user)):
     """
     Return the latest plan/result pointers for a session.
 
     This is used by the UI to reload a session and show the most recent plan/result
     without requiring the send-message response to be in memory.
     """
+    assert_session_owned(session_id, user["sub"])
     conn = get_conn()
     try:
         with conn.cursor() as cur:
-            # Verify session exists
-            cur.execute("SELECT 1 FROM research_sessions WHERE id = %s", (session_id,))
-            if not cur.fetchone():
-                raise HTTPException(status_code=404, detail="Session not found")
 
             # Latest plan id (by created_at)
             cur.execute(
@@ -273,7 +356,7 @@ def get_session_state(session_id: int):
         conn.close()
 
 @router.post("/{session_id}/messages", response_model=SendMessageResponse)
-def send_message(session_id: int, req: SendMessageRequest):
+def send_message(session_id: int, req: SendMessageRequest, user=Depends(require_user)):
     """
     Send a user message and get an assistant response with a proposed plan.
     
@@ -283,6 +366,7 @@ def send_message(session_id: int, req: SendMessageRequest):
     3. Store the assistant message (with plan_id)
     4. Return all three objects
     """
+    assert_session_owned(session_id, user["sub"])
     content = req.content.strip()
     if not content:
         raise HTTPException(status_code=400, detail="Message content cannot be empty")
@@ -290,10 +374,6 @@ def send_message(session_id: int, req: SendMessageRequest):
     conn = get_conn()
     try:
         with conn.cursor() as cur:
-            # Verify session exists
-            cur.execute("SELECT 1 FROM research_sessions WHERE id = %s", (session_id,))
-            if not cur.fetchone():
-                raise HTTPException(status_code=404, detail="Session not found")
             
             # 1. Store user message
             cur.execute(

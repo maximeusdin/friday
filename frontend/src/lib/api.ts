@@ -22,15 +22,34 @@ import type {
   ChatRequest,
   ChatResponse,
   ChatMessage,
+  V9ChatRequest,
+  V9ChatResponse,
 } from '@/types/api';
 
-// Production API URL - must use HTTPS
-// Can be set via NEXT_PUBLIC_API_URL environment variable at build time
-const PRODUCTION_API_URL = 'https://api.fridayarchive.org';
+// Production: health is https://api.fridayarchive.org/health, API routes are under /api (e.g. /api/sessions/...)
+const PRODUCTION_API_HOST = 'https://api.fridayarchive.org';
+const PRODUCTION_API_BASE = `${PRODUCTION_API_HOST}/api`;
 
 // API_BASE: Use environment variable if set, otherwise use relative path for dev proxy
-// In production builds, NEXT_PUBLIC_API_URL should be set to the full API URL
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || '/api';
+
+/** Normalize API base: ensure it ends with /api when it's a full URL so paths like /sessions/... become /api/sessions/... */
+function normalizeApiBase(base: string): string {
+  if (base.startsWith('http') && !base.endsWith('/api') && !base.endsWith('/api/')) {
+    return base.replace(/\/?$/, '') + '/api';
+  }
+  return base;
+}
+
+/** Resolve API base at request time so production works even if build omitted NEXT_PUBLIC_API_URL */
+function getRequestBase(): string {
+  if (typeof window === 'undefined') return normalizeApiBase(API_BASE);
+  // Production (non-localhost): if base is relative, use production API so static deploy works
+  if (!window.location.hostname.includes('localhost') && (API_BASE.startsWith('/') || API_BASE === '/api')) {
+    return PRODUCTION_API_BASE;
+  }
+  return normalizeApiBase(API_BASE);
+}
 
 // Direct backend URL for SSE streaming (bypasses Next.js proxy which buffers responses)
 // In browser, we need to connect directly to avoid proxy buffering
@@ -48,9 +67,9 @@ const getDirectBackendUrl = (): string => {
     const stored = localStorage.getItem('DIRECT_BACKEND_URL');
     if (stored) return stored;
   }
-  // In production (non-localhost), use HTTPS production URL
+  // In production (non-localhost), use HTTPS production URL (routes live at .../api/sessions/...)
   if (typeof window !== 'undefined' && !window.location.hostname.includes('localhost')) {
-    return `${PRODUCTION_API_URL}/api`;
+    return PRODUCTION_API_BASE;
   }
   // Local development: use HTTP on same host port 8000
   if (typeof window !== 'undefined') {
@@ -74,10 +93,12 @@ async function request<T>(
   path: string,
   options: RequestInit = {}
 ): Promise<T> {
-  const url = `${API_BASE}${path}`;
-  
+  const base = getRequestBase();
+  const url = path.startsWith('http') ? path : `${base}${path}`;
+
   const response = await fetch(url, {
     ...options,
+    credentials: 'include',
     headers: {
       'Content-Type': 'application/json',
       ...options.headers,
@@ -109,6 +130,77 @@ async function request<T>(
 }
 
 // =============================================================================
+// Auth (cookie-based session; routes at /auth/* on API host)
+// =============================================================================
+
+/** Base URL for auth routes (host only, no /api suffix) */
+function getAuthBase(): string {
+  if (typeof window === 'undefined') {
+    const base = normalizeApiBase(API_BASE);
+    return base.replace(/\/api\/?$/, '') || base;
+  }
+  if (!window.location.hostname.includes('localhost')) {
+    return PRODUCTION_API_HOST;
+  }
+  if (process.env.NEXT_PUBLIC_API_URL) {
+    const u = process.env.NEXT_PUBLIC_API_URL.replace(/\/api\/?$/, '');
+    return u || process.env.NEXT_PUBLIC_API_URL;
+  }
+  return `http://${window.location.hostname}:8000`;
+}
+
+export interface AuthUser {
+  sub: string;
+  email?: string;
+}
+
+/** Frontend route for sign-in page (do not redirect browser to API). */
+export const SIGNIN_PATH = '/signin';
+
+export function getLoginUrl(): string {
+  return SIGNIN_PATH;
+}
+
+export async function getAuthMe(): Promise<AuthUser | null> {
+  try {
+    const res = await fetch(`${getAuthBase()}/auth/me`, { credentials: 'include' });
+    if (res.status === 401) return null;
+    if (!res.ok) return null;
+    return res.json();
+  } catch {
+    return null;
+  }
+}
+
+/** POST /auth/login (non-OAuth). Call from /signin page with credentials: 'include'. */
+export async function login(email: string, password: string): Promise<{ ok: boolean }> {
+  const res = await fetch(`${getAuthBase()}/auth/login`, {
+    method: 'POST',
+    credentials: 'include',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email, password }),
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new ApiError(
+      data?.error?.code || `HTTP_${res.status}`,
+      data?.error?.message || data?.detail || res.statusText
+    );
+  }
+  return res.json();
+}
+
+export async function logout(): Promise<void> {
+  await fetch(`${getAuthBase()}/auth/logout`, {
+    method: 'POST',
+    credentials: 'include',
+  });
+  if (typeof window !== 'undefined') {
+    window.location.href = '/';
+  }
+}
+
+// =============================================================================
 // Meta & Health
 // =============================================================================
 
@@ -137,6 +229,10 @@ export async function getSessions(): Promise<Session[]> {
 
 export async function getSession(id: number): Promise<Session> {
   return request<Session>(`/sessions/${id}`);
+}
+
+export async function deleteSession(id: number): Promise<void> {
+  return request<void>(`/sessions/${id}`, { method: 'DELETE' });
 }
 
 export async function getSessionState(id: number): Promise<SessionStateResponse> {
@@ -205,7 +301,15 @@ export async function getDocument(id: number): Promise<Document> {
 }
 
 export function getDocumentPdfUrl(id: number): string {
-  return `${API_BASE}/documents/${id}/pdf`;
+  return `${getRequestBase()}/documents/${id}/pdf`;
+}
+
+export async function deletePendingMessage(sessionId: number): Promise<void> {
+  // Uses the direct backend URL (same as streaming) to bypass Next.js proxy
+  const directUrl = getDirectBackendUrl();
+  await fetch(`${directUrl}/sessions/${sessionId}/chat/last-pending`, {
+    method: 'DELETE',
+  });
 }
 
 export async function getEvidence(params: {
@@ -327,21 +431,42 @@ export interface StreamingChatCallbacks {
 export async function sendChatMessageStreaming(
   sessionId: number,
   message: string,
-  callbacks: StreamingChatCallbacks
+  callbacks: StreamingChatCallbacks,
+  signal?: AbortSignal
 ): Promise<void> {
   // Use direct backend URL to bypass Next.js proxy (which buffers SSE)
   const directUrl = getDirectBackendUrl();
   
-  const response = await fetch(`${directUrl}/sessions/${sessionId}/chat/stream`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({ message }),
-  });
+  // Helper: check if an error is an abort (robust across browsers/bundlers)
+  const isAbort = (e: unknown): boolean =>
+    signal?.aborted === true ||
+    (e instanceof Error && e.name === 'AbortError') ||
+    (typeof DOMException !== 'undefined' && e instanceof DOMException && e.name === 'AbortError');
+
+  let response: Response;
+  try {
+    response = await fetch(`${directUrl}/sessions/${sessionId}/chat/stream`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ message }),
+      signal,
+    });
+  } catch (e: unknown) {
+    // AbortError is expected when the user clicks Stop — not a real error
+    if (isAbort(e)) return;
+    throw e;
+  }
 
   if (!response.ok) {
-    const error = await response.text();
+    let error: string;
+    try {
+      error = await response.text();
+    } catch (e: unknown) {
+      if (isAbort(e)) return;
+      error = response.statusText;
+    }
     callbacks.onError?.(error);
     return;
   }
@@ -355,44 +480,260 @@ export async function sendChatMessageStreaming(
   const decoder = new TextDecoder();
   let buffer = '';
 
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
+  try {
+    while (true) {
+      // Check abort before each read so we exit immediately
+      if (signal?.aborted) return;
 
-    buffer += decoder.decode(value, { stream: true });
+      const { done, value } = await reader.read();
+      if (done) break;
 
-    // Parse SSE events from buffer
-    const lines = buffer.split('\n');
-    buffer = lines.pop() || ''; // Keep incomplete line in buffer
+      buffer += decoder.decode(value, { stream: true });
 
-    let currentEvent = '';
-    let currentData = '';
+      // Parse SSE events from buffer
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || ''; // Keep incomplete line in buffer
 
-    for (const line of lines) {
-      if (line.startsWith('event: ')) {
-        currentEvent = line.slice(7).trim();
-      } else if (line.startsWith('data: ')) {
-        currentData = line.slice(6);
-      } else if (line === '' && currentData) {
-        // End of event
-        try {
-          const data = JSON.parse(currentData);
-          if (currentEvent === 'progress') {
-            callbacks.onProgress?.(data as V6ProgressEvent);
-          } else if (currentEvent === 'result') {
-            callbacks.onResult?.(data as V6ResultEvent);
-          } else if (currentEvent === 'error') {
-            callbacks.onError?.(data.error || 'Unknown error');
+      let currentEvent = '';
+      let currentData = '';
+
+      for (const line of lines) {
+        if (line.startsWith('event: ')) {
+          currentEvent = line.slice(7).trim();
+        } else if (line.startsWith('data: ')) {
+          currentData = line.slice(6);
+        } else if (line === '' && currentData) {
+          // End of event
+          try {
+            const data = JSON.parse(currentData);
+            if (currentEvent === 'progress') {
+              callbacks.onProgress?.(data as V6ProgressEvent);
+            } else if (currentEvent === 'result') {
+              callbacks.onResult?.(data as V6ResultEvent);
+            } else if (currentEvent === 'error') {
+              callbacks.onError?.(data.error || 'Unknown error');
+            }
+          } catch {
+            // Ignore parse errors
           }
-        } catch {
-          // Ignore parse errors
+          currentEvent = '';
+          currentData = '';
         }
-        currentEvent = '';
-        currentData = '';
       }
     }
+  } catch (e: unknown) {
+    // AbortError is expected when the user clicks Stop
+    if (isAbort(e)) return;
+    throw e;
   }
 }
+
+// =============================================================================
+// V9 Session-Aware Chat
+// =============================================================================
+
+/**
+ * Send a message via the V9 session-aware endpoint (synchronous fallback).
+ * Routes automatically to new_retrieval, follow_up, or think_deeper.
+ */
+export async function sendV9Message(
+  sessionId: number,
+  text: string,
+  action: 'default' | 'think_deeper' = 'default',
+): Promise<V9ChatResponse> {
+  return request<V9ChatResponse>(`/sessions/${sessionId}/v9/message`, {
+    method: 'POST',
+    body: JSON.stringify({ text, action } as V9ChatRequest),
+  });
+}
+
+// =============================================================================
+// V9 SSE Streaming
+// =============================================================================
+
+/**
+ * Progress event from V9 investigation workflow.
+ */
+export interface V9ProgressEvent {
+  type: 'progress';
+  step: string;
+  status: string;
+  message: string;
+  details: Record<string, unknown>;
+  timestamp: number;
+}
+
+/**
+ * Evidence bullet discovered during investigation.
+ */
+export interface V9EvidenceBullet {
+  text: string;
+  tags: string[];
+  chunk_ids: number[];
+  doc_ids: number[];
+}
+
+/**
+ * Evidence update event — carries actual discovered evidence.
+ */
+export interface V9EvidenceUpdateEvent {
+  type: 'evidence_update';
+  step: string;
+  message: string;
+  details: {
+    bullets: V9EvidenceBullet[];
+    open_questions: string[];
+    leads: string[];
+    total_bullet_count: number;
+  };
+}
+
+/**
+ * Callbacks for V9 streaming chat.
+ */
+export interface V9StreamingCallbacks {
+  onProgress?: (event: V9ProgressEvent) => void;
+  onEvidenceUpdate?: (event: V9EvidenceUpdateEvent) => void;
+  onResult?: (result: V9ChatResponse) => void;
+  onError?: (error: string) => void;
+}
+
+/**
+ * Send a V9 message with SSE streaming progress updates.
+ * Uses POST + ReadableStream (not EventSource) to support request body.
+ * Bypasses Next.js proxy to avoid response buffering.
+ */
+export async function sendV9MessageStreaming(
+  sessionId: number,
+  text: string,
+  action: 'default' | 'think_deeper',
+  callbacks: V9StreamingCallbacks,
+  signal?: AbortSignal,
+  carryContext?: Record<string, unknown>,
+): Promise<void> {
+  const directUrl = getDirectBackendUrl();
+
+  const isAbort = (e: unknown): boolean =>
+    signal?.aborted === true ||
+    (e instanceof Error && e.name === 'AbortError') ||
+    (typeof DOMException !== 'undefined' && e instanceof DOMException && e.name === 'AbortError');
+
+  const body: Record<string, unknown> = { text, action };
+  if (carryContext) {
+    body.carry_context = carryContext;
+  }
+
+  let response: Response;
+  try {
+    response = await fetch(`${directUrl}/sessions/${sessionId}/v9/message/stream`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal,
+    });
+  } catch (e: unknown) {
+    if (isAbort(e)) return;
+    throw e;
+  }
+
+  if (!response.ok) {
+    let error: string;
+    try {
+      error = await response.text();
+    } catch (e: unknown) {
+      if (isAbort(e)) return;
+      error = response.statusText;
+    }
+    callbacks.onError?.(error);
+    return;
+  }
+
+  const reader = response.body?.getReader();
+  if (!reader) {
+    callbacks.onError?.('No response body');
+    return;
+  }
+
+  const decoder = new TextDecoder();
+  let buffer = '';
+
+  try {
+    while (true) {
+      if (signal?.aborted) return;
+
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+
+      // Parse SSE events from buffer
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+
+      let currentEvent = '';
+      let currentData = '';
+
+      for (const line of lines) {
+        if (line.startsWith('event: ')) {
+          currentEvent = line.slice(7).trim();
+        } else if (line.startsWith('data: ')) {
+          currentData = line.slice(6);
+        } else if (line === '' && currentData) {
+          // End of SSE event
+          try {
+            const data = JSON.parse(currentData);
+            if (currentEvent === 'progress') {
+              callbacks.onProgress?.(data as V9ProgressEvent);
+            } else if (currentEvent === 'evidence_update') {
+              callbacks.onEvidenceUpdate?.(data as V9EvidenceUpdateEvent);
+            } else if (currentEvent === 'result') {
+              callbacks.onResult?.(data as V9ChatResponse);
+            } else if (currentEvent === 'error') {
+              callbacks.onError?.(data.error || 'Unknown error');
+            }
+          } catch {
+            // Ignore parse errors
+          }
+          currentEvent = '';
+          currentData = '';
+        }
+      }
+    }
+  } catch (e: unknown) {
+    if (isAbort(e)) return;
+    throw e;
+  }
+}
+
+// =============================================================================
+// Scope Window API
+// =============================================================================
+
+import type { CollectionNode, DocumentNode, UserSelectedScope } from '@/types/api';
+
+async function getCollectionsTree(includeCounts = false): Promise<CollectionNode[]> {
+  const params = includeCounts ? '?include_counts=1' : '';
+  return request<CollectionNode[]>(`/documents/collections_tree${params}`);
+}
+
+async function getCollectionDocuments(collectionId: number, includeCounts = false): Promise<DocumentNode[]> {
+  const params = includeCounts ? '?include_counts=1' : '';
+  return request<DocumentNode[]>(`/documents/collections/${collectionId}/documents${params}`);
+}
+
+async function getSessionScope(sessionId: number): Promise<UserSelectedScope> {
+  const session = await getSession(sessionId);
+  return session.scope_json || { mode: 'full_archive' };
+}
+
+async function updateSessionScope(sessionId: number, scope: UserSelectedScope): Promise<void> {
+  await request(`/sessions/${sessionId}/scope`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(scope),
+  });
+}
+
 
 // =============================================================================
 // Export
@@ -401,9 +742,14 @@ export async function sendChatMessageStreaming(
 export const api = {
   getHealth,
   getMeta,
+  getLoginUrl,
+  getAuthMe,
+  login,
+  logout,
   createSession,
   getSessions,
   getSession,
+  deleteSession,
   getSessionState,
   getSessionMessages,
   sendMessage,
@@ -415,10 +761,19 @@ export const api = {
   getDocument,
   getDocumentPdfUrl,
   getEvidence,
+  deletePendingMessage,
   // V6 Chat
   sendChatMessage,
   sendChatMessageStreaming,
   getChatHistory,
+  // V9 Session-Aware Chat
+  sendV9Message,
+  sendV9MessageStreaming,
+  // Scope Window
+  getCollectionsTree,
+  getCollectionDocuments,
+  getSessionScope,
+  updateSessionScope,
 };
 
 export { ApiError };

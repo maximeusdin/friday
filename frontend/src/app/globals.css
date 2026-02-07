@@ -44,7 +44,7 @@ html, body {
 /* Layout */
 .app-container {
   display: grid;
-  grid-template-columns: 240px 1fr 400px;
+  grid-template-columns: 220px 1fr 480px;
   height: 100vh;
   overflow: hidden;
 }
@@ -305,6 +305,8 @@ input:focus, textarea:focus {
   height: 100%;
   display: flex;
   flex-direction: column;
+  flex: 1;
+  min-height: 0;
 }
 
 .pdf-toolbar {
@@ -314,6 +316,28 @@ input:focus, textarea:focus {
   padding: var(--spacing-sm) var(--spacing-md);
   border-bottom: 1px solid var(--color-border);
   background: var(--color-bg-secondary);
+  flex-wrap: wrap;
+}
+
+.btn-back-to-chat {
+  background: var(--color-primary);
+  color: white;
+  font-weight: 600;
+  font-size: 13px;
+  padding: 6px 14px;
+  border-radius: var(--radius-sm);
+  white-space: nowrap;
+}
+
+.btn-back-to-chat:hover {
+  background: var(--color-primary-hover);
+}
+
+.pdf-toolbar-separator {
+  width: 1px;
+  height: 20px;
+  background: var(--color-border);
+  margin: 0 2px;
 }
 
 .pdf-container {
@@ -322,9 +346,76 @@ input:focus, textarea:focus {
   background: var(--color-bg-tertiary);
 }
 
+.pdf-zoom-wrapper {
+  min-width: 100%;
+  min-height: 100%;
+}
+
 .pdf-page-info {
   font-size: 12px;
   color: var(--color-text-muted);
+  white-space: nowrap;
+}
+
+/* Zoom Controls */
+.zoom-controls {
+  display: inline-flex;
+  align-items: center;
+  gap: 0;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  background: var(--color-bg);
+}
+
+.zoom-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: none;
+  border-radius: 0;
+  background: var(--color-bg);
+  color: var(--color-text);
+  font-size: 16px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+
+.zoom-btn:hover:not(:disabled) {
+  background: var(--color-bg-tertiary);
+}
+
+.zoom-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.zoom-level {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 48px;
+  height: 28px;
+  padding: 0 4px;
+  border: none;
+  border-left: 1px solid var(--color-border);
+  border-right: 1px solid var(--color-border);
+  border-radius: 0;
+  background: var(--color-bg);
+  color: var(--color-text-muted);
+  font-size: 11px;
+  font-weight: 500;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.zoom-level:hover {
+  background: var(--color-bg-tertiary);
+  color: var(--color-text);
 }
 
 /* Loading */
@@ -487,8 +578,19 @@ input:focus, textarea:focus {
   font-size: 13px;
 }
 
+.thinking-bullet-count {
+  display: block;
+  color: var(--color-success, #28a745);
+  font-size: 11px;
+  font-weight: 500;
+  margin-top: 2px;
+}
+
 /* Section Headers */
 .chat-section-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
   padding: var(--spacing-sm) var(--spacing-md);
   background: var(--color-bg-secondary);
   border-top: 1px solid var(--color-border);
@@ -543,6 +645,28 @@ input:focus, textarea:focus {
   border-top: 1px solid var(--color-border);
 }
 
+.claims-summary-badges {
+  display: flex;
+  gap: 4px;
+}
+
+.claims-badge {
+  font-size: 10px;
+  font-weight: 600;
+  padding: 1px 6px;
+  border-radius: 8px;
+}
+
+.claims-badge-supported {
+  background: rgba(25, 135, 84, 0.15);
+  color: var(--color-success);
+}
+
+.claims-badge-partial {
+  background: rgba(255, 193, 7, 0.2);
+  color: #997404;
+}
+
 .claims-list {
   list-style: none;
   padding: var(--spacing-sm) var(--spacing-md);
@@ -553,12 +677,27 @@ input:focus, textarea:focus {
   display: flex;
   align-items: flex-start;
   gap: var(--spacing-sm);
-  padding: var(--spacing-sm) 0;
-  border-bottom: 1px solid var(--color-bg-tertiary);
+  padding: var(--spacing-sm) var(--spacing-xs);
+  margin-bottom: 2px;
+  border-radius: var(--radius-sm);
+  border-left: 3px solid transparent;
+  transition: background 0.15s ease;
 }
 
-.claim-item:last-child {
-  border-bottom: none;
+.claim-item:hover {
+  background: var(--color-bg-secondary);
+}
+
+.claim-item-supported {
+  border-left-color: var(--color-success);
+}
+
+.claim-item-partial {
+  border-left-color: var(--color-warning);
+}
+
+.claim-item-unsupported {
+  border-left-color: var(--color-bg-tertiary);
 }
 
 .claim-confidence {
@@ -596,18 +735,114 @@ input:focus, textarea:focus {
 
 .claim-text {
   font-size: 13px;
-  line-height: 1.4;
+  line-height: 1.5;
   display: block;
+  color: var(--color-text);
 }
 
-.claim-citations-row {
+/* Source links below each claim */
+.claim-sources {
   display: flex;
   flex-wrap: wrap;
+  align-items: center;
   gap: 4px;
-  margin-top: var(--spacing-xs);
+  margin-top: 4px;
 }
 
-/* Citation Buttons */
+.claim-sources-label {
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--color-text-muted);
+  text-transform: uppercase;
+  margin-right: 2px;
+}
+
+.claim-source-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 2px 8px;
+  background: var(--color-bg-secondary);
+  border: 1px solid var(--color-border);
+  border-radius: 4px;
+  font-size: 11px;
+  color: var(--color-primary);
+  cursor: pointer;
+  transition: all 0.15s ease;
+  white-space: nowrap;
+  max-width: 220px;
+  text-decoration: none;
+}
+
+.claim-source-link:hover:not(:disabled) {
+  background: var(--color-primary);
+  color: white;
+  border-color: var(--color-primary);
+}
+
+.claim-source-link:hover:not(:disabled) .source-page {
+  color: rgba(255, 255, 255, 0.85);
+}
+
+.claim-source-link:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.source-icon {
+  font-size: 12px;
+  flex-shrink: 0;
+}
+
+.source-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.source-page {
+  flex-shrink: 0;
+  font-weight: 600;
+  color: var(--color-success);
+  font-size: 10px;
+}
+
+/* Inline citation links (clickable references in answer text) */
+.inline-citation-group {
+  display: inline;
+}
+
+.inline-citation-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 1px 7px;
+  margin: 0 1px;
+  background: rgba(13, 110, 253, 0.08);
+  border: 1px solid rgba(13, 110, 253, 0.25);
+  border-radius: 4px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--color-primary);
+  cursor: pointer;
+  transition: all 0.15s ease;
+  white-space: nowrap;
+  text-decoration: none;
+  vertical-align: baseline;
+  line-height: 1.4;
+}
+
+.inline-citation-link:hover {
+  background: var(--color-primary);
+  color: white;
+  border-color: var(--color-primary);
+}
+
+.inline-citation-unresolved {
+  color: var(--color-text-muted);
+  font-size: 12px;
+}
+
+/* Legacy citation buttons (members list, etc.) */
 .citation-btn {
   display: inline-flex;
   align-items: center;
@@ -857,6 +1092,16 @@ input:focus, textarea:focus {
   50% { border-left-color: rgba(13, 110, 253, 0.4); }
 }
 
+.action-item.action-running .action-icon {
+  display: inline-block;
+  animation: spinIcon 1.2s linear infinite;
+}
+
+@keyframes spinIcon {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
 .action-main {
   display: flex;
   align-items: flex-start;
@@ -891,6 +1136,58 @@ input:focus, textarea:focus {
   font-size: 10px;
   color: var(--color-text-muted);
   padding: 2px;
+}
+
+/* Live Evidence Bullets (during streaming) */
+.evidence-bullet-live {
+  padding: var(--spacing-sm) var(--spacing-md);
+  border-left: 3px solid var(--color-success, #28a745);
+  margin-left: var(--spacing-sm);
+  margin-bottom: var(--spacing-sm);
+  animation: bulletFadeIn 0.3s ease-out;
+}
+
+@keyframes bulletFadeIn {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.bullet-text {
+  font-size: 12px;
+  color: var(--color-text);
+  line-height: 1.5;
+}
+
+.bullet-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 4px;
+  flex-wrap: wrap;
+}
+
+.bullet-tag {
+  display: inline-block;
+  font-size: 10px;
+  font-weight: 500;
+  padding: 1px 6px;
+  border-radius: 8px;
+  background: var(--color-bg-secondary, #f0f0f0);
+  color: var(--color-text-muted);
+}
+
+.bullet-source-link {
+  font-size: 10px;
+  color: var(--color-primary, #4a90d9);
+  cursor: pointer;
+  border: none;
+  background: none;
+  padding: 0;
+  text-decoration: underline;
+}
+
+.bullet-source-link:hover {
+  color: var(--color-primary-hover, #357abd);
 }
 
 /* Action Details */

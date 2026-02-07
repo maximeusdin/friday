@@ -15,9 +15,28 @@ from fastapi import HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from app.routes import sessions, plans, results, documents, meta, chat
+from app.routes import meta  # used by /health
 from app.services.db import ConfigError
 from app.services.db import get_conn
+
+
+def register_routers(app: FastAPI) -> None:
+    """
+    Register all routers in one place so the entrypoint can't forget one.
+    Container runs: uvicorn app.main:app — so this module is the only place that matters.
+    Imports are inside this function to avoid circular imports; any missing router will raise here.
+    """
+    from app.routes import auth_cognito, documents, meta, plans, results, sessions
+    from app.routes import chat  # sessions + chat both under /api/sessions
+
+    app.include_router(auth_cognito.router, prefix="/auth", tags=["auth"])
+    app.include_router(meta.router, prefix="/api", tags=["meta"])
+    app.include_router(sessions.router, prefix="/api/sessions", tags=["sessions"])
+    app.include_router(chat.router, prefix="/api/sessions", tags=["chat"])
+    app.include_router(plans.router, prefix="/api/plans", tags=["plans"])
+    app.include_router(results.router, prefix="/api/result-sets", tags=["results"])
+    app.include_router(documents.router, prefix="/api", tags=["documents"])
+
 
 # Optional: load .env files (dev convenience). Disabled by default so the app
 # can run in a container with only environment variables.
@@ -97,29 +116,27 @@ def http_exception_handler(_request: Request, exc: HTTPException):
         },
     )
 
-# CORS for frontend
+# CORS: frontend at https://fridayarchive.org, API at https://api.fridayarchive.org.
+# Do not use allow_origins=["*"] with credentials — browser blocks it.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "http://localhost:3000",  # Next.js dev
-        "http://127.0.0.1:3000",
-        "http://fridayarchive.org",  # S3 production
-        "http://www.fridayarchive.org",
-        "https://fridayarchive.org",  # Future HTTPS
+        "https://fridayarchive.org",
         "https://www.fridayarchive.org",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://fridayarchive.org",
+        "http://www.fridayarchive.org",
+        "https://api.fridayarchive.org",
     ],
+    allow_origin_regex=r"https?://([a-zA-Z0-9-]+\.)?fridayarchive\.org|https?://.*\.cloudfront\.net",
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "Accept"],
 )
 
-# Include routers
-app.include_router(meta.router, prefix="/api", tags=["meta"])
-app.include_router(sessions.router, prefix="/api/sessions", tags=["sessions"])
-app.include_router(chat.router, prefix="/api/sessions", tags=["chat"])  # V6 chat endpoint
-app.include_router(plans.router, prefix="/api/plans", tags=["plans"])
-app.include_router(results.router, prefix="/api/result-sets", tags=["results"])
-app.include_router(documents.router, prefix="/api", tags=["documents"])
+# Register all routers (single place so ECS entrypoint can't miss auth)
+register_routers(app)
 
 
 @app.get("/health")

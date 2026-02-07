@@ -16,5 +16,9 @@ python-dotenv>=1.0.1
 # LLM / AI
 openai>=1.0.0
 
+# Auth (Cognito OAuth2 + JWT session)
+httpx>=0.27.0
+python-jose[cryptography]>=3.3.0
+
 # CORS middleware (included with FastAPI)
 # starlette  # auto-installed with fastapi

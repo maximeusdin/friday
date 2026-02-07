@@ -39,6 +39,7 @@ class Document(BaseModel):
     source_ref: Optional[str] = None
     volume: Optional[str] = None
     page_count: Optional[int] = None
+    pdf_url: Optional[str] = None
     metadata: Optional[dict] = None
     created_at: datetime
 
@@ -102,15 +103,22 @@ def get_document(document_id: int):
             page_count = cur.fetchone()[0]
             
             metadata = row[6] or {}
+            source_ref = row[4]
+            source_name = row[3]
+            collection_slug = row[2]
+            
+            # Build direct PDF URL for frontend iframe
+            pdf_url = _build_pdf_url_for_client(source_ref, source_name, collection_slug, document_id)
             
             return Document(
                 id=row[0],
                 collection_id=row[1],
-                collection_slug=row[2],
-                source_name=row[3],
-                source_ref=row[4],
+                collection_slug=collection_slug,
+                source_name=source_name,
+                source_ref=source_ref,
                 volume=row[5],
                 page_count=page_count,
+                pdf_url=pdf_url,
                 metadata=metadata,
                 created_at=row[7],
             )
@@ -118,7 +126,7 @@ def get_document(document_id: int):
         conn.close()
 
 
-@router.get("/documents/{document_id}/pdf")
+@router.api_route("/documents/{document_id}/pdf", methods=["GET", "HEAD"])
 def get_document_pdf(document_id: int):
     """
     Serve the PDF file for a document.
@@ -174,57 +182,60 @@ def get_document_pdf(document_id: int):
     )
 
 
+def _build_pdf_url_for_client(
+    source_ref: Optional[str],
+    source_name: str,
+    collection_slug: str,
+    document_id: int,
+) -> str:
+    """
+    Return the direct PDF URL for the frontend to embed in an iframe.
+
+    In production (S3_PDF_BUCKET set), this is the direct S3/CloudFront URL
+    so the browser loads the PDF without going through an API redirect.
+    In development, falls back to the local API route.
+    """
+    if S3_PDF_BUCKET:
+        return _build_s3_url(source_ref, source_name, collection_slug)
+    # Dev: use the API PDF route (serves file directly, no redirect)
+    return f"/api/documents/{document_id}/pdf"
+
+
 def _build_s3_url(source_ref: Optional[str], source_name: str, collection_slug: str) -> str:
     """
-    Build the S3 URL for a PDF file.
-    
-    S3 mirrors the local data/ structure exactly:
-    - Local: data/raw/vassiliev/notebook1.pdf
-    - S3:    s3://fridayarchive.org/data/raw/vassiliev/notebook1.pdf
-    - URL:   https://fridayarchive.org/data/raw/vassiliev/notebook1.pdf
-    
-    source_ref in DB can be:
-    - Relative: "data/raw/vassiliev/notebook1.pdf"
-    - Absolute: "/path/to/friday/data/raw/vassiliev/notebook1.pdf"
-    
-    We extract the path starting from "data/" to match S3 structure.
+    Build the S3 URL for a PDF using the path stored in the database.
+
+    We use documents.source_ref as the canonical path when present (portable relative
+    path like data/raw/venona/Venona London GRU.pdf or data/raw/vassiliev/pdf/...).
+    S3 is assumed to mirror that structure; we only extract the data/... part from
+    source_ref (stripping any machine-specific prefix) and URL-encode for the request.
+    No path rewriting (e.g. no pdf/ insertion or spaces→underscores) so different
+    collection layouts (venona vs vassiliev/pdf/) are supported from the DB.
     """
     from urllib.parse import quote
-    
+
     path = None
-    
+
     if source_ref:
-        # Normalize path separators
         sr_norm = str(source_ref).replace("\\", "/")
-        
-        # Extract path starting from "data/" to match S3 structure
-        # Handles both: "data/raw/..." and "/full/path/friday/data/raw/..."
         data_idx = sr_norm.lower().find("/data/")
         if data_idx >= 0:
-            # Absolute path: extract from data/ onwards (including "data/")
-            path = sr_norm[data_idx + 1:]  # +1 to skip the leading /
+            path = sr_norm[data_idx + 1:]
         elif sr_norm.lower().startswith("data/"):
-            # Already relative from data/
             path = sr_norm
         else:
-            # Doesn't contain data/ - maybe just the filename or raw/ path
-            # Try to find raw/ pattern
             raw_idx = sr_norm.lower().find("/raw/")
             if raw_idx >= 0:
                 path = "data" + sr_norm[raw_idx:]
             elif sr_norm.lower().startswith("raw/"):
                 path = "data/" + sr_norm
             else:
-                # Last resort: construct from collection/source_name
                 path = f"data/raw/{collection_slug}/{source_name}" if collection_slug else f"data/{source_name}"
     else:
-        # No source_ref: construct from collection/source_name
         path = f"data/raw/{collection_slug}/{source_name}" if collection_slug else f"data/{source_name}"
-    
-    # Ensure path doesn't start with /
+
     path = path.lstrip("/")
-    
-    # URL-encode the path components (handles spaces in filenames like "Rosenberg, Julius 01_text.pdf")
+    # URL-encode each segment (handles spaces in filenames, e.g. "Venona London GRU.pdf")
     path_encoded = "/".join(quote(part, safe="") for part in path.split("/"))
     
     # Build URL - S3_PDF_BUCKET is typically a domain like "fridayarchive.org"
@@ -314,6 +325,117 @@ def _find_pdf_by_filename(pdf_root: Path, filename: str) -> Optional[Path]:
     return None
 
 
+# =============================================================================
+# Collections Tree and Documents (for Scope panel)
+# =============================================================================
+
+class CollectionNodeResponse(BaseModel):
+    id: int
+    slug: str
+    title: str
+    description: Optional[str] = None
+    document_count: int = 0
+    chunk_count: Optional[int] = None  # only with ?include_counts=1
+
+
+class DocumentNodeResponse(BaseModel):
+    id: int
+    source_name: str
+    source_ref: Optional[str] = None
+    volume: Optional[str] = None
+    chunk_count: Optional[int] = None  # only with ?include_counts=1
+
+
+@router.get("/collections_tree", response_model=list[CollectionNodeResponse])
+def get_collections_tree(include_counts: int = Query(0, description="Set to 1 to include chunk counts")):
+    """Return all collections with document counts (no nested documents).
+
+    Documents are lazy-loaded per collection via GET /collections/{id}/documents.
+    """
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            if include_counts:
+                cur.execute("""
+                    SELECT c.id, c.slug, c.title, c.description,
+                           COUNT(DISTINCT d.id) AS document_count,
+                           COUNT(DISTINCT cm.chunk_id) AS chunk_count
+                    FROM collections c
+                    LEFT JOIN documents d ON d.collection_id = c.id
+                    LEFT JOIN chunk_metadata cm ON cm.collection_slug = c.slug
+                    GROUP BY c.id
+                    ORDER BY c.title
+                """)
+            else:
+                cur.execute("""
+                    SELECT c.id, c.slug, c.title, c.description,
+                           COUNT(d.id) AS document_count
+                    FROM collections c
+                    LEFT JOIN documents d ON d.collection_id = c.id
+                    GROUP BY c.id
+                    ORDER BY c.title
+                """)
+            rows = cur.fetchall()
+            result = []
+            for row in rows:
+                node = CollectionNodeResponse(
+                    id=row[0], slug=row[1], title=row[2],
+                    description=row[3], document_count=row[4],
+                )
+                if include_counts and len(row) > 5:
+                    node.chunk_count = row[5]
+                result.append(node)
+            return result
+    finally:
+        conn.close()
+
+
+@router.get("/collections/{collection_id}/documents", response_model=list[DocumentNodeResponse])
+def get_collection_documents(
+    collection_id: int,
+    include_counts: int = Query(0, description="Set to 1 to include chunk counts per document"),
+):
+    """Return documents for a single collection (lazy-loaded by UI on expand)."""
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            # Verify collection exists
+            cur.execute("SELECT 1 FROM collections WHERE id = %s", (collection_id,))
+            if not cur.fetchone():
+                raise HTTPException(status_code=404, detail="Collection not found")
+
+            if include_counts:
+                cur.execute("""
+                    SELECT d.id, d.source_name, d.source_ref, d.volume,
+                           COUNT(cm.chunk_id) AS chunk_count
+                    FROM documents d
+                    LEFT JOIN chunk_metadata cm ON cm.document_id = d.id
+                    WHERE d.collection_id = %s
+                    GROUP BY d.id
+                    ORDER BY d.source_name
+                """, (collection_id,))
+            else:
+                cur.execute("""
+                    SELECT d.id, d.source_name, d.source_ref, d.volume
+                    FROM documents d
+                    WHERE d.collection_id = %s
+                    ORDER BY d.source_name
+                """, (collection_id,))
+            rows = cur.fetchall()
+            result = []
+            for row in rows:
+                node = DocumentNodeResponse(
+                    id=row[0], source_name=row[1],
+                    source_ref=row[2], volume=row[3],
+                )
+                if include_counts and len(row) > 4:
+                    node.chunk_count = row[4]
+                result.append(node)
+            return result
+    finally:
+        conn.close()
+
+
 @router.get("/evidence", response_model=EvidenceResponse)
 def get_evidence(
     document_id: int = Query(..., description="Document ID"),
@@ -357,14 +479,20 @@ def get_evidence(
             )
             page_count = cur.fetchone()[0]
             
+            source_ref_ev = row[4]
+            source_name_ev = row[3]
+            collection_slug_ev = row[2]
+            pdf_url_ev = _build_pdf_url_for_client(source_ref_ev, source_name_ev, collection_slug_ev, document_id)
+            
             document = Document(
                 id=row[0],
                 collection_id=row[1],
-                collection_slug=row[2],
-                source_name=row[3],
-                source_ref=row[4],
+                collection_slug=collection_slug_ev,
+                source_name=source_name_ev,
+                source_ref=source_ref_ev,
                 volume=row[5],
                 page_count=page_count,
+                pdf_url=pdf_url_ev,
                 metadata=row[6] or {},
                 created_at=row[7],
             )

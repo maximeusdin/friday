@@ -9,11 +9,13 @@ import clsx from 'clsx';
 interface SessionListProps {
   activeSessionId?: number;
   onSessionSelect: (session: Session) => void;
+  onSessionDelete?: (sessionId: number) => void;
 }
 
-export function SessionList({ activeSessionId, onSessionSelect }: SessionListProps) {
+export function SessionList({ activeSessionId, onSessionSelect, onSessionDelete }: SessionListProps) {
   const [newLabel, setNewLabel] = useState('');
   const [isCreating, setIsCreating] = useState(false);
+  const [confirmDeleteId, setConfirmDeleteId] = useState<number | null>(null);
   const queryClient = useQueryClient();
 
   const { data: sessions, isLoading, error } = useQuery({
@@ -28,6 +30,17 @@ export function SessionList({ activeSessionId, onSessionSelect }: SessionListPro
       setNewLabel('');
       setIsCreating(false);
       onSessionSelect(newSession);
+    },
+  });
+
+  const deleteMutation = useMutation({
+    mutationFn: api.deleteSession,
+    onSuccess: (_data, deletedId) => {
+      queryClient.invalidateQueries({ queryKey: ['sessions'] });
+      setConfirmDeleteId(null);
+      if (deletedId === activeSessionId) {
+        onSessionDelete?.(deletedId);
+      }
     },
   });
 
@@ -112,11 +125,71 @@ export function SessionList({ activeSessionId, onSessionSelect }: SessionListPro
             })}
             onClick={() => onSessionSelect(session)}
           >
-            <div className="session-label">{session.label}</div>
-            <div className="session-meta">
-              {formatDate(session.last_activity || session.created_at)}
-              {session.message_count !== undefined && (
-                <> · {session.message_count} messages</>
+            <div style={{ display: 'flex', alignItems: 'start', justifyContent: 'space-between' }}>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div className="session-label">{session.label}</div>
+                <div className="session-meta">
+                  {formatDate(session.last_activity || session.created_at)}
+                  {session.message_count !== undefined && (
+                    <> · {session.message_count} messages</>
+                  )}
+                </div>
+              </div>
+              {confirmDeleteId === session.id ? (
+                <div
+                  style={{ display: 'flex', gap: '4px', flexShrink: 0 }}
+                  onClick={(e) => e.stopPropagation()}
+                >
+                  <button
+                    className="btn-danger-sm"
+                    style={{
+                      padding: '2px 8px',
+                      fontSize: '11px',
+                      background: 'var(--color-danger, #dc3545)',
+                      color: '#fff',
+                      border: 'none',
+                      borderRadius: '3px',
+                      cursor: 'pointer',
+                    }}
+                    onClick={() => deleteMutation.mutate(session.id)}
+                    disabled={deleteMutation.isPending}
+                  >
+                    {deleteMutation.isPending ? '...' : 'Yes'}
+                  </button>
+                  <button
+                    style={{
+                      padding: '2px 8px',
+                      fontSize: '11px',
+                      border: '1px solid var(--color-border)',
+                      borderRadius: '3px',
+                      background: 'transparent',
+                      cursor: 'pointer',
+                    }}
+                    onClick={() => setConfirmDeleteId(null)}
+                  >
+                    No
+                  </button>
+                </div>
+              ) : (
+                <button
+                  className="btn-delete-session"
+                  style={{
+                    padding: '2px 6px',
+                    fontSize: '12px',
+                    background: 'transparent',
+                    border: 'none',
+                    cursor: 'pointer',
+                    opacity: 0.4,
+                    flexShrink: 0,
+                  }}
+                  title="Delete session"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setConfirmDeleteId(session.id);
+                  }}
+                >
+                  ✕
+                </button>
               )}
             </div>
           </div>
