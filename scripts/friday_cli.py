@@ -1198,7 +1198,8 @@ Commands:
     - Stop gate validation: verifies all claims are grounded
     - Expanded summary: output shows claims with their citations
   
-  /v7 <query>   Explicitly use V7 with citation enforcement (same as plain query)
+  /v9 <query>   Explicitly use V9 Reasoning Workspace Loop (same as plain query - DEFAULT)
+  /v7 <query>   Use V7 with citation enforcement
   /v6 <query>   Use V6 (no citation enforcement)
   /v4 <query>   Use V4.2 agentic workflow (reasoning-first + discovery loop)
                 Flags: --dump-plan, --dump-evidence, --dump-verify, --dump-discovery
@@ -1240,12 +1241,18 @@ Workflow Modes:
                 - Hard bottleneck forces convergence to 30-50 spans
                 - Responsiveness check: does answer actually satisfy question?
                 - Progress-gated rounds: stop if no quality evidence gained
-  V7 (/v7):     V6 + Citation Enforcement (DEFAULT):
+  V9 (/v9):     Reasoning Workspace Loop V9.2 (DEFAULT):
+                - Model drives tools (search_chunks, fetch_chunks, expand_entities)
+                - expand_entities supports names[] + include_comentions for roster power
+                - Auto-detects scope (collections/dates) from question text
+                - Model self-labels task_type → structured output (roster/timeline/evidence/edges)
+                - Sufficiency contract with per-task-type thresholds
+                - Advisory responsiveness check → auto-extends if not responsive
+                - Verification is advisory only (never blocks or drops answer)
+  V7 (/v7):     V6 + Citation Enforcement:
                 - All V6 features plus strict citation requirements
-                - Claim enumeration: extracts atomic claims from answer
-                - Stop gate: validates all claims have valid citations
-                - Expanded summary: output shows claims with references
-                - Dropped claims: uncited claims are removed from output
+                - Claim enumeration, stop gate, expanded summary
+                - Uncited claims are dropped from output
 
 V4.2 Query Examples:
   /v4 who were members of the Silvermaster network  (roster query with discovery)
@@ -1263,7 +1270,7 @@ V7 Query Examples (DEFAULT - with citation enforcement):
   who handled Julius Rosenberg?                      (plain queries use V7 by default)
 """)
 
-def interactive_mode(session_id: int, auto_execute: bool = False, pre_bundling_mode: str = "off"):
+def interactive_mode(session_id: int, auto_execute: bool = False, pre_bundling_mode: str = "micro", bottleneck_mode: str = "score"):
     """Run interactive CLI mode."""
     conn = get_conn()
     
@@ -1733,6 +1740,7 @@ def interactive_mode(session_id: int, auto_execute: bool = False, pre_bundling_m
                         max_rounds=5,
                         verbose=True,
                         pre_bundling_mode=pre_bundling_mode,
+                        bottleneck_grading_mode=bottleneck_mode,
                     )
                     
                     # Print formatted answer
@@ -1799,10 +1807,74 @@ def interactive_mode(session_id: int, auto_execute: bool = False, pre_bundling_m
                     print()
                 continue
             
+            elif cmd == "/v9":
+                if not arg:
+                    print("Usage: /v9 <query>")
+                    print("V9.2 Reasoning Workspace Loop (DEFAULT mode)")
+                    print("Examples:")
+                    print("  /v9 who were members of the Silvermaster network?")
+                    print("  /v9 what evidence is there for Soviet awareness of the proximity fuse?")
+                    print("  /v9 only from Vassiliev, list handlers of Rosenberg")
+                    print("\nV9.2 features:")
+                    print("  - Model drives tools (search, fetch, expand_entities w/ co-mentions)")
+                    print("  - Auto-detects scope (collections, date range) from question")
+                    print("  - Model self-labels task_type (roster/timeline/evidence/factual/relationship)")
+                    print("  - Structured output: roster[]/timeline[]/evidence[]/edges[] by task_type")
+                    print("  - Sufficiency contract with per-task-type thresholds")
+                    print("  - Advisory responsiveness check → auto-extends if budget remains")
+                    print("  - Verification is advisory only (never blocks answer)")
+                    continue
+                
+                query_text = arg.strip()
+                if not query_text:
+                    print("Error: Please provide a query text after /v9")
+                    continue
+                
+                print(f"\n[V9 Mode] Processing: \"{query_text}\"...")
+                try:
+                    from retrieval.agent.v9_runner import run_v9_query, format_v9_result
+                    result = run_v9_query(conn=conn, question=query_text, verbose=True)
+                    print(format_v9_result(result, include_verification=True))
+                    if result.workspace and result.workspace.chunks:
+                        try:
+                            chunk_ids = result.workspace.chunk_ids()
+                            if chunk_ids:
+                                from retrieval.ops import log_retrieval_run
+                                from scripts.execute_plan import create_result_set
+                                chunk_pv = os.getenv("DEFAULT_CHUNK_PV", "chunk_v1_full")
+                                with conn.cursor() as cur:
+                                    cur.execute("SELECT current_chunk_pv FROM retrieval_config_current LIMIT 1")
+                                    row = cur.fetchone()
+                                    if row and row[0]:
+                                        chunk_pv = row[0]
+                                run_id = log_retrieval_run(
+                                    conn, query_text=f"[AGENTIC_V9] {query_text}",
+                                    search_type="hybrid", chunk_pv=chunk_pv, embedding_model=None,
+                                    top_k=len(chunk_ids), returned_chunk_ids=chunk_ids,
+                                    retrieval_config_json={"mode": "agentic_v9"},
+                                    auto_commit=False, session_id=session_id,
+                                )
+                                conn.commit()
+                                result_set_id_v9 = create_result_set(
+                                    conn, run_id=run_id, chunk_ids=chunk_ids,
+                                    name=f"V9: {query_text[:40]}... (run {run_id})", session_id=session_id,
+                                )
+                                current_result_set_id = result_set_id_v9
+                                print(f"\n  Created result set #{result_set_id_v9}", file=sys.stderr)
+                        except Exception as e:
+                            print(f"  Warning: Could not create result set: {e}", file=sys.stderr)
+                    print()
+                except Exception as e:
+                    print(f"\nV9 workflow error: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    print()
+                continue
+            
             elif cmd == "/v7":
                 if not arg:
                     print("Usage: /v7 <query>")
-                    print("V7 extends V6 with citation enforcement (DEFAULT mode)")
+                    print("V7 extends V6 with citation enforcement")
                     print("Examples:")
                     print("  /v7 who were members of the Silvermaster network?")
                     print("  /v7 list Soviet agents in the Treasury Department")
@@ -1832,6 +1904,7 @@ def interactive_mode(session_id: int, auto_execute: bool = False, pre_bundling_m
                         drop_uncited_claims=True,
                         verbose=True,
                         pre_bundling_mode=pre_bundling_mode,
+                        bottleneck_grading_mode=bottleneck_mode,
                     )
                     
                     # Print formatted result
@@ -2034,50 +2107,28 @@ def interactive_mode(session_id: int, auto_execute: bool = False, pre_bundling_m
             
             continue
         
-        # Process as a query - V7 is now the DEFAULT for all queries
-        # (V6 available via /v6 command, old agentic modes via /v1-/v4)
+        # Process as a query - V9 is now the DEFAULT for all queries
+        # (V7 via /v7, V6 via /v6, old agentic modes via /v1-/v4)
         
-        # DEFAULT: V7 Citation Enforcement Mode
-        # Plain text queries now go through V7 by default
+        # DEFAULT: V9 Reasoning Workspace Loop (model drives tools, synthesis first, advisory verification)
         query_text = user_input
-        print(f"\n[V7 Mode] Processing: \"{query_text}\"...")
+        print(f"\n[V9 Mode] Processing: \"{query_text}\"...")
         
         try:
-            from retrieval.agent.v7_runner import run_v7_query, format_v7_result
+            from retrieval.agent.v9_runner import run_v9_query, format_v9_result
             
-            result = run_v7_query(
+            result = run_v9_query(
                 conn=conn,
                 question=query_text,
-                max_bottleneck_spans=40,
-                max_rounds=5,
-                drop_uncited_claims=True,
                 verbose=True,
-                pre_bundling_mode=pre_bundling_mode,
             )
             
-            # Print formatted V7 result
-            print(format_v7_result(result, include_evidence=False, include_v6_trace=False))
-            
-            # Show members for roster queries
-            if result.members_identified:
-                print("\nMEMBERS IDENTIFIED:")
-                for m in result.members_identified[:20]:
-                    print(f"  • {m}")
-                if len(result.members_identified) > 20:
-                    print(f"  ... and {len(result.members_identified) - 20} more")
-                print()
+            print(format_v9_result(result, include_verification=True))
             
             # Create result set for summarize compatibility
-            if result.trace and result.trace.v6_trace:
+            if result.workspace and result.workspace.chunks:
                 try:
-                    chunk_ids = []
-                    # Get chunk IDs from bottlenecked spans
-                    spans = getattr(result.trace.v6_trace, 'bottleneck_spans', None) or []
-                    for span in spans:
-                        cid = getattr(span, 'chunk_id', None)
-                        if cid and cid not in chunk_ids:
-                            chunk_ids.append(cid)
-                    
+                    chunk_ids = result.workspace.chunk_ids()
                     if chunk_ids:
                         chunk_pv = None
                         with conn.cursor() as cur:
@@ -2099,32 +2150,32 @@ def interactive_mode(session_id: int, auto_execute: bool = False, pre_bundling_m
                                 top_k=len(chunk_ids),
                                 returned_chunk_ids=chunk_ids,
                                 retrieval_config_json={
-                                    "mode": "agentic_v7",
-                                    "citation_validation_passed": result.citation_validation_passed,
-                                    "claims_valid": result.trace.claims_valid if result.trace else 0,
-                                    "claims_dropped": result.trace.claims_unsupported if result.trace else 0,
+                                    "mode": "agentic_v9",
+                                    "grounded_claims": result.verification.grounded_claims if result.verification else 0,
+                                    "weak_claims": result.verification.weak_claims if result.verification else 0,
+                                    "unsupported_claims": result.verification.unsupported_claims if result.verification else 0,
                                 },
                                 auto_commit=False,
                                 session_id=session_id,
                             )
                             conn.commit()
                             
-                            result_set_id_v7 = create_result_set(
+                            result_set_id_v9 = create_result_set(
                                 conn,
                                 run_id=run_id,
                                 chunk_ids=chunk_ids,
-                                name=f"V7: {query_text[:40]}... (run {run_id})",
+                                name=f"V9: {query_text[:40]}... (run {run_id})",
                                 session_id=session_id,
                             )
-                            current_result_set_id = result_set_id_v7
-                            print(f"  Created result set #{result_set_id_v7}", file=sys.stderr)
+                            current_result_set_id = result_set_id_v9
+                            print(f"  Created result set #{result_set_id_v9}", file=sys.stderr)
                 except Exception as e:
                     print(f"  Warning: Could not create result set: {e}", file=sys.stderr)
             
             print()
                 
         except Exception as e:
-            print(f"\nV7 workflow error: {e}")
+            print(f"\nV9 workflow error: {e}")
             import traceback
             traceback.print_exc()
             print()
@@ -2210,7 +2261,7 @@ def interactive_mode(session_id: int, auto_execute: bool = False, pre_bundling_m
 # One-Shot Mode
 # =============================================================================
 
-def one_shot_query(session_label: str, query: str, auto_execute: bool = True, force_agentic: bool = False, force_v2: bool = False, pre_bundling_mode: str = "off"):
+def one_shot_query(session_label: str, query: str, auto_execute: bool = True, force_agentic: bool = False, force_v2: bool = False, pre_bundling_mode: str = "micro", bottleneck_mode: str = "score"):
     """Execute a single query and print results."""
     conn = get_conn()
     
@@ -2237,18 +2288,22 @@ def one_shot_query(session_label: str, query: str, auto_execute: bool = True, fo
             print("\nFalling back to V1 agentic mode...\n")
     
     # Check if we should use agentic mode (enabled by default for all queries)
+    # Default agentic path is V9 (Reasoning Workspace Loop)
     use_agentic = force_agentic or AGENTIC_MODE_ENABLED
     
     if use_agentic:
-        print("[Agentic Mode (V1)]")
+        print("[V9 Mode - Reasoning Workspace Loop]")
         print()
         try:
-            result = execute_agentic_query(conn, session_id, query)
-            print(format_agentic_result(result))
+            from retrieval.agent.v9_runner import run_v9_query, format_v9_result
+            result = run_v9_query(conn=conn, question=query, verbose=True)
+            print(format_v9_result(result, include_verification=True))
             conn.close()
             return
         except Exception as e:
-            print(f"Agentic workflow error: {e}")
+            print(f"V9 workflow error: {e}")
+            import traceback
+            traceback.print_exc()
             print("\nFalling back to traditional mode...\n")
     
     # Traditional mode
@@ -2365,8 +2420,14 @@ Examples:
     parser.add_argument(
         "--pre-bundling",
         choices=["off", "passthrough", "micro", "semantic"],
-        default="off",
-        help="Pre-bundling mode for concordance-aware evidence grouping (default: off)"
+        default="micro",
+        help="Pre-bundling mode (default: micro)"
+    )
+    parser.add_argument(
+        "--bottleneck-mode",
+        choices=["score", "absolute", "tournament"],
+        default="score",
+        help="Bottleneck grading: score (fastest, no LLM), absolute, tournament (default: score)"
     )
     
     args = parser.parse_args()
@@ -2397,9 +2458,9 @@ Examples:
     
     # One-shot or interactive
     if args.query:
-        one_shot_query(args.session, args.query, args.auto_execute, force_agentic=args.agentic, force_v2=args.v2, pre_bundling_mode=args.pre_bundling)
+        one_shot_query(args.session, args.query, args.auto_execute, force_agentic=args.agentic, force_v2=args.v2, pre_bundling_mode=args.pre_bundling, bottleneck_mode=args.bottleneck_mode)
     else:
-        interactive_mode(session_id, args.auto_execute, pre_bundling_mode=args.pre_bundling)
+        interactive_mode(session_id, args.auto_execute, pre_bundling_mode=args.pre_bundling, bottleneck_mode=args.bottleneck_mode)
 
 
 if __name__ == "__main__":

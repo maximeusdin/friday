@@ -6,6 +6,7 @@ Auth: form login (POST /auth/login) + optional Cognito OAuth2.
 - GET /auth/me, POST|GET /auth/logout.
 Cookies: Domain=.fridayarchive.org, Path=/, Secure, HttpOnly, SameSite=None for cross-site.
 """
+import json
 import os
 import time
 import secrets
@@ -25,8 +26,36 @@ log = logging.getLogger("friday.auth")
 # =========================
 COGNITO_DOMAIN = os.environ.get("COGNITO_DOMAIN", "").rstrip("/")
 COGNITO_CLIENT_ID = os.environ.get("COGNITO_CLIENT_ID", "")
-COGNITO_CLIENT_SECRET = os.environ.get("COGNITO_CLIENT_SECRET")
+_COGNITO_CLIENT_SECRET_RAW = os.environ.get("COGNITO_CLIENT_SECRET")
 COGNITO_ISSUER = os.environ.get("COGNITO_ISSUER", "").rstrip("/")
+
+
+def _get_cognito_client_secret() -> str | None:
+    """
+    Return the raw Cognito client secret for /oauth2/token (Basic auth).
+    Secrets Manager often stores JSON or adds newlines; we strip and optionally
+    parse so the value sent to Cognito is exactly the raw secret.
+    """
+    raw = _COGNITO_CLIENT_SECRET_RAW
+    if not raw:
+        return None
+    raw = raw.strip()
+    if not raw:
+        return None
+    # If stored as JSON (e.g. {"secret":"..."} or {"COGNITO_CLIENT_SECRET":"..."})
+    if raw.startswith("{"):
+        try:
+            obj = json.loads(raw)
+            for key in ("COGNITO_CLIENT_SECRET", "client_secret", "secret"):
+                val = obj.get(key)
+                if isinstance(val, str) and val.strip():
+                    return val.strip()
+            return raw
+        except Exception:
+            raise RuntimeError("COGNITO_CLIENT_SECRET is JSON but missing expected key")
+    return raw
+
+
 UI_REDIRECT_AFTER_LOGIN = os.environ.get("UI_REDIRECT_AFTER_LOGIN", "https://fridayarchive.org/")
 REDIRECT_URI = os.environ.get(
     "COGNITO_REDIRECT_URI", "https://api.fridayarchive.org/auth/oauth/cognito/callback"
@@ -39,7 +68,27 @@ COOKIE_SECURE = os.environ.get("COOKIE_SECURE", "true").lower() == "true"
 # SameSite=None typically required for cross-site (site → API); requires Secure=True
 COOKIE_SAMESITE = "none" if COOKIE_SECURE else "lax"
 
-APP_SESSION_SECRET = os.environ.get("APP_SESSION_SECRET", "")
+def _parse_secret_env(raw: str, *keys: str) -> str:
+    """Extract secret value from env var that may be a raw string or JSON wrapper."""
+    raw = raw.strip()
+    if not raw:
+        return ""
+    if raw.startswith("{"):
+        try:
+            obj = json.loads(raw)
+            for k in keys:
+                val = obj.get(k)
+                if isinstance(val, str) and val.strip():
+                    return val.strip()
+        except Exception:
+            pass
+    return raw
+
+
+APP_SESSION_SECRET = _parse_secret_env(
+    os.environ.get("APP_SESSION_SECRET", ""),
+    "APP_SESSION_SECRET", "secret",
+)
 SESSION_TTL_SECONDS = 7 * 24 * 3600  # 7 days
 STATE_COOKIE_MAX_AGE = 600  # 5–10 min
 
@@ -222,15 +271,20 @@ async def auth_oauth_cognito_callback(request: Request, code: str | None = None,
         log.warning("Auth callback: state mismatch (no token/code logged)")
         raise HTTPException(status_code=400, detail="Invalid state")
 
+    # Token exchange: form-encoded body, Basic auth with raw client secret (no hash).
+    # Secret must be exactly what Cognito has; strip whitespace / parse JSON if from Secrets Manager.
     token_url = f"{COGNITO_DOMAIN}/oauth2/token"
+    client_secret = _get_cognito_client_secret()
     data = {
         "grant_type": "authorization_code",
         "client_id": COGNITO_CLIENT_ID,
         "code": code,
         "redirect_uri": REDIRECT_URI,
     }
+    # Cognito accepts either Basic auth (client_id:client_secret) or client_id+client_secret in body.
+    # We use Basic auth; do not send client_secret in body.
     headers = {"Content-Type": "application/x-www-form-urlencoded"}
-    auth = (COGNITO_CLIENT_ID, COGNITO_CLIENT_SECRET) if COGNITO_CLIENT_SECRET else None
+    auth = (COGNITO_CLIENT_ID, client_secret) if client_secret else None
 
     async with httpx.AsyncClient(timeout=10) as client:
         r = await client.post(token_url, data=data, headers=headers, auth=auth)
@@ -259,8 +313,12 @@ async def auth_oauth_cognito_callback(request: Request, code: str | None = None,
 async def auth_me(request: Request):
     sess = _read_app_session(request)
     if not sess:
-        raise HTTPException(status_code=401, detail="Not authenticated")
-    return JSONResponse({"sub": sess.get("sub"), "email": sess.get("email")})
+        resp = JSONResponse({"detail": "Not authenticated"}, status_code=401)
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
+    resp = JSONResponse({"sub": sess.get("sub"), "email": sess.get("email")})
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
 
 
 @router.post("/logout")

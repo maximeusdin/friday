@@ -176,6 +176,8 @@ export function Conversation({ session, onV9Response, onProcessingChange, onEvid
                 onEscalate={(action, text, carryContext) => {
                   if (action === 'think_deeper') {
                     sendV9(text, 'think_deeper', carryContext);
+                  } else if (action === 'new_retrieval') {
+                    sendV9(text, 'default', carryContext);
                   }
                 }}
                 onPrefillInput={(text) => {
@@ -579,13 +581,22 @@ function EscalationBlock({
         intent_hint: opt.description,
       });
     } else if (opt.action === 'new_retrieval') {
-      // Pre-fill the input so the user can review/edit before sending
+      // Send the prefilled query as a new search immediately
       if (opt.prefilled_query) {
-        onPrefillInput?.(opt.prefilled_query);
+        onEscalate?.(opt.action, opt.prefilled_query, {
+          entities: opt.carry_entities,
+          intent_hint: opt.description,
+        });
+      } else {
+        // No prefilled query — fall back to pre-filling the input for manual entry
+        onPrefillInput?.('');
       }
     } else if (opt.action === 'show_evidence') {
-      // For now, this is a no-op / scroll indicator
-      // Could open the right pane or scroll to citations
+      // Scroll to the claims/citations section of the current message
+      const claimsEl = document.querySelector('.chat-claims');
+      if (claimsEl) {
+        claimsEl.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      }
     }
   };
 

@@ -276,23 +276,23 @@ function ScopePanel({
   };
 
   return (
-    <div style={{ padding: '12px', fontSize: '13px' }}>
+    <div style={{ fontSize: '13px' }}>
       {/* Used in last run */}
       {lastRunScope && (
         <div style={{
-          padding: '8px 10px',
+          padding: '6px 8px',
           background: 'var(--color-surface, #f5f5f5)',
-          borderRadius: '6px',
-          marginBottom: '12px',
+          borderRadius: '4px',
+          marginBottom: '8px',
           fontSize: '12px',
         }}>
-          <div style={{ fontWeight: 600, marginBottom: 4 }}>Used in last run</div>
+          <div style={{ fontWeight: 600, marginBottom: 2 }}>Used in last run</div>
           <div>
             {lastRunScope.mode === 'full_archive' ? 'Full archive' : 'Custom scope'}
             {lastRunScope.source === 'query_override' && ' (overridden by query)'}
           </div>
           {expansionInfo && (
-            <div style={{ marginTop: 4, color: 'var(--color-text-secondary, #666)' }}>
+            <div style={{ marginTop: 2, color: 'var(--color-text-secondary, #666)' }}>
               Expansion: {expansionInfo.triggered ? 'Triggered' : 'Not triggered'}
               {expansionInfo.reason && ` - ${expansionInfo.reason.substring(0, 80)}`}
             </div>
@@ -300,11 +300,11 @@ function ScopePanel({
           <button
             onClick={loadRunScopeIntoSelection}
             style={{
-              marginTop: 6,
+              marginTop: 4,
               fontSize: '11px',
-              padding: '3px 8px',
+              padding: '2px 6px',
               border: '1px solid var(--color-border, #ddd)',
-              borderRadius: '4px',
+              borderRadius: '3px',
               background: 'white',
               cursor: 'pointer',
             }}
@@ -314,23 +314,25 @@ function ScopePanel({
         </div>
       )}
 
-      {/* Mode selector */}
-      <div style={{ marginBottom: '12px' }}>
-        <label style={{ display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer', marginBottom: 6 }}>
+      {/* Mode selector — inline row */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: '8px' }}>
+        <label style={{ display: 'flex', alignItems: 'center', gap: 4, cursor: 'pointer', fontSize: '13px' }}>
           <input
             type="radio"
             name="scope-mode"
             checked={scope.mode === 'full_archive'}
             onChange={() => handleModeChange('full_archive')}
+            style={{ margin: 0 }}
           />
           Full archive
         </label>
-        <label style={{ display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer' }}>
+        <label style={{ display: 'flex', alignItems: 'center', gap: 4, cursor: 'pointer', fontSize: '13px' }}>
           <input
             type="radio"
             name="scope-mode"
             checked={scope.mode === 'custom'}
             onChange={() => handleModeChange('custom')}
+            style={{ margin: 0 }}
           />
           Custom
         </label>
@@ -345,25 +347,25 @@ function ScopePanel({
         disabled={!isCustom}
         style={{
           width: '100%',
-          padding: '6px 8px',
+          padding: '4px 6px',
           border: '1px solid var(--color-border, #ddd)',
-          borderRadius: '4px',
+          borderRadius: '3px',
           fontSize: '12px',
-          marginBottom: '8px',
+          marginBottom: '6px',
           opacity: isCustom ? 1 : 0.5,
         }}
       />
 
       {/* Quick actions */}
       {isCustom && (
-        <div style={{ display: 'flex', gap: 8, marginBottom: 8 }}>
-          <button onClick={selectAll} style={{ fontSize: '11px', cursor: 'pointer', color: 'var(--color-accent, #1a73e8)', background: 'none', border: 'none', padding: 0 }}>
+        <div style={{ display: 'flex', gap: 8, marginBottom: 6, fontSize: '11px' }}>
+          <button onClick={selectAll} style={{ cursor: 'pointer', color: 'var(--color-accent, #1a73e8)', background: 'none', border: 'none', padding: 0, fontSize: 'inherit' }}>
             Select all
           </button>
-          <button onClick={selectNone} style={{ fontSize: '11px', cursor: 'pointer', color: 'var(--color-accent, #1a73e8)', background: 'none', border: 'none', padding: 0 }}>
+          <button onClick={selectNone} style={{ cursor: 'pointer', color: 'var(--color-accent, #1a73e8)', background: 'none', border: 'none', padding: 0, fontSize: 'inherit' }}>
             Select none
           </button>
-          <button onClick={() => handleModeChange('full_archive')} style={{ fontSize: '11px', cursor: 'pointer', color: 'var(--color-text-secondary, #666)', background: 'none', border: 'none', padding: 0, marginLeft: 'auto' }}>
+          <button onClick={() => handleModeChange('full_archive')} style={{ cursor: 'pointer', color: 'var(--color-text-secondary, #666)', background: 'none', border: 'none', padding: 0, marginLeft: 'auto', fontSize: 'inherit' }}>
             Reset
           </button>
         </div>
@@ -371,63 +373,70 @@ function ScopePanel({
 
       {/* Collections tree */}
       {loading ? (
-        <div style={{ color: 'var(--color-text-secondary, #666)', padding: '20px 0', textAlign: 'center' }}>
+        <div style={{ color: 'var(--color-text-secondary, #666)', padding: '12px 0', textAlign: 'center' }}>
           Loading collections...
         </div>
       ) : (
         <div style={{ maxHeight: '400px', overflowY: 'auto' }}>
           {filteredCollections.map(col => (
-            <div key={col.id} style={{ marginBottom: 2 }}>
-              <div style={{
-                display: 'flex', alignItems: 'center', gap: 4, padding: '4px 0',
-                opacity: isCustom ? 1 : 0.5,
-              }}>
+            <div key={col.id} style={{ marginBottom: 1 }}>
+              <div
+                style={{
+                  display: 'flex', alignItems: 'center', gap: 0, padding: '3px 0',
+                  opacity: isCustom ? 1 : 0.5,
+                }}
+              >
                 <input
                   type="checkbox"
                   checked={selectedCollectionIds.has(col.id)}
                   onChange={() => toggleCollection(col.id)}
                   disabled={!isCustom}
-                  style={{ cursor: isCustom ? 'pointer' : 'default' }}
+                  style={{ cursor: isCustom ? 'pointer' : 'default', margin: '0 2px 0 0', flexShrink: 0 }}
                 />
                 <button
                   onClick={() => toggleExpand(col.id)}
                   style={{
                     background: 'none', border: 'none', cursor: 'pointer',
-                    fontSize: '10px', width: 16, padding: 0,
+                    fontSize: '9px', width: 14, padding: 0, flexShrink: 0,
                     color: 'var(--color-text-secondary, #666)',
+                    display: 'flex', alignItems: 'center', justifyContent: 'center',
                   }}
                 >
                   {expandedCollections.has(col.id) ? '▼' : '▶'}
                 </button>
-                <span style={{ fontWeight: 500 }}>{col.title}</span>
-                <span style={{ color: 'var(--color-text-secondary, #666)', fontSize: '11px', marginLeft: 'auto' }}>
-                  {col.document_count} docs
+                <span style={{ fontWeight: 500, flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{col.title}</span>
+                <span style={{ color: 'var(--color-text-secondary, #666)', fontSize: '11px', flexShrink: 0, marginLeft: 4 }}>
+                  {col.document_count}
                 </span>
               </div>
 
               {/* Expanded documents */}
-              {expandedCollections.has(col.id) && col.documents && (
-                <div style={{ paddingLeft: 28 }}>
-                  {col.documents.map(doc => (
-                    <div key={doc.id} style={{
-                      display: 'flex', alignItems: 'center', gap: 4, padding: '2px 0',
-                      fontSize: '12px', opacity: isCustom ? 1 : 0.5,
-                    }}>
-                      <input
-                        type="checkbox"
-                        checked={selectedDocumentIds.has(doc.id)}
-                        onChange={() => toggleDocument(doc.id)}
-                        disabled={!isCustom}
-                        style={{ cursor: isCustom ? 'pointer' : 'default' }}
-                      />
-                      <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                        {doc.source_name}
-                      </span>
-                    </div>
-                  ))}
-                  {!col._docsLoaded && (
-                    <div style={{ color: 'var(--color-text-secondary, #666)', fontSize: '11px', padding: '4px 0' }}>
-                      Loading...
+              {expandedCollections.has(col.id) && (
+                <div style={{ paddingLeft: 18 }}>
+                  {col.documents && col.documents.length > 0 ? (
+                    col.documents.map(doc => (
+                      <div key={doc.id} style={{
+                        display: 'flex', alignItems: 'center', gap: 0, padding: '2px 0',
+                        fontSize: '12px', opacity: isCustom ? 1 : 0.5,
+                      }}>
+                        <input
+                          type="checkbox"
+                          checked={selectedDocumentIds.has(doc.id)}
+                          onChange={() => toggleDocument(doc.id)}
+                          disabled={!isCustom}
+                          style={{ cursor: isCustom ? 'pointer' : 'default', margin: '0 4px 0 0', flexShrink: 0 }}
+                        />
+                        <span
+                          style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+                          title={doc.source_name}
+                        >
+                          {doc.source_name}
+                        </span>
+                      </div>
+                    ))
+                  ) : (
+                    <div style={{ color: 'var(--color-text-secondary, #666)', fontSize: '11px', padding: '2px 0' }}>
+                      {col._docsLoaded ? 'No documents' : 'Loading...'}
                     </div>
                   )}
                 </div>
@@ -439,8 +448,8 @@ function ScopePanel({
 
       {/* Status footer */}
       <div style={{
-        marginTop: 12,
-        padding: '8px 0',
+        marginTop: 8,
+        padding: '6px 0',
         borderTop: '1px solid var(--color-border, #ddd)',
         fontSize: '12px',
         color: 'var(--color-text-secondary, #666)',

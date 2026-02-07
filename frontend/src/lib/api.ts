@@ -154,20 +154,34 @@ export interface AuthUser {
   email?: string;
 }
 
-/** Frontend route for sign-in page (do not redirect browser to API). */
-export const SIGNIN_PATH = '/signin';
+/** Cognito OAuth login URL – redirects to hosted UI then back to the app. */
+export const COGNITO_LOGIN_URL = `${PRODUCTION_API_HOST}/auth/oauth/cognito/login`;
 
 export function getLoginUrl(): string {
-  return SIGNIN_PATH;
+  return COGNITO_LOGIN_URL;
 }
 
 export async function getAuthMe(): Promise<AuthUser | null> {
+  const url = `${getAuthBase()}/auth/me`;
   try {
-    const res = await fetch(`${getAuthBase()}/auth/me`, { credentials: 'include' });
-    if (res.status === 401) return null;
-    if (!res.ok) return null;
-    return res.json();
-  } catch {
+    const res = await fetch(url, {
+      credentials: 'include',
+      cache: 'no-store',          // never serve a stale 401 from cache
+    });
+    if (res.status === 401) {
+      console.debug('[auth] /auth/me → 401 (not authenticated)');
+      return null;
+    }
+    if (!res.ok) {
+      console.warn('[auth] /auth/me → unexpected status', res.status);
+      return null;
+    }
+    const user = await res.json();
+    console.debug('[auth] /auth/me → authenticated as', user.email ?? user.sub);
+    return user;
+  } catch (err) {
+    // CORS failures and network errors land here — log so they're diagnosable
+    console.error('[auth] /auth/me fetch failed (CORS or network?):', err);
     return null;
   }
 }
@@ -309,6 +323,7 @@ export async function deletePendingMessage(sessionId: number): Promise<void> {
   const directUrl = getDirectBackendUrl();
   await fetch(`${directUrl}/sessions/${sessionId}/chat/last-pending`, {
     method: 'DELETE',
+    credentials: 'include',
   });
 }
 
@@ -447,6 +462,7 @@ export async function sendChatMessageStreaming(
   try {
     response = await fetch(`${directUrl}/sessions/${sessionId}/chat/stream`, {
       method: 'POST',
+      credentials: 'include',
       headers: {
         'Content-Type': 'application/json',
       },
@@ -627,6 +643,7 @@ export async function sendV9MessageStreaming(
   try {
     response = await fetch(`${directUrl}/sessions/${sessionId}/v9/message/stream`, {
       method: 'POST',
+      credentials: 'include',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
       signal,
