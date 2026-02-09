@@ -71,10 +71,17 @@ def _mask_url(url: str) -> str:
 async def startup_event():
     db_url = os.getenv("DATABASE_URL", "")
     db_host = os.getenv("DB_HOST", "")
+    db_pass = os.getenv("DB_PASS", "")
     log.info("ENV_CHECK: DATABASE_URL present=%s", bool(db_url))
     if db_url:
         log.info("ENV_CHECK: DATABASE_URL(masked)=%s", _mask_url(db_url))
-    log.info("ENV_CHECK: DB_HOST=%s", db_host or "<missing>")
+    log.info("ENV_CHECK: DB_HOST=%s  DB_PASS present=%s", db_host or "<missing>", bool(db_pass))
+    if db_host and db_pass:
+        log.info("ENV_CHECK: DB config via components (rotation-safe)")
+    elif db_url:
+        log.info("ENV_CHECK: DB config via DATABASE_URL (static)")
+    else:
+        log.error("ENV_CHECK: NO DB CONFIG — both DATABASE_URL and DB_HOST/DB_PASS missing")
 
 
 # Consistent error shape

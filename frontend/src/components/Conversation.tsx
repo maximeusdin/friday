@@ -6,8 +6,9 @@ import { api } from '@/lib/api';
 import type {
   Session, ChatMessage, ChatClaim, ChatMember, V6Stats, EvidenceRef, ChatCitation,
   V9ChatResponse, V9Meta, V9ProgressEvent, V9EvidenceBullet, CitationDetail,
-  ScopeMeta, EscalationOption,
+  ScopeMeta, EscalationOption, UserSelectedScope, CollectionNode,
 } from '@/types/api';
+import { scopeFingerprint } from '@/lib/scope';
 
 interface ConversationProps {
   session: Session | null;
@@ -17,9 +18,20 @@ interface ConversationProps {
   onProgressUpdate?: (steps: V9ProgressEvent[], bullets: V9EvidenceBullet[]) => void;
   /** Ref setter so parent can pre-fill the input (used by escalation "Start new search" action). */
   inputRef?: React.RefObject<HTMLInputElement | null>;
+  // Scope bar props
+  activeScope?: UserSelectedScope | null;
+  lastUsedScope?: UserSelectedScope | null;
+  collections?: CollectionNode[];
+  hasDraftChanges?: boolean;
+  onEditScope?: () => void;
+  onQuerySent?: (scopeSent: UserSelectedScope) => void;
+  onMakeActiveScope?: (scope: UserSelectedScope) => void;
 }
 
-export function Conversation({ session, onV9Response, onProcessingChange, onEvidenceClick, onProgressUpdate }: ConversationProps) {
+export function Conversation({
+  session, onV9Response, onProcessingChange, onEvidenceClick, onProgressUpdate,
+  activeScope, lastUsedScope, collections, hasDraftChanges, onEditScope, onQuerySent, onMakeActiveScope,
+}: ConversationProps) {
   const [input, setInput] = useState('');
   const [isSending, setIsSending] = useState(false);
   const [sendError, setSendError] = useState<string | null>(null);
@@ -30,6 +42,15 @@ export function Conversation({ session, onV9Response, onProcessingChange, onEvid
   const queryClient = useQueryClient();
   const abortControllerRef = useRef<AbortController | null>(null);
   const abortRef = useRef(false);
+
+  // Toast state for scope actions
+  const [toastMessage, setToastMessage] = useState<string | null>(null);
+  useEffect(() => {
+    if (toastMessage) {
+      const timer = setTimeout(() => setToastMessage(null), 3000);
+      return () => clearTimeout(timer);
+    }
+  }, [toastMessage]);
 
   // Fetch chat history (reuses existing endpoint — V9 now persists to research_messages)
   const { data: messages, isLoading } = useQuery({
@@ -71,6 +92,7 @@ export function Conversation({ session, onV9Response, onProcessingChange, onEvid
     onProcessingChange?.(true);
     onV9Response?.(null);
     onProgressUpdate?.([], []);
+    onQuerySent?.(activeScope || { mode: 'full_archive' });
 
     // Accumulate in local vars so callbacks have latest state
     const steps: V9ProgressEvent[] = [];
@@ -139,6 +161,11 @@ export function Conversation({ session, onV9Response, onProcessingChange, onEvid
     onProgressUpdate?.([], []);
   };
 
+  const handleMakeActive = (scope: UserSelectedScope) => {
+    onMakeActiveScope?.(scope);
+    setToastMessage('Scope updated for next queries.');
+  };
+
   const handleThinkDeeper = () => {
     if (!lastV9?.can_think_deeper) return;
     // Re-send the last user question with think_deeper action
@@ -171,8 +198,9 @@ export function Conversation({ session, onV9Response, onProcessingChange, onEvid
                 key={message.id}
                 message={message}
                 onEvidenceClick={onEvidenceClick}
-                // Show V9 metadata on the last assistant message
                 v9={idx === messages.length - 1 && message.role === 'assistant' ? lastV9 : null}
+                onMakeActiveScope={handleMakeActive}
+                collections={collections}
                 onEscalate={(action, text, carryContext) => {
                   if (action === 'think_deeper') {
                     sendV9(text, 'think_deeper', carryContext);
@@ -243,6 +271,19 @@ export function Conversation({ session, onV9Response, onProcessingChange, onEvid
 
       {/* Input area */}
       <div className="chat-input-container">
+        {session && activeScope && (
+          <ActiveScopeBar
+            activeScope={activeScope}
+            lastUsedScope={lastUsedScope ?? null}
+            collections={collections || []}
+            hasDraftChanges={hasDraftChanges || false}
+            hasMessages={!!(messages && messages.length > 0)}
+            onEditScope={onEditScope}
+          />
+        )}
+        {toastMessage && (
+          <div className="scope-toast">{toastMessage}</div>
+        )}
         <form onSubmit={handleSubmit}>
           <div className="flex gap-sm">
             <input
@@ -293,12 +334,16 @@ function ChatBubble({
   v9,
   onEscalate,
   onPrefillInput,
+  onMakeActiveScope,
+  collections,
 }: {
   message: ChatMessage;
   onEvidenceClick?: (evidence: EvidenceRef) => void;
   v9?: V9ChatResponse | null;
   onEscalate?: (action: string, text: string, carryContext?: Record<string, unknown>) => void;
   onPrefillInput?: (text: string) => void;
+  onMakeActiveScope?: (scope: UserSelectedScope) => void;
+  collections?: CollectionNode[];
 }) {
   const isUser = message.role === 'user';
 
@@ -353,40 +398,53 @@ function ChatBubble({
 
         {/* Scope-used header for new_retrieval */}
         {intent === 'new_retrieval' && scopeOverride && (
-          <div style={{
-            fontSize: '12px',
-            color: 'var(--color-text-secondary, #666)',
-            marginBottom: '4px',
-          }}>
-            Scope used: {scopeOverride.run_scope?.mode === 'full_archive'
-              ? 'Full archive'
-              : 'Custom scope'
-            }
-          </div>
+          <UsedScopeDisplay scopeOverride={scopeOverride} collections={collections} />
         )}
 
-        {/* Override warning banner */}
+        {/* Inline scope override banner */}
         {intent === 'new_retrieval' && scopeOverride?.overridden && !overrideDismissed && (
-          <div style={{
-            padding: '8px 10px',
-            background: '#fff3cd',
-            border: '1px solid #ffc107',
-            borderRadius: '6px',
-            marginBottom: '8px',
-            fontSize: '12px',
-          }}>
-            <strong>Scope overridden by query</strong>
+          <div className="scope-inline-banner">
+            <div>
+              <strong>Scope for this query: </strong>
+              {scopeOverride.run_scope?.mode === 'full_archive'
+                ? 'Full archive'
+                : (() => {
+                    const colIds = scopeOverride.run_scope?.included_collection_ids || [];
+                    const names = colIds.slice(0, 3).map(id => {
+                      const col = collections?.find(c => c.id === id);
+                      return col ? (col.title || col.slug) : `#${id}`;
+                    });
+                    return names.join(', ') + (colIds.length > 3 ? ` +${colIds.length - 3} more` : '');
+                  })()
+              }
+              <span style={{ color: 'var(--color-text-muted)', marginLeft: 4 }}>(not saved)</span>
+            </div>
             {scopeOverride.run_scope?.reason && (
-              <span> &mdash; {scopeOverride.run_scope.reason}</span>
+              <div style={{ fontSize: '11px', color: 'var(--color-text-muted)', marginTop: 2 }}>
+                {scopeOverride.run_scope.reason}
+              </div>
             )}
-            <div style={{ marginTop: 4, display: 'flex', gap: 8 }}>
+            <div style={{ marginTop: 6, display: 'flex', gap: 8 }}>
+              <button
+                onClick={() => {
+                  if (scopeOverride.run_scope) {
+                    onMakeActiveScope?.({
+                      mode: scopeOverride.run_scope.mode,
+                      included_collection_ids: scopeOverride.run_scope.included_collection_ids,
+                      included_document_ids: scopeOverride.run_scope.included_document_ids,
+                    });
+                  }
+                  setOverrideDismissed(true);
+                }}
+                className="btn-primary"
+                style={{ fontSize: '11px', padding: '3px 10px' }}
+              >
+                Make active
+              </button>
               <button
                 onClick={() => setOverrideDismissed(true)}
-                style={{
-                  fontSize: '11px', padding: '2px 8px',
-                  border: '1px solid #ccc', borderRadius: '3px',
-                  background: 'white', cursor: 'pointer',
-                }}
+                className="btn-secondary"
+                style={{ fontSize: '11px', padding: '3px 10px' }}
               >
                 Dismiss
               </button>
@@ -949,6 +1007,137 @@ function V6StatsFooter({ stats }: { stats: V6Stats }) {
             <span className="stats-label">Execution Time:</span>
             <span className="stats-value">{stats.elapsed_ms.toFixed(0)}ms</span>
           </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+
+// =============================================================================
+// Active Scope Bar — always-visible bar above chat input
+// =============================================================================
+
+function ActiveScopeBar({
+  activeScope,
+  lastUsedScope,
+  collections,
+  hasDraftChanges,
+  hasMessages,
+  onEditScope,
+}: {
+  activeScope: UserSelectedScope;
+  lastUsedScope: UserSelectedScope | null;
+  collections: CollectionNode[];
+  hasDraftChanges: boolean;
+  hasMessages: boolean;
+  onEditScope?: () => void;
+}) {
+  const isFullArchive = activeScope.mode === 'full_archive';
+  const scopeChanged = lastUsedScope
+    ? scopeFingerprint(activeScope) !== scopeFingerprint(lastUsedScope)
+    : false;
+
+  // Resolve collection IDs to display pills
+  const pills: string[] = [];
+  if (isFullArchive) {
+    pills.push('Full archive');
+  } else {
+    const colIds = activeScope.included_collection_ids || [];
+    for (const id of colIds.slice(0, 4)) {
+      const col = collections.find(c => c.id === id);
+      pills.push(col ? (col.title || col.slug) : `#${id}`);
+    }
+    if (colIds.length > 4) pills.push(`+${colIds.length - 4} more`);
+    const docCount = activeScope.included_document_ids?.length || 0;
+    if (docCount > 0) pills.push(`${docCount} document${docCount !== 1 ? 's' : ''}`);
+  }
+
+  const label = hasMessages ? 'Applies to next query' : 'Applies to first query';
+
+  return (
+    <div className="scope-bar">
+      <span className="scope-bar-label">{label}:</span>
+      <div className="scope-bar-pills">
+        {pills.map((name, i) => (
+          <span key={i} className={isFullArchive && i === 0 ? 'scope-pill scope-pill-archive' : 'scope-pill'}>
+            {name}
+          </span>
+        ))}
+      </div>
+      {hasMessages && lastUsedScope && (
+        scopeChanged
+          ? <span className="scope-tag-changed">changed since last query</span>
+          : <span style={{ fontSize: '11px', color: 'var(--color-text-muted)' }}>(same as last query)</span>
+      )}
+      <button
+        onClick={onEditScope}
+        style={{
+          background: 'none', border: 'none', cursor: 'pointer', padding: '2px 4px',
+          fontSize: '14px', color: 'var(--color-text-muted)', position: 'relative',
+          display: 'flex', alignItems: 'center',
+        }}
+        title={hasDraftChanges ? 'Edit scope (unapplied changes)' : 'Edit scope'}
+      >
+        ✏️
+        {hasDraftChanges && <span className="scope-draft-dot" style={{ position: 'absolute', top: 0, right: 0 }} />}
+      </button>
+    </div>
+  );
+}
+
+
+// =============================================================================
+// Used Scope Display — collapsed/expandable per-message provenance
+// =============================================================================
+
+function UsedScopeDisplay({
+  scopeOverride,
+  collections,
+}: {
+  scopeOverride: { overridden?: boolean; run_scope?: { mode: string; included_collection_ids?: number[]; included_document_ids?: number[] } };
+  collections?: CollectionNode[];
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const runScope = scopeOverride.run_scope;
+  if (!runScope) return null;
+
+  const isFullArchive = runScope.mode === 'full_archive';
+  const colIds = runScope.included_collection_ids || [];
+  const docIds = runScope.included_document_ids || [];
+
+  const summary = isFullArchive
+    ? 'Full archive'
+    : (() => {
+        const names = colIds.slice(0, 3).map(id => {
+          const col = collections?.find(c => c.id === id);
+          return col ? (col.title || col.slug) : `#${id}`;
+        });
+        const label = names.join(', ') + (colIds.length > 3 ? ` +${colIds.length - 3}` : '');
+        return docIds.length > 0 ? `${label} \u2014 ${docIds.length} documents` : label;
+      })();
+
+  return (
+    <div style={{ fontSize: '12px', color: 'var(--color-text-secondary, #666)', marginBottom: '4px' }}>
+      <span
+        onClick={() => setExpanded(!expanded)}
+        style={{ cursor: 'pointer', userSelect: 'none' }}
+      >
+        Used scope: {summary} {expanded ? '▼' : '▶'}
+      </span>
+      {expanded && (
+        <div style={{ marginTop: 4, paddingLeft: 8, fontSize: '11px' }}>
+          <div>Mode: {runScope.mode}</div>
+          {colIds.length > 0 && (
+            <div>
+              Collections ({colIds.length}):
+              {colIds.map(id => {
+                const col = collections?.find(c => c.id === id);
+                return <div key={id} style={{ paddingLeft: 8 }}>&#x2022; {col ? (col.title || col.slug) : `#${id}`}</div>;
+              })}
+            </div>
+          )}
+          {docIds.length > 0 && <div>Documents: {docIds.length}</div>}
         </div>
       )}
     </div>

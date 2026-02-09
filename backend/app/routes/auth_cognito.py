@@ -92,6 +92,17 @@ APP_SESSION_SECRET = _parse_secret_env(
 SESSION_TTL_SECONDS = 7 * 24 * 3600  # 7 days
 STATE_COOKIE_MAX_AGE = 600  # 5–10 min
 
+# --- Startup diagnostics ---
+log.info(
+    "Auth config loaded: COOKIE_DOMAIN=%s  COOKIE_SECURE=%s  SAMESITE=%s  "
+    "SESSION_COOKIE=%s  REDIRECT_URI=%s  UI_REDIRECT=%s  "
+    "APP_SESSION_SECRET=%s  COGNITO_CLIENT_ID=%s",
+    COOKIE_DOMAIN, COOKIE_SECURE, COOKIE_SAMESITE,
+    SESSION_COOKIE_NAME, REDIRECT_URI, UI_REDIRECT_AFTER_LOGIN,
+    f"{APP_SESSION_SECRET[:4]}…" if APP_SESSION_SECRET else "EMPTY",
+    COGNITO_CLIENT_ID or "EMPTY",
+)
+
 _JWKS: dict | None = None
 _JWKS_FETCHED_AT = 0.0
 _JWKS_TTL_SECONDS = 3600
@@ -242,9 +253,11 @@ async def auth_login_post(request: Request):
 
 # OAuth (Cognito): separate paths so POST /auth/login is form/password only.
 @router.get("/oauth/cognito/login")
-async def auth_oauth_cognito_login():
+async def auth_oauth_cognito_login(request: Request):
     """Start Cognito OAuth2 flow: redirect to Cognito hosted UI."""
     if not _auth_configured():
+        log.error("OAuth login: auth not configured (COGNITO_DOMAIN=%s, CLIENT_ID=%s, ISSUER=%s, SECRET=%s)",
+                  bool(COGNITO_DOMAIN), bool(COGNITO_CLIENT_ID), bool(COGNITO_ISSUER), bool(APP_SESSION_SECRET))
         raise HTTPException(status_code=503, detail="Auth not configured")
     state = secrets.token_urlsafe(32)
     params = {
@@ -257,19 +270,48 @@ async def auth_oauth_cognito_login():
     url = f"{COGNITO_DOMAIN}/oauth2/authorize?{urlencode(params)}"
     resp = RedirectResponse(url=url, status_code=302)
     _set_state_cookie(resp, state)
+    log.info("OAuth login: setting oauth_state cookie (domain=%s, secure=%s, samesite=%s) state=%s…%s redirect=%s",
+             COOKIE_DOMAIN, COOKIE_SECURE, COOKIE_SAMESITE, state[:8], state[-4:], REDIRECT_URI)
     return resp
 
 
 @router.get("/oauth/cognito/callback")
 async def auth_oauth_cognito_callback(request: Request, code: str | None = None, state: str | None = None):
+    # --- DIAGNOSTIC: log everything the browser sent ---
+    all_cookie_names = list(request.cookies.keys())
+    cookie_state = request.cookies.get("oauth_state")
+    log.info(
+        "OAuth callback: cookies_received=%s  oauth_state_cookie=%s  state_query=%s  "
+        "host=%s  origin=%s  referer=%s",
+        all_cookie_names,
+        f"{cookie_state[:8]}…{cookie_state[-4:]}" if cookie_state else "MISSING",
+        f"{state[:8]}…{state[-4:]}" if state else "MISSING",
+        request.headers.get("host", "?"),
+        request.headers.get("origin", "?"),
+        request.headers.get("referer", "?")[:80] if request.headers.get("referer") else "?",
+    )
+
     if not _auth_configured():
         raise HTTPException(status_code=503, detail="Auth not configured")
     if not code or not state:
+        log.warning("OAuth callback: missing code=%s state=%s", bool(code), bool(state))
         raise HTTPException(status_code=400, detail="Missing code or state")
-    cookie_state = request.cookies.get("oauth_state")
-    if not cookie_state or cookie_state != state:
-        log.warning("Auth callback: state mismatch (no token/code logged)")
-        raise HTTPException(status_code=400, detail="Invalid state")
+    if not cookie_state:
+        log.error(
+            "OAuth callback: oauth_state cookie MISSING. Browser did not send it. "
+            "Cookie was set with domain=%s path=/ secure=%s samesite=%s. "
+            "Possible causes: (1) cookie blocked by browser, (2) domain mismatch, "
+            "(3) ALB/CDN stripping cookie header, (4) SameSite policy.",
+            COOKIE_DOMAIN, COOKIE_SECURE, COOKIE_SAMESITE,
+        )
+        raise HTTPException(status_code=400, detail="Missing oauth_state cookie — see server logs")
+    if cookie_state != state:
+        log.error(
+            "OAuth callback: state MISMATCH. cookie=%s…%s  query=%s…%s  "
+            "This means a stale/different cookie was sent (e.g. second tab, cached redirect).",
+            cookie_state[:8], cookie_state[-4:], state[:8], state[-4:],
+        )
+        raise HTTPException(status_code=400, detail="State mismatch — see server logs")
 
     # Token exchange: form-encoded body, Basic auth with raw client secret (no hash).
     # Secret must be exactly what Cognito has; strip whitespace / parse JSON if from Secrets Manager.
@@ -286,10 +328,11 @@ async def auth_oauth_cognito_callback(request: Request, code: str | None = None,
     headers = {"Content-Type": "application/x-www-form-urlencoded"}
     auth = (COGNITO_CLIENT_ID, client_secret) if client_secret else None
 
+    log.info("OAuth callback: exchanging code at %s (client_secret present=%s)", token_url, bool(client_secret))
     async with httpx.AsyncClient(timeout=10) as client:
         r = await client.post(token_url, data=data, headers=headers, auth=auth)
         if r.status_code != 200:
-            log.warning("Token exchange failed: status=%s body=%s", r.status_code, r.text[:200])
+            log.error("Token exchange FAILED: status=%s body=%s", r.status_code, r.text[:300])
             raise HTTPException(status_code=400, detail=f"Token exchange failed: {r.text[:200]}")
         token_payload = r.json()
 
@@ -306,16 +349,30 @@ async def auth_oauth_cognito_callback(request: Request, code: str | None = None,
     resp = RedirectResponse(url=UI_REDIRECT_AFTER_LOGIN, status_code=302)
     _pop_state_cookie(resp)
     _set_session_cookie(resp, session_jwt)
+    log.info(
+        "OAuth callback SUCCESS: sub=%s email=%s → redirect to %s  "
+        "session cookie domain=%s secure=%s samesite=%s",
+        sub, email, UI_REDIRECT_AFTER_LOGIN,
+        COOKIE_DOMAIN, COOKIE_SECURE, COOKIE_SAMESITE,
+    )
     return resp
 
 
 @router.get("/me")
 async def auth_me(request: Request):
+    cookie_names = list(request.cookies.keys())
+    has_session = SESSION_COOKIE_NAME in request.cookies
     sess = _read_app_session(request)
     if not sess:
+        log.info(
+            "/auth/me → 401  cookies_present=%s  has_%s=%s  origin=%s",
+            cookie_names, SESSION_COOKIE_NAME, has_session,
+            request.headers.get("origin", "?"),
+        )
         resp = JSONResponse({"detail": "Not authenticated"}, status_code=401)
         resp.headers["Cache-Control"] = "no-store"
         return resp
+    log.info("/auth/me → 200  sub=%s email=%s", sess.get("sub"), sess.get("email"))
     resp = JSONResponse({"sub": sess.get("sub"), "email": sess.get("email")})
     resp.headers["Cache-Control"] = "no-store"
     return resp

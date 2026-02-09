@@ -50,6 +50,17 @@ INCLUDE_COGNITO_CLIENT_SECRET="true"
 COGNITO_CLIENT_SECRET_NAME="cognito-client"
 APP_SESSION_SECRET_NAME="app-session-secret"
 
+# RDS-managed secret — ECS extracts the "password" JSON key at task launch.
+# This survives RDS password rotation automatically.
+RDS_SECRET_ARN="arn:aws:secretsmanager:us-west-1:682405977227:secret:rds!db-d7eff14c-c6f9-449a-ace0-ac376ada5dc0-0gmQ1B"
+
+# DB connection components (non-secret)
+DB_HOST="friday-postgres.cheoc40uk4v7.us-west-1.rds.amazonaws.com"
+DB_NAME="friday"
+DB_USER="friday"
+DB_PORT="5432"
+
+
 
 
 ############################################
@@ -199,6 +210,11 @@ UPDATED_TASKDEF_OBJ="$(echo "${TASKDEF_OBJ}" | jq \
   --arg cookie_domain "${COOKIE_DOMAIN}" \
   --arg cookie_secure "${COOKIE_SECURE}" \
   --arg session_cookie_name "${SESSION_COOKIE_NAME}" \
+  --arg db_host "${DB_HOST}" \
+  --arg db_name "${DB_NAME}" \
+  --arg db_user "${DB_USER}" \
+  --arg db_port "${DB_PORT}" \
+  --arg rds_secret_arn "${RDS_SECRET_ARN}" \
   --arg app_session_secret_arn "${APP_SESSION_SECRET_ARN}" \
   --arg cognito_client_secret_arn "${COGNITO_CLIENT_SECRET_ARN}" \
   --arg include_cognito_secret "${INCLUDE_COGNITO_CLIENT_SECRET}" \
@@ -217,7 +233,11 @@ UPDATED_TASKDEF_OBJ="$(echo "${TASKDEF_OBJ}" | jq \
           .name != "UI_REDIRECT_AFTER_LOGIN" and
           .name != "COOKIE_DOMAIN" and
           .name != "COOKIE_SECURE" and
-          .name != "SESSION_COOKIE_NAME"
+          .name != "SESSION_COOKIE_NAME" and
+          .name != "DB_HOST" and
+          .name != "DB_NAME" and
+          .name != "DB_USER" and
+          .name != "DB_PORT"
         ))
       + [
           {"name":"S3_PDF_BUCKET","value":$s3bucket},
@@ -228,7 +248,11 @@ UPDATED_TASKDEF_OBJ="$(echo "${TASKDEF_OBJ}" | jq \
           {"name":"UI_REDIRECT_AFTER_LOGIN","value":$ui_redirect},
           {"name":"COOKIE_DOMAIN","value":$cookie_domain},
           {"name":"COOKIE_SECURE","value":$cookie_secure},
-          {"name":"SESSION_COOKIE_NAME","value":$session_cookie_name}
+          {"name":"SESSION_COOKIE_NAME","value":$session_cookie_name},
+          {"name":"DB_HOST","value":$db_host},
+          {"name":"DB_NAME","value":$db_name},
+          {"name":"DB_USER","value":$db_user},
+          {"name":"DB_PORT","value":$db_port}
         ]
     )
 
@@ -238,17 +262,21 @@ UPDATED_TASKDEF_OBJ="$(echo "${TASKDEF_OBJ}" | jq \
       # remove prior injected entries to avoid duplicates
       | map(select(
           .name != "APP_SESSION_SECRET" and
-          .name != "COGNITO_CLIENT_SECRET"
+          .name != "COGNITO_CLIENT_SECRET" and
+          .name != "DB_PASS" and
+          .name != "DATABASE_URL"
         ))
       + (
           if $include_cognito_secret == "true" then
             [
               {"name":"APP_SESSION_SECRET","valueFrom":($app_session_secret_arn + ":APP_SESSION_SECRET::")},
-              {"name":"COGNITO_CLIENT_SECRET","valueFrom":($cognito_client_secret_arn + ":COGNITO_CLIENT_SECRET::")}
+              {"name":"COGNITO_CLIENT_SECRET","valueFrom":($cognito_client_secret_arn + ":COGNITO_CLIENT_SECRET::")},
+              {"name":"DB_PASS","valueFrom":($rds_secret_arn + ":password::")}
             ]
           else
             [
-              {"name":"APP_SESSION_SECRET","valueFrom":($app_session_secret_arn + ":APP_SESSION_SECRET::")}
+              {"name":"APP_SESSION_SECRET","valueFrom":($app_session_secret_arn + ":APP_SESSION_SECRET::")},
+              {"name":"DB_PASS","valueFrom":($rds_secret_arn + ":password::")}
             ]
           end
         )

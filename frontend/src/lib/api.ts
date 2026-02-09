@@ -730,12 +730,12 @@ import type { CollectionNode, DocumentNode, UserSelectedScope } from '@/types/ap
 
 async function getCollectionsTree(includeCounts = false): Promise<CollectionNode[]> {
   const params = includeCounts ? '?include_counts=1' : '';
-  return request<CollectionNode[]>(`/documents/collections_tree${params}`);
+  return request<CollectionNode[]>(`/collections_tree${params}`);
 }
 
 async function getCollectionDocuments(collectionId: number, includeCounts = false): Promise<DocumentNode[]> {
   const params = includeCounts ? '?include_counts=1' : '';
-  return request<DocumentNode[]>(`/documents/collections/${collectionId}/documents${params}`);
+  return request<DocumentNode[]>(`/collections/${collectionId}/documents${params}`);
 }
 
 async function getSessionScope(sessionId: number): Promise<UserSelectedScope> {

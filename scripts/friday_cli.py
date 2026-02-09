@@ -1188,17 +1188,22 @@ def print_help():
     """Print help message."""
     print("""
 Commands:
-  <query>       Submit a research query (uses V7 by default)
+  <query>       Submit a research query (uses V9 by default)
   
-  === V7 is now the DEFAULT (V6 + Citation Enforcement) ===
-  V7 features:
-    - All V6 features (CONTROL/CONTENT parsing, entity linking, bottleneck)
-    - PLUS citation enforcement: every claim MUST have citations
-    - Claim enumeration: extracts atomic claims from answer
-    - Stop gate validation: verifies all claims are grounded
-    - Expanded summary: output shows claims with their citations
+  === V9 Reasoning Workspace Loop is now the DEFAULT ===
+  V9 features:
+    - Model drives tools (search, fetch, expand_entities w/ co-mentions)
+    - Auto-detects scope (collections, date range) from question
+    - Structured output: roster[]/timeline[]/evidence[]/edges[] by task_type
+    - Sufficiency contract with per-task-type thresholds
+    - Advisory verification (never blocks answer)
   
+  /v10 <query>  V10 Scope-aware Alias Identity Layer (span-lattice, scoped aliases)
   /v9 <query>   Explicitly use V9 Reasoning Workspace Loop (same as plain query - DEFAULT)
+  /deeper [msg]  Think Deeper: autonomous Actor/Judge loop on last V9/V10 result
+                 Optional follow-up message to guide the investigation
+                 Runs additional retrieval+verification steps to find new evidence
+                 Can be chained: each /deeper builds on the previous result
   /v7 <query>   Use V7 with citation enforcement
   /v6 <query>   Use V6 (no citation enforcement)
   /v4 <query>   Use V4.2 agentic workflow (reasoning-first + discovery loop)
@@ -1241,6 +1246,13 @@ Workflow Modes:
                 - Hard bottleneck forces convergence to 30-50 spans
                 - Responsiveness check: does answer actually satisfy question?
                 - Progress-gated rounds: stop if no quality evidence gained
+  V10 (/v10):   Scope-aware Alias Identity Layer:
+                - Span-lattice query interpretation with dominance relationships
+                - Collection-scoped alias semantics (Venona/Vassiliev codenames stay scoped)
+                - Multi-tier alias resolution: Referent Rules → Contextual → General → Fallback
+                - Structured entity/alias boosts (replaces query rewriting)
+                - Entity-aware grounding and alias-annotated rendering
+                - Full ThinkDeeper compatibility with V10 artifact persistence
   V9 (/v9):     Reasoning Workspace Loop V9.2 (DEFAULT):
                 - Model drives tools (search_chunks, fetch_chunks, expand_entities)
                 - expand_entities supports names[] + include_comentions for roster power
@@ -1282,6 +1294,9 @@ def interactive_mode(session_id: int, auto_execute: bool = False, pre_bundling_m
     
     current_result_set_id = None
     current_v3_result = None  # Track V3 result for structured summarization
+    last_v9_workspace = None  # Track last V9 workspace for /deeper
+    last_v9_question = None   # Track last V9 question for /deeper
+    last_v9_run_id = None     # Track last V9 run_id (v9_runs) for /deeper DB persistence
     
     print_header()
     print(f"Session: {session_label} (ID: {session_id})")
@@ -1835,7 +1850,16 @@ def interactive_mode(session_id: int, auto_execute: bool = False, pre_bundling_m
                     from retrieval.agent.v9_runner import run_v9_query, format_v9_result
                     result = run_v9_query(conn=conn, question=query_text, verbose=True)
                     print(format_v9_result(result, include_verification=True))
+                    # Save workspace for /deeper
+                    if result.workspace:
+                        last_v9_workspace = result.workspace
+                        last_v9_question = query_text
                     if result.workspace and result.workspace.chunks:
+                        # Clear any aborted transaction state from the V9 pipeline
+                        try:
+                            conn.rollback()
+                        except Exception:
+                            pass
                         try:
                             chunk_ids = result.workspace.chunk_ids()
                             if chunk_ids:
@@ -1863,9 +1887,244 @@ def interactive_mode(session_id: int, auto_execute: bool = False, pre_bundling_m
                                 print(f"\n  Created result set #{result_set_id_v9}", file=sys.stderr)
                         except Exception as e:
                             print(f"  Warning: Could not create result set: {e}", file=sys.stderr)
+                    # Create v9_runs entry for Think Deeper DB persistence
+                    try:
+                        conn.rollback()  # clear any aborted transaction
+                    except Exception:
+                        pass
+                    try:
+                        from retrieval.agent.v9_session import create_run as create_v9_run, update_run_status
+                        v9_run = create_v9_run(
+                            conn, session_id=session_id, query_text=query_text,
+                            mode="new_retrieval",
+                        )
+                        last_v9_run_id = v9_run.run_id
+                        update_run_status(conn, v9_run.run_id, "paused")
+                        print(f"  V9 run #{v9_run.run_id} created (paused, ready for /deeper)", file=sys.stderr)
+                    except Exception as e:
+                        print(f"  Warning: Could not create v9_run for Think Deeper: {e}", file=sys.stderr)
+                        last_v9_run_id = None
                     print()
                 except Exception as e:
                     print(f"\nV9 workflow error: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    print()
+                continue
+            
+            elif cmd == "/v10":
+                if not arg:
+                    print("Usage: /v10 <query>")
+                    print("V10 Scope-aware Alias Identity Layer")
+                    print("Examples:")
+                    print("  /v10 who was the Soviet handler for codename LIBERAL?")
+                    print("  /v10 what do the Venona decrypts say about ANTENNA?")
+                    print("  /v10 only from Vassiliev, list handlers of Rosenberg")
+                    print("\nV10 features:")
+                    print("  - Span-lattice query interpretation with dominance")
+                    print("  - Collection-scoped alias semantics (no alias leakage)")
+                    print("  - Multi-tier alias resolution: Referent Rules → Contextual → General → Fallback")
+                    print("  - Structured entity/alias boosts (no query rewriting)")
+                    print("  - Entity-aware grounding and alias-annotated rendering")
+                    print("  - Full ThinkDeeper compatibility")
+                    continue
+                
+                query_text = arg.strip()
+                if not query_text:
+                    print("Error: Please provide a query text after /v10")
+                    continue
+                
+                print(f"\n[V10 Mode] Processing: \"{query_text}\"...")
+                try:
+                    from retrieval.agent.v10_runner import run_v10_query, format_v10_result
+                    v10_result = run_v10_query(conn=conn, question=query_text, verbose=True)
+                    print(format_v10_result(v10_result, include_identity=True))
+                    # Convert to V9Result for /deeper compatibility
+                    result = v10_result.to_v9_result()
+                    if result.workspace:
+                        last_v9_workspace = result.workspace
+                        last_v9_question = query_text
+                    if result.workspace and result.workspace.chunks:
+                        # Clear any aborted transaction state
+                        try:
+                            conn.rollback()
+                        except Exception:
+                            pass
+                        try:
+                            chunk_ids = result.workspace.chunk_ids()
+                            if chunk_ids:
+                                from retrieval.ops import log_retrieval_run
+                                from scripts.execute_plan import create_result_set
+                                chunk_pv = os.getenv("DEFAULT_CHUNK_PV", "chunk_v1_full")
+                                with conn.cursor() as cur:
+                                    cur.execute("SELECT current_chunk_pv FROM retrieval_config_current LIMIT 1")
+                                    row = cur.fetchone()
+                                    if row and row[0]:
+                                        chunk_pv = row[0]
+                                run_id = log_retrieval_run(
+                                    conn, query_text=f"[AGENTIC_V10] {query_text}",
+                                    search_type="hybrid", chunk_pv=chunk_pv, embedding_model=None,
+                                    top_k=len(chunk_ids), returned_chunk_ids=chunk_ids,
+                                    retrieval_config_json={"mode": "agentic_v10"},
+                                    auto_commit=False, session_id=session_id,
+                                )
+                                conn.commit()
+                                result_set_id_v10 = create_result_set(
+                                    conn, run_id=run_id, chunk_ids=chunk_ids,
+                                    name=f"V10: {query_text[:40]}... (run {run_id})", session_id=session_id,
+                                )
+                                current_result_set_id = result_set_id_v10
+                                print(f"\n  Created result set #{result_set_id_v10}", file=sys.stderr)
+                        except Exception as e:
+                            print(f"  Warning: Could not create result set: {e}", file=sys.stderr)
+                    # Create v9_runs entry for Think Deeper DB persistence
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                    try:
+                        from retrieval.agent.v9_session import create_run as create_v9_run, update_run_status
+                        v9_run = create_v9_run(
+                            conn, session_id=session_id, query_text=query_text,
+                            mode="new_retrieval",
+                        )
+                        last_v9_run_id = v9_run.run_id
+                        update_run_status(conn, v9_run.run_id, "paused")
+                        print(f"  V10 run #{v9_run.run_id} created (paused, ready for /deeper)", file=sys.stderr)
+                    except Exception as e:
+                        print(f"  Warning: Could not create v9_run for Think Deeper: {e}", file=sys.stderr)
+                        last_v9_run_id = None
+                    print()
+                except Exception as e:
+                    print(f"\nV10 workflow error: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    print()
+                continue
+            
+            elif cmd == "/deeper":
+                # Think Deeper: autonomous Actor/Judge loop on last V9 result
+                if last_v9_workspace is None:
+                    print("No V9 result to deepen. Run a query first (plain text or /v9 <query>).")
+                    continue
+                
+                user_followup = arg.strip() if arg else None
+                followup_msg = f" with follow-up: \"{user_followup}\"" if user_followup else ""
+                baseline_chunks = len(last_v9_workspace.fulltext_chunks)
+                print(f"\n[Think Deeper] Deepening last V9 result for: \"{last_v9_question}\"{followup_msg}")
+                print(f"  Baseline: {baseline_chunks} chunks in workspace")
+                print("  Actor/Judge autonomous loop running...\n")
+                
+                try:
+                    from retrieval.agent.v9_deep_runner import think_deeper
+                    from retrieval.agent.v9_types import WorkspaceChunk
+                    
+                    td_result = think_deeper(
+                        conn=conn,
+                        seed_question=last_v9_question,
+                        workspace=last_v9_workspace,
+                        user_followup=user_followup,
+                        max_steps=8,
+                        max_tool_calls=10,
+                        verbose=True,
+                        v9_run_id=last_v9_run_id,  # enables DB persistence
+                    )
+                    
+                    # ── Display results ────────────────────────────────────
+                    print(f"\n{'='*60}")
+                    print(f"  THINK DEEPER RESULTS")
+                    print(f"{'='*60}")
+                    print(f"  Steps executed:   {td_result.steps_executed}")
+                    print(f"  Tool calls used:  {td_result.tool_calls_used}")
+                    print(f"  Stop reason:      {td_result.stop_reason}")
+                    print(f"  Elapsed:          {td_result.elapsed_ms:.0f}ms")
+                    
+                    # Novelty report (prominent display)
+                    nr = td_result.novelty_report
+                    if nr:
+                        if nr.new_docs:
+                            print(f"  New documents:    {len(nr.new_docs)}")
+                        if nr.what_changed:
+                            print(f"\n  What changed:")
+                            print(f"    {nr.what_changed}")
+                        if nr.remaining_gaps:
+                            print(f"\n  Remaining gaps:")
+                            for gap in nr.remaining_gaps[:5]:
+                                print(f"    - {gap}")
+                    
+                    # Verdict history summary
+                    if td_result.verdict_history:
+                        print(f"\n  Step-by-step scores:")
+                        for i, v in enumerate(td_result.verdict_history):
+                            print(
+                                f"    Step {i}: ans={v.answeredness:.2f} "
+                                f"nov={v.material_novelty:.2f} "
+                                f"conf={v.confidence:.2f} "
+                                f"{'[STOP]' if v.stop_recommendation else ''}"
+                            )
+                    
+                    # Findings (all new, non-baseline)
+                    if td_result.finding_store_entries:
+                        non_baseline = [e for e in td_result.finding_store_entries if e.finding_type != "baseline"]
+                        if non_baseline:
+                            print(f"\n  New findings ({len(non_baseline)}):")
+                            for entry in non_baseline[:15]:
+                                cids = ",".join(str(c) for c in entry.supporting_chunk_ids[:3])
+                                print(f"    [{entry.finding_type}] {entry.text[:140]} (chunks: {cids})")
+                    
+                    # ── Merge new chunks into workspace for chaining ──────
+                    existing_ids = {c.chunk_id for c in last_v9_workspace.fulltext_chunks}
+                    merged_count = 0
+                    for cc in td_result.selected_chunks:
+                        if cc.chunk_id not in existing_ids:
+                            last_v9_workspace.fulltext_chunks.append(
+                                WorkspaceChunk(
+                                    chunk_id=cc.chunk_id,
+                                    text=cc.text,
+                                    doc_id=cc.doc_id,
+                                    page=cc.page,
+                                    source_label=cc.collection_slug,
+                                    collection_slug=cc.collection_slug,
+                                    score=cc.score,
+                                )
+                            )
+                            existing_ids.add(cc.chunk_id)
+                            merged_count += 1
+                    
+                    new_total = len(last_v9_workspace.fulltext_chunks)
+                    print(f"\n  Evidence: {merged_count} new chunks merged into workspace")
+                    print(f"  Workspace now: {new_total} chunks (was {baseline_chunks})")
+                    
+                    # ── Re-synthesize answer using enriched workspace ─────
+                    # Run V9 on the expanded workspace with a small tool budget
+                    # so it focuses on synthesis rather than more retrieval.
+                    print(f"\n  Re-synthesizing answer with enriched evidence...")
+                    try:
+                        from retrieval.agent.v9_runner import run_v9_query, format_v9_result
+                        resynthesized = run_v9_query(
+                            conn=conn,
+                            question=last_v9_question,
+                            verbose=False,
+                            _resume_workspace=last_v9_workspace,
+                            max_tool_calls=3,  # small budget: focus on synthesis, not more retrieval
+                        )
+                        print(f"\n{'='*60}")
+                        print(f"  UPDATED ANSWER (with Think Deeper evidence)")
+                        print(f"{'='*60}")
+                        print(format_v9_result(resynthesized, include_verification=True))
+                        
+                        # Update workspace with the synthesis result
+                        if resynthesized.workspace:
+                            last_v9_workspace = resynthesized.workspace
+                    except Exception as synth_err:
+                        print(f"  Warning: Re-synthesis failed: {synth_err}", file=sys.stderr)
+                        print(f"  (New evidence is still merged into workspace for next /deeper)")
+                    
+                    print(f"{'='*60}")
+                    print(f"\n  Type /deeper again to continue deepening, or enter a new query.\n")
+                    
+                except Exception as e:
+                    print(f"\nThink Deeper error: {e}")
                     import traceback
                     traceback.print_exc()
                     print()
@@ -2125,8 +2384,18 @@ def interactive_mode(session_id: int, auto_execute: bool = False, pre_bundling_m
             
             print(format_v9_result(result, include_verification=True))
             
+            # Save workspace for /deeper
+            if result.workspace:
+                last_v9_workspace = result.workspace
+                last_v9_question = query_text
+            
             # Create result set for summarize compatibility
             if result.workspace and result.workspace.chunks:
+                # Clear any aborted transaction state from the V9 pipeline
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
                 try:
                     chunk_ids = result.workspace.chunk_ids()
                     if chunk_ids:
@@ -2171,6 +2440,24 @@ def interactive_mode(session_id: int, auto_execute: bool = False, pre_bundling_m
                             print(f"  Created result set #{result_set_id_v9}", file=sys.stderr)
                 except Exception as e:
                     print(f"  Warning: Could not create result set: {e}", file=sys.stderr)
+            
+            # Create v9_runs entry for Think Deeper DB persistence
+            try:
+                conn.rollback()  # clear any aborted transaction
+            except Exception:
+                pass
+            try:
+                from retrieval.agent.v9_session import create_run as create_v9_run, update_run_status
+                v9_run = create_v9_run(
+                    conn, session_id=session_id, query_text=query_text,
+                    mode="new_retrieval",
+                )
+                last_v9_run_id = v9_run.run_id
+                update_run_status(conn, v9_run.run_id, "paused")
+                print(f"  V9 run #{v9_run.run_id} created (paused, ready for /deeper)", file=sys.stderr)
+            except Exception as e:
+                print(f"  Warning: Could not create v9_run for Think Deeper: {e}", file=sys.stderr)
+                last_v9_run_id = None
             
             print()
                 

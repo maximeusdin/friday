@@ -277,8 +277,9 @@ button:disabled {
   background: #157347;
 }
 
-/* Input */
-input, textarea {
+/* Input — exclude checkbox and radio from block-level sizing */
+input:not([type="checkbox"]):not([type="radio"]),
+textarea {
   width: 100%;
   padding: var(--spacing-sm) var(--spacing-md);
   border: 1px solid var(--color-border);
@@ -287,7 +288,8 @@ input, textarea {
   font-family: inherit;
 }
 
-input:focus, textarea:focus {
+input:not([type="checkbox"]):not([type="radio"]):focus,
+textarea:focus {
   outline: none;
   border-color: var(--color-primary);
   box-shadow: 0 0 0 3px rgba(13, 110, 253, 0.15);
@@ -1384,4 +1386,165 @@ input:focus, textarea:focus {
 @keyframes indeterminate {
   0% { transform: translateX(-100%); }
   100% { transform: translateX(400%); }
+}
+
+
+/* =============================================================================
+   Scope UX — Staged Commit Model
+   ============================================================================= */
+
+/* Active Scope Bar (above chat input, always visible) */
+.scope-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px var(--spacing-md, 16px);
+  border-bottom: 1px solid var(--color-border, #e0e0e0);
+  background: var(--color-bg-secondary, #fafafa);
+  font-size: 12px;
+  flex-wrap: wrap;
+}
+
+.scope-bar-label {
+  color: var(--color-text-muted, #888);
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.scope-bar-pills {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+  flex: 1;
+  min-width: 0;
+}
+
+.scope-pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-size: 11px;
+  font-weight: 500;
+  background: var(--color-primary, #1a73e8);
+  color: white;
+  white-space: nowrap;
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.scope-pill-archive {
+  background: var(--color-bg-tertiary, #e8e8e8);
+  color: var(--color-text, #333);
+}
+
+.scope-tag-changed {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 6px;
+  border-radius: 8px;
+  font-size: 10px;
+  font-weight: 600;
+  background: rgba(255, 193, 7, 0.2);
+  color: #997404;
+  white-space: nowrap;
+}
+
+.scope-draft-dot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #e67e22;
+  flex-shrink: 0;
+}
+
+/* Scope Panel Banners */
+.scope-banner-clean {
+  padding: 4px 8px;
+  font-size: 11px;
+  color: var(--color-text-muted, #888);
+  border-bottom: 1px solid var(--color-border, #e0e0e0);
+  flex-shrink: 0;
+}
+
+.scope-banner-dirty {
+  padding: 4px 8px;
+  font-size: 11px;
+  color: #e67e22;
+  font-weight: 500;
+  border-bottom: 1px solid var(--color-border, #e0e0e0);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.scope-rebase-banner {
+  padding: 8px;
+  margin-bottom: 8px;
+  background: #fff3cd;
+  border: 1px solid #ffc107;
+  border-radius: var(--radius-sm, 4px);
+  font-size: 12px;
+  flex-shrink: 0;
+}
+
+/* Changes Strip (summary above tree) */
+.scope-changes-strip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 8px;
+  font-size: 11px;
+  background: rgba(255, 193, 7, 0.08);
+  border-bottom: 1px solid var(--color-border, #e0e0e0);
+  flex-shrink: 0;
+}
+
+.scope-changes-detail {
+  padding: 4px 8px 4px 16px;
+  border-bottom: 1px solid var(--color-border, #e0e0e0);
+  background: var(--color-bg-secondary, #fafafa);
+  flex-shrink: 0;
+}
+
+/* Scope Footer (sticky bottom with Apply / Revert) */
+.scope-footer {
+  padding: 8px;
+  border-top: 1px solid var(--color-border, #e0e0e0);
+  background: var(--color-bg-secondary, #fafafa);
+  flex-shrink: 0;
+}
+
+/* Inline Scope Override Banner (on assistant messages) */
+.scope-inline-banner {
+  padding: 8px 10px;
+  background: #fff3cd;
+  border: 1px solid #ffc107;
+  border-radius: 6px;
+  margin-bottom: 8px;
+  font-size: 12px;
+}
+
+/* Toast notification */
+.scope-toast {
+  padding: 6px var(--spacing-md, 16px);
+  font-size: 12px;
+  color: var(--color-success, #2e7d32);
+  font-weight: 500;
+  border-bottom: 1px solid var(--color-border, #e0e0e0);
+  animation: scopeToastIn 0.3s ease;
+}
+
+@keyframes scopeToastIn {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
 }

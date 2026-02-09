@@ -62,28 +62,51 @@ aws s3 sync out/ "s3://$BUCKET_NAME" --delete --exclude "data/*"
 echo ""
 echo "Setting cache headers..."
 
-# Long cache for static assets (JS, CSS, images)
-aws s3 cp "s3://$BUCKET_NAME" "s3://$BUCKET_NAME" \
+# IMPORTANT: --metadata-directive REPLACE on S3-to-S3 copies resets content-type
+# to binary/octet-stream unless explicitly specified. We must set --content-type
+# for each file type, or re-upload from local with correct types.
+
+# Long cache for JS
+aws s3 cp out/ "s3://$BUCKET_NAME" \
   --recursive \
   --exclude "*" \
   --include "*.js" \
+  --content-type "application/javascript" \
+  --cache-control "public, max-age=31536000, immutable"
+
+# Long cache for CSS
+aws s3 cp out/ "s3://$BUCKET_NAME" \
+  --recursive \
+  --exclude "*" \
   --include "*.css" \
+  --content-type "text/css" \
+  --cache-control "public, max-age=31536000, immutable"
+
+# Long cache for fonts
+aws s3 cp out/ "s3://$BUCKET_NAME" \
+  --recursive \
+  --exclude "*" \
   --include "*.woff" \
   --include "*.woff2" \
+  --cache-control "public, max-age=31536000, immutable"
+
+# Long cache for images
+aws s3 cp out/ "s3://$BUCKET_NAME" \
+  --recursive \
+  --exclude "*" \
   --include "*.png" \
   --include "*.jpg" \
   --include "*.svg" \
   --include "*.ico" \
-  --cache-control "public, max-age=31536000, immutable" \
-  --metadata-directive REPLACE
+  --cache-control "public, max-age=31536000, immutable"
 
-# Short cache for HTML (for updates)
-aws s3 cp "s3://$BUCKET_NAME" "s3://$BUCKET_NAME" \
+# Short cache for HTML (must revalidate on every request)
+aws s3 cp out/ "s3://$BUCKET_NAME" \
   --recursive \
   --exclude "*" \
   --include "*.html" \
-  --cache-control "public, max-age=0, must-revalidate" \
-  --metadata-directive REPLACE
+  --content-type "text/html" \
+  --cache-control "public, max-age=0, must-revalidate"
 
 # Invalidate CloudFront cache if specified
 if [ -n "$CLOUDFRONT_DIST" ]; then

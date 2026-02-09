@@ -1261,6 +1261,11 @@ class V9ChatResponse(BaseModel):
     scope_override: Optional[ScopeOverrideInfoResponse] = None
     expansion_info: Optional[ExpansionInfoResponse] = None
 
+    # Think Deeper enrichment (optional, only present for think_deeper intent)
+    novelty_report: Optional[Dict[str, Any]] = None
+    stop_reason: Optional[str] = None
+    deep_dive_trace: Optional[List[Dict[str, Any]]] = None
+
     # Timing
     elapsed_ms: float = 0.0
 
@@ -1709,6 +1714,10 @@ def v9_message(session_id: int, req: V9ChatRequest, user=Depends(require_user)):
             escalations=escalations_resp,
             scope_override=scope_override_resp,
             expansion_info=expansion_info_resp,
+            # Think Deeper enrichment (additive, optional fields)
+            novelty_report=getattr(result, "novelty_report", None),
+            stop_reason=getattr(result, "stop_reason_detail", None),
+            deep_dive_trace=getattr(result, "deep_dive_trace", None),
             elapsed_ms=_safe_float(result.elapsed_ms),
         )
         return response
@@ -1721,6 +1730,158 @@ def v9_message(session_id: int, req: V9ChatRequest, user=Depends(require_user)):
         raise HTTPException(
             status_code=500,
             detail=f"V9 dispatch error: {str(e)}",
+        )
+    finally:
+        conn.close()
+
+
+# =============================================================================
+# V10 Identity-Aware Pipeline Endpoint
+# =============================================================================
+
+class V10ChatRequest(BaseModel):
+    """Request for V10 session-aware chat with scope-aware alias identity."""
+    text: str
+    action: Optional[str] = "default"  # "default" | "think_deeper"
+    scope_collections: Optional[List[str]] = None  # optional collection filter
+
+
+class V10ChatResponse(BaseModel):
+    """Response from V10 session-aware chat."""
+    intent: str
+    answer: str
+    cited_chunk_ids: List[int] = []
+    confidence: str = "medium"
+    active_run_id: Optional[int] = None
+    active_run_status: str = "completed"
+    active_evidence_set_id: Optional[int] = None
+    can_think_deeper: bool = False
+    citation_map: Dict[str, CitationDetail] = {}
+    unresolved_aliases: List[Dict[str, Any]] = []
+    elapsed_ms: float = 0.0
+
+
+@router.post("/{session_id}/v10/message", response_model=V10ChatResponse)
+def v10_message(session_id: int, req: V10ChatRequest, user=Depends(require_user)):
+    """
+    V10 session-aware message endpoint with scope-aware alias identity.
+
+    Uses the V10 pipeline:
+    - SpanLattice query interpretation
+    - Structured boosts (not query rewriting)
+    - Collection-scoped alias semantics
+    - Contextual (doc/page-specific) alias resolution
+    - Entity-aware grounding + alias-annotated rendering
+
+    Body:
+        { "text": "...", "action": "default" | "think_deeper" }
+
+    V9 endpoints remain unchanged — V10 is opt-in.
+    """
+    assert_session_owned(session_id, user["sub"])
+    text = req.text.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Text cannot be empty")
+
+    explicit_action = None
+    if req.action == "think_deeper":
+        explicit_action = "think_deeper"
+
+    # Build scope
+    scope = None
+    if req.scope_collections:
+        from retrieval.agent.v9_types import ScopeFilter
+        scope = ScopeFilter(collections=req.scope_collections)
+
+    conn = get_conn()
+    try:
+        # Verify session exists
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM research_sessions WHERE id = %s", (session_id,))
+            if not cur.fetchone():
+                raise HTTPException(status_code=404, detail="Session not found")
+
+            # Persist user message
+            cur.execute(
+                "INSERT INTO research_messages (session_id, role, content) "
+                "VALUES (%s, 'user', %s) RETURNING id",
+                (session_id, text),
+            )
+            conn.commit()
+
+        from retrieval.agent.v10_dispatch import dispatch_v10_message
+
+        result = dispatch_v10_message(
+            conn, session_id, text,
+            explicit_action=explicit_action,
+            scope=scope,
+            verbose=True,
+        )
+
+        def _safe_float(x, default: float = 0.0) -> float:
+            if x is None:
+                return default
+            try:
+                f = float(x)
+                return f if math.isfinite(f) else default
+            except (TypeError, ValueError):
+                return default
+
+        # Persist assistant message
+        try:
+            v10_metadata = {
+                "v10": True,
+                "intent": result.intent,
+                "confidence": result.confidence,
+                "cited_chunk_ids": result.cited_chunk_ids,
+                "can_think_deeper": result.can_think_deeper,
+                "elapsed_ms": _safe_float(result.elapsed_ms),
+                "run_id": result.run_id,
+                "evidence_set_id": result.evidence_set_id,
+                "unresolved_aliases": result.unresolved_aliases,
+            }
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO research_messages (session_id, role, content, metadata) "
+                    "VALUES (%s, 'assistant', %s, %s)",
+                    (session_id, result.answer, Json(v10_metadata)),
+                )
+                conn.commit()
+        except Exception as save_err:
+            print(f"[V10] Error saving assistant message: {save_err}", file=sys.stderr)
+
+        # Build citation details
+        cit_details = {}
+        for label, d in (result.citation_map or {}).items():
+            cit_details[label] = CitationDetail(
+                chunk_id=d.get("chunk_id", 0),
+                document_id=d.get("document_id"),
+                page=d.get("page"),
+            )
+
+        response = V10ChatResponse(
+            intent=result.intent,
+            answer=result.answer,
+            cited_chunk_ids=result.cited_chunk_ids or [],
+            confidence=result.confidence,
+            active_run_id=result.run_id,
+            active_run_status=result.run_status,
+            active_evidence_set_id=result.evidence_set_id,
+            can_think_deeper=result.can_think_deeper,
+            citation_map=cit_details,
+            unresolved_aliases=result.unresolved_aliases,
+            elapsed_ms=_safe_float(result.elapsed_ms),
+        )
+        return response
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=500,
+            detail=f"V10 dispatch error: {str(e)}",
         )
     finally:
         conn.close()

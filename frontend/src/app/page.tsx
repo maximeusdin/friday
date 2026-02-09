@@ -1,14 +1,15 @@
 'use client';
 
-import { useState, useCallback, useEffect } from 'react';
+import { useState, useCallback, useEffect, useRef } from 'react';
 import { SessionList } from '@/components/SessionList';
 import { Conversation } from '@/components/Conversation';
 import { RightPane } from '@/components/RightPane';
 import { EvidenceViewer } from '@/components/EvidenceViewer';
 import { AuthHeader } from '@/components/AuthHeader';
-import type { Session, EvidenceRef, V9ChatResponse, V9ProgressEvent, V9EvidenceBullet, UserSelectedScope } from '@/types/api';
+import type { Session, EvidenceRef, V9ChatResponse, V9ProgressEvent, V9EvidenceBullet, UserSelectedScope, CollectionNode } from '@/types/api';
 import type { AuthUser } from '@/lib/api';
 import { api, getLoginUrl } from '@/lib/api';
+import { normalizeScope } from '@/lib/scope';
 
 export default function Home() {
   const [user, setUser] = useState<AuthUser | null>(null);
@@ -19,7 +20,30 @@ export default function Home() {
   const [isProcessing, setIsProcessing] = useState(false);
   const [progressSteps, setProgressSteps] = useState<V9ProgressEvent[]>([]);
   const [evidenceBullets, setEvidenceBullets] = useState<V9EvidenceBullet[]>([]);
-  const [sessionScope, setSessionScope] = useState<UserSelectedScope | null>(null);
+
+  // --- Scope state (staged-commit model) ---
+  const [activeScope, setActiveScope] = useState<UserSelectedScope | null>(null);
+  const [activeScopeRevision, setActiveScopeRevision] = useState(0);
+  const [lastUsedScope, setLastUsedScope] = useState<UserSelectedScope | null>(null);
+  const pendingRunScopeRef = useRef<UserSelectedScope | null>(null);
+  const [activeRightTab, setActiveRightTab] = useState<'scope' | 'investigation'>('scope');
+  const [hasDraftChanges, setHasDraftChanges] = useState(false);
+  const [collections, setCollections] = useState<CollectionNode[]>([]);
+
+  // Load collections cache once on mount (retry once after 2s on failure)
+  useEffect(() => {
+    const load = () => api.getCollectionsTree().then(setCollections);
+    load().catch(() => {
+      setTimeout(() => load().catch(console.error), 2000);
+    });
+  }, []);
+
+  // Auto-switch to investigation tab when a query starts processing
+  useEffect(() => {
+    if (isProcessing) setActiveRightTab('investigation');
+  }, [isProcessing]);
+
+  // --- Session handlers ---
 
   const handleSessionSelect = (session: Session) => {
     setActiveSession(session);
@@ -27,13 +51,65 @@ export default function Home() {
     setLastV9Response(null);
     setProgressSteps([]);
     setEvidenceBullets([]);
-    // Load scope from session
-    setSessionScope(session.scope_json || { mode: 'full_archive' });
+    // Scope: deterministic reset
+    setActiveScope(session.scope_json || { mode: 'full_archive' });
+    setActiveScopeRevision(1); // deterministic reset, not increment
+    setLastUsedScope(null);
+    pendingRunScopeRef.current = null;
+    setActiveRightTab('scope');
+    setHasDraftChanges(false);
   };
 
-  const handleV9Response = (response: V9ChatResponse | null) => {
-    setLastV9Response(response);
+  const handleSessionDelete = () => {
+    setActiveSession(null);
+    setActiveEvidence(null);
+    setLastV9Response(null);
+    setIsProcessing(false);
+    setProgressSteps([]);
+    setEvidenceBullets([]);
+    setActiveScope(null);
+    setActiveScopeRevision(0);
+    setLastUsedScope(null);
+    pendingRunScopeRef.current = null;
+    setHasDraftChanges(false);
   };
+
+  // --- Scope handlers (useCallback-stable) ---
+
+  const handleApplyScope = useCallback((scope: UserSelectedScope) => {
+    setActiveScope(scope);
+    setActiveScopeRevision(r => r + 1);
+    if (activeSession?.id) {
+      api.updateSessionScope(activeSession.id, scope).catch(console.error);
+    }
+  }, [activeSession?.id]);
+
+  const handleQuerySent = useCallback((scopeSent: UserSelectedScope) => {
+    pendingRunScopeRef.current = normalizeScope(scopeSent);
+  }, []);
+
+  const handleDraftDirtyChange = useCallback((dirty: boolean) => {
+    setHasDraftChanges(dirty);
+  }, []);
+
+  const handleEditScope = useCallback(() => {
+    setActiveRightTab('scope');
+  }, []);
+
+  // --- V9 response handler ---
+
+  const handleV9Response = useCallback((response: V9ChatResponse | null) => {
+    setLastV9Response(response);
+    if (response?.scope_override?.run_scope) {
+      setLastUsedScope(normalizeScope({
+        mode: response.scope_override.run_scope.mode,
+        included_collection_ids: response.scope_override.run_scope.included_collection_ids,
+        included_document_ids: response.scope_override.run_scope.included_document_ids,
+      }));
+    } else if (pendingRunScopeRef.current) {
+      setLastUsedScope(pendingRunScopeRef.current);
+    }
+  }, []);
 
   const handleProcessingChange = (processing: boolean) => {
     setIsProcessing(processing);
@@ -48,23 +124,12 @@ export default function Home() {
     setEvidenceBullets(bullets);
   }, []);
 
-  const handleSessionDelete = () => {
-    setActiveSession(null);
-    setActiveEvidence(null);
-    setLastV9Response(null);
-    setIsProcessing(false);
-    setProgressSteps([]);
-    setEvidenceBullets([]);
-    setSessionScope(null);
-  };
+  // --- Auth ---
 
   useEffect(() => {
     let cancelled = false;
     const checkAuth = async () => {
       let u = await api.getAuthMe();
-      // If first check fails, retry once after a brief delay.
-      // Handles edge cases where the session cookie isn't immediately
-      // available after an OAuth redirect (302 → page load race).
       if (!u) {
         await new Promise((r) => setTimeout(r, 500));
         if (!cancelled) u = await api.getAuthMe();
@@ -130,7 +195,7 @@ export default function Home() {
                   onClick={() => setActiveEvidence(null)}
                   style={{ fontSize: '13px', padding: '4px 12px' }}
                 >
-                  ← Back to Chat
+                  &larr; Back to Chat
                 </button>
               </div>
               <EvidenceViewer
@@ -156,12 +221,19 @@ export default function Home() {
                 onProcessingChange={handleProcessingChange}
                 onEvidenceClick={handleEvidenceClick}
                 onProgressUpdate={handleProgressUpdate}
+                activeScope={activeScope}
+                lastUsedScope={lastUsedScope}
+                collections={collections}
+                hasDraftChanges={hasDraftChanges}
+                onEditScope={handleEditScope}
+                onQuerySent={handleQuerySent}
+                onMakeActiveScope={handleApplyScope}
               />
             </>
           )}
         </div>
 
-        {/* Right Pane: Investigation */}
+        {/* Right Pane: Scope & Investigation */}
         <div className="pane" style={{ borderRight: 'none' }}>
           <RightPane
             v9Response={lastV9Response}
@@ -170,8 +242,13 @@ export default function Home() {
             progressSteps={progressSteps}
             evidenceBullets={evidenceBullets}
             sessionId={activeSession?.id}
-            sessionScope={sessionScope}
-            onScopeChange={setSessionScope}
+            activeScope={activeScope}
+            activeTab={activeRightTab}
+            onTabChange={setActiveRightTab}
+            onApplyScope={handleApplyScope}
+            onDraftDirtyChange={handleDraftDirtyChange}
+            activeScopeRevision={activeScopeRevision}
+            collections={collections}
           />
         </div>
       </div>
