@@ -657,16 +657,43 @@ function ScopePanel({
 
 const DEFAULT_MAX_TOOL_CALLS = 12;
 
-function toUserFriendlyProgress(step: V9ProgressEvent): string {
+/** Strip chunk_id=..., chunk_ids: [], etc. from bullet text (LLM sometimes echoes prompt format). */
+function sanitizeBulletText(text: string): string {
+  return text
+    .replace(/\s*[\[\(]chunk_id=\d+[\)\]]\s*/gi, ' ')
+    .replace(/\s*[\[\(]chunk_ids:\s*\[\d*(?:,\s*\d*)*\]\s*[\)\]]\s*/gi, ' ')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+}
+
+const PROGRESS_PHRASES = [
+  'Searching archives...',
+  'Reviewing documents...',
+  'Cross-referencing sources...',
+  'Extracting key findings...',
+  'Verifying evidence...',
+  'Building answer...',
+  'Following leads...',
+  'Checking citations...',
+];
+
+function toUserFriendlyProgress(step: V9ProgressEvent, stepIndex?: number): string {
   switch (step.step) {
     case 'tool_call': {
+      // Prefer backend message when it contains context (e.g. "Searching for: X", "Loading N chunks...")
+      const msg = (step.message || '').trim();
+      if (msg && (msg.startsWith('Searching for:') || msg.startsWith('Loading ') || msg.includes('chunks'))) {
+        return msg;
+      }
       const tool = (step.details?.tool as string) || '';
-      if (tool.startsWith('search_chunks') || tool === 'search_chunks') return 'Searching documents...';
+      const idx = stepIndex ?? 0;
+      if (tool.startsWith('search_chunks') || tool === 'search_chunks') {
+        return PROGRESS_PHRASES[idx % PROGRESS_PHRASES.length];
+      }
       if (tool.startsWith('fetch_chunks') || tool === 'fetch_chunks') return 'Reading documents...';
       if (tool.startsWith('expand_entities') || tool === 'expand_entities') return 'Resolving identities...';
       if (tool.startsWith('alias_index') || tool.includes('alias')) return 'Looking up references...';
-      if (tool.startsWith('search') || tool.includes('search')) return 'Searching...';
-      return 'Gathering evidence...';
+      return PROGRESS_PHRASES[idx % PROGRESS_PHRASES.length];
     }
     case 'turn_start':
       return 'Investigating...';
@@ -680,12 +707,22 @@ function toUserFriendlyProgress(step: V9ProgressEvent): string {
       return 'Found evidence...';
     case 'routing':
       return 'Understanding your question...';
+    case 'investigation_start':
+    case 'retrieval_prepare':
+      return 'Starting investigation...';
+    case 'context_build':
+      return 'Building context...';
+    case 'follow_up_start':
+    case 'follow_up':
+      return 'Searching evidence...';
+    case 'think_deeper_start':
+      return 'Resuming Think Deeper...';
     default:
-      if (step.message?.toLowerCase().includes('search')) return 'Searching...';
-      if (step.message?.toLowerCase().includes('round')) return 'Analyzing evidence...';
+      if (step.message?.toLowerCase().includes('search')) return 'Searching archives...';
+      if (step.message?.toLowerCase().includes('round')) return 'Cross-referencing sources...';
       if (step.message?.toLowerCase().includes('fetch')) return 'Reading documents...';
       if (step.message?.toLowerCase().includes('synthes')) return 'Synthesizing answer...';
-      return step.message || 'Investigating...';
+      return PROGRESS_PHRASES[(stepIndex ?? 0) % PROGRESS_PHRASES.length] || step.message || 'Investigating...';
   }
 }
 
@@ -751,21 +788,22 @@ function InvestigationPanel({
     const steps = progressStepsFiltered.filter(s => s.step !== 'evidence_update');
     if (steps.length === 0) return null;
     const seen = new Set<string>();
-    const unique: V9ProgressEvent[] = [];
-    for (const s of steps) {
-      const label = toUserFriendlyProgress(s);
+    const unique: { step: V9ProgressEvent; idx: number }[] = [];
+    for (let i = 0; i < steps.length; i++) {
+      const s = steps[i];
+      const label = toUserFriendlyProgress(s, i);
       if (!seen.has(label)) {
         seen.add(label);
-        unique.push(s);
+        unique.push({ step: s, idx: i });
       }
     }
     return (
       <div className="workflow-progress-bullets">
         <div className="actions-header">Progress</div>
         <ul className="progress-bullets-list">
-          {unique.map((step, i) => (
+          {unique.map(({ step, idx }, i) => (
             <li key={i} className="progress-bullet">
-              {toUserFriendlyProgress(step)}
+              {toUserFriendlyProgress(step, idx)}
             </li>
           ))}
         </ul>
@@ -780,18 +818,19 @@ function InvestigationPanel({
         <div className="evidence-bullets-list">
           {evidenceBullets.map((bullet, i) => (
             <div key={i} className="evidence-bullet-live">
-              <div className="bullet-text">{bullet.text}</div>
+              <div className="bullet-text">{sanitizeBulletText(bullet.text)}</div>
               <div className="bullet-meta">
                 {bullet.doc_ids?.length > 0 && bullet.chunk_ids?.length > 0 && onEvidenceClick && (
                   <button
                     className="bullet-source-link"
                     onClick={() => onEvidenceClick({
                       document_id: bullet.doc_ids[0],
-                      pdf_page: 1,
+                      pdf_page: bullet.pages?.[0] ?? 1,
                       chunk_id: bullet.chunk_ids[0],
                     })}
                   >
-                    View source
+                    {bullet.source_names?.[0] || (bullet.pages?.[0] ? `p.${bullet.pages[0]}` : 'View document')}
+                    {bullet.pages?.[0] && bullet.source_names?.[0] && ` (p.${bullet.pages[0]})`}
                   </button>
                 )}
               </div>

@@ -112,6 +112,7 @@ class V9Meta(BaseModel):
     confidence: Optional[str] = None
     can_think_deeper: bool = False
     remaining_gaps: List[str] = []
+    suggested_queries: List[str] = []
     suggestion: str = ""
     elapsed_ms: float = 0.0
     run_id: Optional[int] = None
@@ -676,6 +677,7 @@ def get_chat_history(session_id: int, user=Depends(require_user)):
                         confidence=metadata.get("confidence"),
                         can_think_deeper=metadata.get("can_think_deeper", False),
                         remaining_gaps=metadata.get("remaining_gaps", []),
+                        suggested_queries=metadata.get("suggested_queries", []),
                         suggestion=metadata.get("suggestion", ""),
                         elapsed_ms=metadata.get("elapsed_ms", 0.0),
                         run_id=metadata.get("run_id"),
@@ -1241,6 +1243,7 @@ class V9ChatResponse(BaseModel):
     # Sufficiency (remaining gaps + suggested next actions)
     remaining_gaps: List[str] = []
     next_best_actions: List[str] = []
+    suggested_queries: List[str] = []  # Think Deeper: LLM-generated queries to explore
 
     # Run history for UI (recent runs in this session)
     run_history: List[V9RunSummary] = []
@@ -1597,6 +1600,9 @@ async def v9_message_stream(session_id: int, req: V9ChatRequest, user=Depends(re
                     }
 
                     # Persist assistant message
+                    _nr = getattr(result, "novelty_report", None)
+                    _suggested = (_nr.get("suggested_queries") or []) if isinstance(_nr, dict) else []
+                    _gaps = (_nr.get("remaining_gaps") or []) if isinstance(_nr, dict) else []
                     try:
                         v9_metadata = {
                             "v9": True,
@@ -1604,6 +1610,8 @@ async def v9_message_stream(session_id: int, req: V9ChatRequest, user=Depends(re
                             "confidence": result.confidence,
                             "cited_chunk_ids": result.cited_chunk_ids,
                             "can_think_deeper": result.can_think_deeper,
+                            "remaining_gaps": _gaps,
+                            "suggested_queries": _suggested,
                             "suggestion": result.suggestion,
                             "elapsed_ms": _safe_float(result.elapsed_ms),
                             "run_id": result.run_id,
@@ -1626,10 +1634,16 @@ async def v9_message_stream(session_id: int, req: V9ChatRequest, user=Depends(re
                     from retrieval.agent.v9_session import load_recent_runs
                     remaining_gaps: List[str] = []
                     next_best_actions: List[str] = []
+                    suggested_queries: List[str] = []
                     if result.v9_result and result.v9_result.sufficiency:
                         suf = result.v9_result.sufficiency
                         remaining_gaps = suf.remaining_gaps or []
                         next_best_actions = suf.next_best_actions_if_more_time or []
+                    if result.intent == "think_deeper":
+                        nr = getattr(result, "novelty_report", None)
+                        if nr and isinstance(nr, dict):
+                            remaining_gaps = nr.get("remaining_gaps") or []
+                            suggested_queries = nr.get("suggested_queries") or []
 
                     run_history: List[Dict] = []
                     try:
@@ -1694,6 +1708,7 @@ async def v9_message_stream(session_id: int, req: V9ChatRequest, user=Depends(re
                         "can_think_deeper": result.can_think_deeper,
                         "remaining_gaps": remaining_gaps,
                         "next_best_actions": next_best_actions,
+                        "suggested_queries": suggested_queries,
                         "run_history": run_history,
                         "routing_reasoning": routing.reasoning if routing else "",
                         "routing_confidence": _safe_float(routing.confidence if routing else None, 0.0),
@@ -1773,10 +1788,20 @@ def v9_message(session_id: int, req: V9ChatRequest, user=Depends(require_user)):
         # Extract sufficiency data if available
         remaining_gaps: List[str] = []
         next_best_actions: List[str] = []
+        suggested_queries: List[str] = []
         if result.v9_result and result.v9_result.sufficiency:
             suf = result.v9_result.sufficiency
             remaining_gaps = suf.remaining_gaps or []
             next_best_actions = suf.next_best_actions_if_more_time or []
+        if result.intent == "think_deeper":
+            nr = getattr(result, "novelty_report", None)
+            if nr:
+                if isinstance(nr, dict):
+                    remaining_gaps = nr.get("remaining_gaps") or []
+                    suggested_queries = nr.get("suggested_queries") or []
+                else:
+                    remaining_gaps = getattr(nr, "remaining_gaps", []) or []
+                    suggested_queries = getattr(nr, "suggested_queries", []) or []
 
         # Load run history for UI
         run_history: List[V9RunSummary] = []
@@ -1820,6 +1845,7 @@ def v9_message(session_id: int, req: V9ChatRequest, user=Depends(require_user)):
                 "cited_chunk_ids": result.cited_chunk_ids,
                 "can_think_deeper": result.can_think_deeper,
                 "remaining_gaps": remaining_gaps,
+                "suggested_queries": suggested_queries,
                 "suggestion": result.suggestion,
                 "elapsed_ms": _safe_float(result.elapsed_ms),
                 "run_id": result.run_id,
@@ -1912,6 +1938,7 @@ def v9_message(session_id: int, req: V9ChatRequest, user=Depends(require_user)):
             can_think_deeper=result.can_think_deeper,
             remaining_gaps=remaining_gaps,
             next_best_actions=next_best_actions,
+            suggested_queries=suggested_queries,
             run_history=run_history,
             routing_reasoning=routing.reasoning if routing else "",
             routing_confidence=_safe_float(routing.confidence if routing else None, 0.0),

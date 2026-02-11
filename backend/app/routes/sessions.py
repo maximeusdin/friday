@@ -30,6 +30,7 @@ class Session(BaseModel):
     created_at: datetime
     message_count: Optional[int] = None
     last_activity: Optional[datetime] = None
+    scope_json: Optional[dict] = None
 
 
 class Message(BaseModel):
@@ -154,27 +155,46 @@ def get_session(session_id: int, user=Depends(require_user)):
     assert_session_owned(session_id, user["sub"])
     conn = get_conn()
     try:
+        cols = get_table_columns(get_dsn(), "research_sessions")
+        has_scope = has_column(cols, "scope_json")
         with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT 
-                    s.id,
-                    s.label,
-                    s.created_at,
-                    COUNT(m.id) AS message_count,
-                    MAX(m.created_at) AS last_activity,
-                    s.scope_json
-                FROM research_sessions s
-                LEFT JOIN research_messages m ON m.session_id = s.id
-                WHERE s.id = %s AND s.user_sub = %s
-                GROUP BY s.id, s.scope_json
-                """,
-                (session_id, user["sub"]),
-            )
+            if has_scope:
+                cur.execute(
+                    """
+                    SELECT 
+                        s.id,
+                        s.label,
+                        s.created_at,
+                        COUNT(m.id) AS message_count,
+                        MAX(m.created_at) AS last_activity,
+                        s.scope_json
+                    FROM research_sessions s
+                    LEFT JOIN research_messages m ON m.session_id = s.id
+                    WHERE s.id = %s AND s.user_sub = %s
+                    GROUP BY s.id, s.scope_json
+                    """,
+                    (session_id, user["sub"]),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT 
+                        s.id,
+                        s.label,
+                        s.created_at,
+                        COUNT(m.id) AS message_count,
+                        MAX(m.created_at) AS last_activity
+                    FROM research_sessions s
+                    LEFT JOIN research_messages m ON m.session_id = s.id
+                    WHERE s.id = %s AND s.user_sub = %s
+                    GROUP BY s.id
+                    """,
+                    (session_id, user["sub"]),
+                )
             row = cur.fetchone()
             if not row:
                 raise HTTPException(status_code=404, detail="Session not found")
-            scope = row[5]
+            scope = row[5] if has_scope else {"mode": "full_archive"}
             if isinstance(scope, str):
                 import json as _json
                 try:
@@ -293,16 +313,18 @@ def update_session_scope(session_id: int, req: UpdateScopeRequest, user=Depends(
 
     conn = get_conn()
     try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                UPDATE research_sessions
-                SET scope_json = %s, updated_at = now()
-                WHERE id = %s AND user_sub = %s
-                """,
-                (Json(scope_json), session_id, user["sub"]),
-            )
-            conn.commit()
+        cols = get_table_columns(get_dsn(), "research_sessions")
+        if has_column(cols, "scope_json"):
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE research_sessions
+                    SET scope_json = %s, updated_at = now()
+                    WHERE id = %s AND user_sub = %s
+                    """,
+                    (Json(scope_json), session_id, user["sub"]),
+                )
+                conn.commit()
         return {"ok": True, "scope_json": scope_json}
     finally:
         conn.close()

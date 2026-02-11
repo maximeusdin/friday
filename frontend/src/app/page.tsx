@@ -208,10 +208,7 @@ export default function Home() {
             <>
               <div className="pane-header">
                 {activeSession ? (
-                  <>
-                    <span>{activeSession.label}</span>
-                    <span className="header-badge">V9</span>
-                  </>
+                  <span>{activeSession.label}</span>
                 ) : (
                   'Friday Research Console'
                 )}
@@ -222,6 +219,7 @@ export default function Home() {
                 onProcessingChange={handleProcessingChange}
                 onEvidenceClick={handleEvidenceClick}
                 onProgressUpdate={handleProgressUpdate}
+                onShowEvidence={() => setActiveRightTab('investigation')}
                 activeScope={activeScope}
                 lastUsedScope={lastUsedScope}
                 collections={collections}
@@ -231,6 +229,9 @@ export default function Home() {
                 onMakeActiveScope={handleApplyScope}
                 isProcessing={isProcessing}
                 processingSessionId={processingSessionId}
+                progressSteps={progressSteps}
+                evidenceBullets={evidenceBullets}
+                lastV9Response={lastV9Response}
               />
             </>
           )}

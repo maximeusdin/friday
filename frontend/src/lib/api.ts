@@ -154,11 +154,16 @@ export interface AuthUser {
   email?: string;
 }
 
-/** Cognito OAuth login URL – redirects to hosted UI then back to the app. */
-export const COGNITO_LOGIN_URL = `${PRODUCTION_API_HOST}/auth/oauth/cognito/login`;
+/** Backend OAuth callback path. Cognito redirects here; backend exchanges code, sets cookie, 302 to app. */
+const AUTH_CALLBACK_PATH = '/auth/oauth/cognito/callback';
 
-export function getLoginUrl(): string {
-  return COGNITO_LOGIN_URL;
+/** Cognito OAuth login URL. redirect_uri points to backend callback; backend then 302 to app. */
+export function getLoginUrl(returnUrl?: string): string {
+  const base = getAuthBase();
+  const redirectUri = `${base.replace(/\/$/, '')}${AUTH_CALLBACK_PATH}`;
+  const params = new URLSearchParams({ redirect_uri: redirectUri });
+  if (returnUrl) params.set('return_url', returnUrl);
+  return `${base}/auth/oauth/cognito/login?${params.toString()}`;
 }
 
 export async function getAuthMe(): Promise<AuthUser | null> {
@@ -587,6 +592,7 @@ export interface V9EvidenceBullet {
   tags: string[];
   chunk_ids: number[];
   doc_ids: number[];
+  pages?: number[];
 }
 
 /**
@@ -641,7 +647,7 @@ export async function sendV9MessageStreaming(
 
   let response: Response;
   try {
-    response = await fetch(`${directUrl}/sessions/${sessionId}/v10/message/stream`, {
+    response = await fetch(`${directUrl}/sessions/${sessionId}/v9/message/stream`, {
       method: 'POST',
       credentials: 'include',
       headers: { 'Content-Type': 'application/json' },

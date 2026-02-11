@@ -38,16 +38,16 @@ def register_routers(app: FastAPI) -> None:
     app.include_router(documents.router, prefix="/api", tags=["documents"])
 
 
-# Optional: load .env files (dev convenience). Disabled by default so the app
-# can run in a container with only environment variables.
-if os.getenv("FRIDAY_LOAD_DOTENV") == "1":
+# Load .env for local dev (when file exists or FRIDAY_LOAD_DOTENV=1).
+# Does not override existing env vars; container env wins.
+_envenv = REPO_ROOT / ".env"
+if os.getenv("FRIDAY_LOAD_DOTENV") == "1" or _envenv.exists():
     try:
         from dotenv import load_dotenv
 
         load_dotenv(REPO_ROOT / ".env")
         load_dotenv(Path(__file__).parent.parent / ".env")
     except Exception:
-        # If python-dotenv isn't installed or files are missing, ignore.
         pass
 
 app = FastAPI(

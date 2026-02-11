@@ -584,36 +584,158 @@ textarea:focus {
 
 /* Splash (no session) */
 .splash-content {
-  padding: var(--spacing-lg);
-  max-width: 56rem;
+  padding: var(--spacing-xl);
+  max-width: 52rem;
   margin: 0 auto;
+  background: linear-gradient(180deg, rgba(248, 249, 250, 0.6) 0%, transparent 12%);
 }
+
 .splash-hero {
   margin-bottom: var(--spacing-xl);
   text-align: center;
+  padding: var(--spacing-lg) 0;
 }
-.splash-title {
-  font-size: 1.5rem;
+
+.splash-badge {
+  display: inline-block;
+  font-size: 0.7rem;
   font-weight: 600;
-  color: var(--color-text-primary);
-  margin: 0 0 0.5rem 0;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--color-primary);
+  margin-bottom: 0.5rem;
+  padding: 4px 10px;
+  border: 1px solid rgba(13, 110, 253, 0.25);
+  border-radius: 20px;
+  background: rgba(13, 110, 253, 0.04);
 }
+
+.splash-title {
+  font-size: 2.5rem;
+  font-weight: 700;
+  letter-spacing: -0.03em;
+  color: var(--color-text);
+  margin: 0 0 0.5rem 0;
+  line-height: 1.1;
+}
+
+.splash-tagline {
+  font-size: 1.1rem;
+  font-weight: 500;
+  color: var(--color-text);
+  margin: 0 0 1rem 0;
+  opacity: 0.95;
+}
+
 .splash-subtitle {
   font-size: 0.95rem;
-  color: var(--color-text-secondary);
+  color: var(--color-text-muted);
   margin: 0;
+  max-width: 32rem;
+  margin-left: auto;
+  margin-right: auto;
+  line-height: 1.6;
 }
+
 .splash-section {
   margin-bottom: var(--spacing-xl);
 }
+
 .splash-section-title {
-  font-size: 0.9rem;
+  font-size: 0.8rem;
   font-weight: 600;
-  color: var(--color-text-primary);
-  margin: 0 0 0.5rem 0;
+  color: var(--color-text-muted);
+  margin: 0 0 0.75rem 0;
   text-transform: uppercase;
-  letter-spacing: 0.03em;
+  letter-spacing: 0.06em;
 }
+
+/* Example questions */
+.splash-examples {
+  margin-top: 2rem;
+}
+
+.splash-example-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 0.75rem;
+}
+
+.splash-example-card {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.75rem 1rem;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--color-border);
+  background: var(--color-bg);
+  font-size: 0.9rem;
+  color: var(--color-text);
+  transition: border-color 0.2s, box-shadow 0.2s;
+}
+
+.splash-example-card:hover {
+  border-color: var(--color-primary);
+  box-shadow: 0 2px 8px rgba(13, 110, 253, 0.08);
+}
+
+.splash-example-icon {
+  font-size: 1.1rem;
+  flex-shrink: 0;
+}
+
+.splash-example-text {
+  flex: 1;
+  min-width: 0;
+}
+
+/* Feature grid */
+.splash-feature-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 0.75rem;
+}
+
+.splash-feature {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.5rem;
+  font-size: 0.875rem;
+  color: var(--color-text);
+  padding: 0.5rem 0;
+}
+
+.splash-feature-icon {
+  font-size: 1.1rem;
+  flex-shrink: 0;
+  opacity: 0.8;
+}
+
+/* Collections as pills */
+.splash-collections-pills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.splash-collection-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 6px 12px;
+  background: var(--color-bg-tertiary);
+  border-radius: 20px;
+  font-size: 0.85rem;
+  font-weight: 500;
+  color: var(--color-text);
+}
+
+.splash-collection-count {
+  font-size: 0.75rem;
+  color: var(--color-text-muted);
+  font-weight: 400;
+}
+
 .splash-list {
   margin: 0;
   padding-left: 1.25rem;
@@ -621,31 +743,9 @@ textarea:focus {
   font-size: 0.9rem;
   line-height: 1.6;
 }
+
 .splash-list li {
   margin-bottom: 0.35rem;
-}
-.splash-collections-intro {
-  font-size: 0.85rem;
-  color: var(--color-text-muted);
-  margin: 0 0 0.5rem 0;
-}
-.splash-collections-list {
-  margin: 0;
-  padding-left: 1.25rem;
-  font-size: 0.9rem;
-  color: var(--color-text-secondary);
-  line-height: 1.5;
-}
-.splash-collections-list li {
-  margin-bottom: 0.25rem;
-}
-.splash-collection-name {
-  font-weight: 500;
-  color: var(--color-text-primary);
-}
-.splash-collection-meta {
-  color: var(--color-text-muted);
-  font-size: 0.85rem;
 }
 
 /* Utility */
@@ -743,6 +843,7 @@ textarea:focus {
 /* Thinking Indicator */
 .chat-thinking {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: var(--spacing-sm);
   padding: var(--spacing-md);
@@ -788,7 +889,26 @@ textarea:focus {
   font-size: 13px;
 }
 
+/* 6-minute progress bar (unlabeled) — gives user a sense of time during long queries */
+.thinking-progress-bar {
+  flex: 1;
+  min-width: 80px;
+  max-width: 120px;
+  height: 6px;
+  background: rgba(0, 0, 0, 0.08);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.thinking-progress-fill {
+  height: 100%;
+  background: var(--color-primary);
+  border-radius: 3px;
+  transition: width 0.5s ease-out;
+}
+
 .thinking-bullet-count {
+  flex-basis: 100%;
   display: block;
   color: var(--color-success, #28a745);
   font-size: 11px;

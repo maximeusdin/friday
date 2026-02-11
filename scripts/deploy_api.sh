@@ -32,6 +32,7 @@ HEALTHCHECK_URL="https://api.fridayarchive.org/health"
 COGNITO_DOMAIN="https://us-west-1b9vdzkuiu.auth.us-west-1.amazoncognito.com"
 COGNITO_ISSUER="https://cognito-idp.us-west-1.amazonaws.com/us-west-1_b9VdZKUiu"
 COGNITO_CLIENT_ID="35p0phf7tk0231pr5i4pippr4s"
+# Backend callback: Cognito redirects here; we exchange, set cookie, 302 to fridayarchive.org.
 COGNITO_REDIRECT_URI="https://api.fridayarchive.org/auth/oauth/cognito/callback"
 UI_REDIRECT_AFTER_LOGIN="https://fridayarchive.org/"
 COOKIE_DOMAIN=".fridayarchive.org"

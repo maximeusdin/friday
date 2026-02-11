@@ -10,16 +10,35 @@ import type {
 } from '@/types/api';
 import { scopeFingerprint } from '@/lib/scope';
 
-/** Map technical progress messages to user-friendly text. */
-function toUserFriendlyProgress(step: V9ProgressEvent): string {
+const PROGRESS_PHRASES = [
+  'Searching archives...',
+  'Reviewing documents...',
+  'Cross-referencing sources...',
+  'Extracting key findings...',
+  'Verifying evidence...',
+  'Building answer...',
+  'Following leads...',
+  'Checking citations...',
+];
+
+/** Map technical progress to user-friendly text. Uses backend message when available. */
+function toUserFriendlyProgress(step: V9ProgressEvent, stepIndex?: number): string {
   switch (step.step) {
     case 'tool_call': {
+      // Prefer backend message when it contains context (e.g. "Searching for: X", "Loading N chunks...")
+      const msg = (step.message || '').trim();
+      if (msg && (msg.startsWith('Searching for:') || msg.startsWith('Loading ') || msg.includes('chunks'))) {
+        return msg;
+      }
       const tool = (step.details?.tool as string) || '';
-      if (tool.startsWith('search_chunks') || tool === 'search_chunks') return 'Searching documents...';
+      const idx = stepIndex ?? 0;
+      if (tool.startsWith('search_chunks') || tool === 'search_chunks') {
+        return PROGRESS_PHRASES[idx % PROGRESS_PHRASES.length];
+      }
       if (tool.startsWith('fetch_chunks') || tool === 'fetch_chunks') return 'Reading documents...';
       if (tool.startsWith('expand_entities') || tool === 'expand_entities') return 'Resolving identities...';
       if (tool.startsWith('alias_index') || tool.includes('alias')) return 'Looking up references...';
-      return 'Gathering evidence...';
+      return PROGRESS_PHRASES[idx % PROGRESS_PHRASES.length];
     }
     case 'turn_start':
       return 'Investigating...';
@@ -33,19 +52,30 @@ function toUserFriendlyProgress(step: V9ProgressEvent): string {
       return 'Found evidence...';
     case 'routing':
       return 'Understanding your question...';
+    case 'investigation_start':
+    case 'retrieval_prepare':
+      return 'Starting investigation...';
+    case 'context_build':
+      return 'Building context...';
+    case 'follow_up_start':
+    case 'follow_up':
+      return 'Searching evidence...';
+    case 'think_deeper_start':
+      return 'Resuming Think Deeper...';
     default:
-      if (step.message.toLowerCase().includes('search')) return 'Searching...';
-      if (step.message.toLowerCase().includes('round')) return 'Analyzing evidence...';
-      if (step.message.toLowerCase().includes('fetch')) return 'Reading documents...';
-      if (step.message.toLowerCase().includes('synthes')) return 'Synthesizing answer...';
-      return 'Investigating...';
+      const msg = (step.message || '').toLowerCase();
+      if (msg.includes('search')) return 'Searching archives...';
+      if (msg.includes('round')) return 'Cross-referencing sources...';
+      if (msg.includes('fetch')) return 'Reading documents...';
+      if (msg.includes('synthes')) return 'Synthesizing answer...';
+      return PROGRESS_PHRASES[(stepIndex ?? 0) % PROGRESS_PHRASES.length];
   }
 }
 
 interface ConversationProps {
   session: Session | null;
   onV9Response?: (response: V9ChatResponse | null) => void;
-  onProcessingChange?: (processing: boolean) => void;
+  onProcessingChange?: (processing: boolean, sessionId?: number) => void;
   onEvidenceClick?: (evidence: EvidenceRef) => void;
   onProgressUpdate?: (steps: V9ProgressEvent[], bullets: V9EvidenceBullet[]) => void;
   /** Ref setter so parent can pre-fill the input (used by escalation "Start new search" action). */
@@ -60,12 +90,20 @@ interface ConversationProps {
   onMakeActiveScope?: (scope: UserSelectedScope) => void;
   isProcessing?: boolean;
   processingSessionId?: number | null;
+  onShowEvidence?: () => void;
+  /** Persisted progress/bullets from parent (so dots persist when returning from doc view). */
+  progressSteps?: V9ProgressEvent[];
+  evidenceBullets?: V9EvidenceBullet[];
+  /** Persisted last V9 response (so Think Deeper persists when returning from doc view). */
+  lastV9Response?: V9ChatResponse | null;
 }
 
 export function Conversation({
   session, onV9Response, onProcessingChange, onEvidenceClick, onProgressUpdate,
   activeScope, lastUsedScope, collections, hasDraftChanges, onEditScope, onQuerySent, onMakeActiveScope,
-  isProcessing = false, processingSessionId = null,
+  isProcessing = false, processingSessionId = null, onShowEvidence,
+  progressSteps: progressStepsProp, evidenceBullets: evidenceBulletsProp,
+  lastV9Response: lastV9ResponseProp,
 }: ConversationProps) {
   const [input, setInput] = useState('');
   const [isSending, setIsSending] = useState(false);
@@ -73,10 +111,37 @@ export function Conversation({
   const [lastV9, setLastV9] = useState<V9ChatResponse | null>(null);
   const [progressSteps, setProgressSteps] = useState<V9ProgressEvent[]>([]);
   const [evidenceBullets, setEvidenceBullets] = useState<V9EvidenceBullet[]>([]);
+  // Use parent's persisted data when returning from doc view (parent has latest from stream)
+  const displayProgressSteps = (progressStepsProp != null && progressStepsProp.length > 0) ? progressStepsProp : progressSteps;
+  const displayEvidenceBullets = (evidenceBulletsProp != null && evidenceBulletsProp.length > 0) ? evidenceBulletsProp : evidenceBullets;
+  const displayLastV9 = lastV9 ?? lastV9ResponseProp ?? null;
+  const showThinkingIndicator = (isSending || isProcessing) && session?.id === processingSessionId;
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const queryClient = useQueryClient();
   const abortControllerRef = useRef<AbortController | null>(null);
   const abortRef = useRef(false);
+
+  // 6-minute progress bar: elapsed time while processing, reset when processing starts
+  const processingStartRef = useRef<number | null>(null);
+  const [elapsedSeconds, setElapsedSeconds] = useState(0);
+  useEffect(() => {
+    if (showThinkingIndicator) {
+      if (processingStartRef.current === null) {
+        processingStartRef.current = Date.now();
+      }
+      const tick = () => {
+        if (processingStartRef.current) {
+          setElapsedSeconds(Math.floor((Date.now() - processingStartRef.current) / 1000));
+        }
+      };
+      tick();
+      const id = setInterval(tick, 1000);
+      return () => clearInterval(id);
+    } else {
+      processingStartRef.current = null;
+      setElapsedSeconds(0);
+    }
+  }, [showThinkingIndicator]);
 
   // Toast state for scope actions
   const [toastMessage, setToastMessage] = useState<string | null>(null);
@@ -162,7 +227,9 @@ export function Conversation({
           },
         onError: (error) => {
             if (abortRef.current) return;
-          setSendError(error);
+            setSendError(error);
+            setIsSending(false);
+            onProcessingChange?.(false);
           },
         },
         controller.signal,
@@ -202,7 +269,7 @@ export function Conversation({
   };
 
   const handleThinkDeeper = () => {
-    if (!lastV9?.can_think_deeper) return;
+    if (!displayLastV9?.can_think_deeper) return;
     // Re-send the last user question with think_deeper action
     const lastUserMsg = messages?.filter(m => m.role === 'user').pop();
     if (lastUserMsg) {
@@ -211,45 +278,71 @@ export function Conversation({
   };
 
   if (!session) {
+    const exampleQuestions = [
+      'Who was involved in the Rosenberg case?',
+      'What documents mention atomic espionage?',
+      'How did Soviet intelligence operate in the US?',
+      'Which agents had contact with Klaus Fuchs?',
+    ];
+
     return (
       <div className="pane-content splash-content">
         <div className="splash-hero">
-          <h2 className="splash-title">Friday Research Console</h2>
-          <p className="splash-subtitle">Select a session to start, or create a new one from the sidebar.</p>
+          <div className="splash-badge">Archival Research Assistant</div>
+          <h2 className="splash-title">Friday</h2>
+          <p className="splash-tagline">Search Cold War archives. Trace connections. Follow the evidence.</p>
+          <p className="splash-subtitle">
+            Create or select a session in the sidebar to begin. Ask questions in plain language — Friday searches declassified documents, resolves codenames, and cites sources.
+          </p>
         </div>
-        <div className="splash-section">
-          <h3 className="splash-section-title">How to use</h3>
-          <ul className="splash-list">
-            <li>Ask research questions in plain language; Friday searches archived documents and resolves entities (people, places, codenames).</li>
-            <li>Use <strong>Scope</strong> to limit searches to specific collections or documents, or run over the full archive.</li>
-            <li>Follow-up questions run against the evidence from your last search; use &ldquo;New search&rdquo; when you want a fresh retrieval.</li>
-            <li>Click any citation in an answer to open the source document and page in the viewer.</li>
-          </ul>
+
+        <div className="splash-section splash-examples">
+          <h3 className="splash-section-title">Try asking</h3>
+          <div className="splash-example-grid">
+            {exampleQuestions.map((q, i) => (
+              <div key={i} className="splash-example-card">
+                <span className="splash-example-icon">&#x1F50E;</span>
+                <span className="splash-example-text">{q}</span>
+              </div>
+            ))}
+          </div>
         </div>
-        <div className="splash-section">
-          <h3 className="splash-section-title">Features</h3>
-          <ul className="splash-list">
-            <li>Entity-aware search with concordance and alias resolution</li>
-            <li>Cited answers with clickable evidence links</li>
-            <li>Session scope (full archive or custom collections/documents)</li>
-            <li>Investigation panel with progress and evidence bullets</li>
-            <li>Think Deeper to extend an investigation with more steps</li>
-          </ul>
+
+        <div className="splash-section splash-features">
+          <h3 className="splash-section-title">What Friday does</h3>
+          <div className="splash-feature-grid">
+            <div className="splash-feature">
+              <span className="splash-feature-icon">&#x1F4DA;</span>
+              <span>Entity-aware search with concordance & alias resolution</span>
+            </div>
+            <div className="splash-feature">
+              <span className="splash-feature-icon">&#x1F4C4;</span>
+              <span>Cited answers with clickable evidence links</span>
+            </div>
+            <div className="splash-feature">
+              <span className="splash-feature-icon">&#x1F4CB;</span>
+              <span>Scope to specific collections or full archive</span>
+            </div>
+            <div className="splash-feature">
+              <span className="splash-feature-icon">&#x1F4AD;</span>
+              <span>Think Deeper to extend an investigation</span>
+            </div>
+          </div>
         </div>
+
         {collections && collections.length > 0 && (
           <div className="splash-section">
             <h3 className="splash-section-title">Indexed collections</h3>
-            <p className="splash-collections-intro">The following collections are available for search.</p>
-            <ul className="splash-collections-list">
+            <div className="splash-collections-pills">
               {collections.map((c) => (
-                <li key={c.id}>
-                  <span className="splash-collection-name">{c.title || c.slug}</span>
+                <span key={c.id} className="splash-collection-pill">
+                  {c.title || c.slug}
                   {c.document_count != null && (
-                    <span className="splash-collection-meta"> — {c.document_count} document{c.document_count !== 1 ? 's' : ''}</span>
+                    <span className="splash-collection-count">{c.document_count}</span>
                   )}
-                </li>
+                </span>
               ))}
-            </ul>
+            </div>
           </div>
         )}
       </div>
@@ -270,6 +363,7 @@ export function Conversation({
                 onEvidenceClick={onEvidenceClick}
                 v9={idx === messages.length - 1 && message.role === 'assistant' ? lastV9 : null}
                 onMakeActiveScope={handleMakeActive}
+                onShowEvidence={onShowEvidence}
                 collections={collections}
                 onEscalate={(action, text, carryContext) => {
                   if (action === 'think_deeper') {
@@ -286,31 +380,43 @@ export function Conversation({
             <div ref={messagesEndRef} />
           </>
         ) : (
-          <div className="empty-state">
-            <p>Ask a research question</p>
-            <p className="text-sm">V9 will search archives, resolve entities, and generate cited answers</p>
-          </div>
+          <div className="empty-state" />
         )}
 
-        {isSending && session?.id === processingSessionId && (
-          <div className="chat-thinking">
-            <div className="thinking-indicator">
-              <span className="thinking-dot"></span>
-              <span className="thinking-dot"></span>
-              <span className="thinking-dot"></span>
+        {showThinkingIndicator && (() => {
+          const lastStep = displayProgressSteps[displayProgressSteps.length - 1];
+          const isSynthesisPhase = lastStep?.step === 'synthesis';
+          const barFilledByTime = elapsedSeconds >= 360;
+          const barPercent = isSynthesisPhase ? 100 : Math.min(100, (elapsedSeconds / 360) * 100);
+          const statusLabel = isSynthesisPhase
+            ? 'Writing answer'
+            : barFilledByTime
+              ? 'This is tough, almost there'
+              : displayProgressSteps.length > 0
+                ? toUserFriendlyProgress(lastStep!, displayProgressSteps.length - 1)
+                : 'Investigating...';
+          return (
+            <div className="chat-thinking">
+              <div className="thinking-indicator">
+                <span className="thinking-dot"></span>
+                <span className="thinking-dot"></span>
+                <span className="thinking-dot"></span>
+              </div>
+              <span className="thinking-text">{statusLabel}</span>
+              <div className="thinking-progress-bar" aria-hidden>
+                <div
+                  className="thinking-progress-fill"
+                  style={{ width: `${barPercent}%` }}
+                />
+              </div>
+              {displayEvidenceBullets.length > 0 && (
+                <span className="thinking-bullet-count">
+                  {displayEvidenceBullets.length} evidence bullet{displayEvidenceBullets.length !== 1 ? 's' : ''} found
+                </span>
+              )}
             </div>
-            <span className="thinking-text">
-              {progressSteps.length > 0
-                ? toUserFriendlyProgress(progressSteps[progressSteps.length - 1])
-                : 'Investigating...'}
-            </span>
-            {evidenceBullets.length > 0 && (
-              <span className="thinking-bullet-count">
-                {evidenceBullets.length} evidence bullet{evidenceBullets.length !== 1 ? 's' : ''} found
-              </span>
-            )}
-          </div>
-        )}
+          );
+        })()}
 
         {sendError && (
           <div className="card" style={{ borderColor: 'var(--color-danger)' }}>
@@ -320,8 +426,8 @@ export function Conversation({
           </div>
         )}
 
-        {/* Think Deeper button */}
-        {lastV9?.can_think_deeper && !isSending && (
+        {/* Think Deeper button — always show when last response supports it (persists across doc view) */}
+        {displayLastV9?.can_think_deeper && !isSending && (
           <div style={{ padding: 'var(--spacing-sm) var(--spacing-md)', textAlign: 'center' }}>
             <button
               className="btn-secondary"
@@ -330,14 +436,26 @@ export function Conversation({
             >
               Think Deeper — extend investigation
             </button>
-            {lastV9.remaining_gaps.length > 0 && (
+            {displayLastV9.remaining_gaps.length > 0 && (
               <div className="text-sm text-muted" style={{ marginTop: '4px' }}>
-                Gaps: {lastV9.remaining_gaps.slice(0, 2).join('; ')}
+                Gaps: {displayLastV9.remaining_gaps.slice(0, 2).join('; ')}
               </div>
             )}
           </div>
         )}
       </div>
+
+      {/* Scope banner — shows what scope applies to the next query */}
+      {activeScope && collections && (
+        <ActiveScopeBar
+          activeScope={activeScope}
+          lastUsedScope={lastUsedScope ?? null}
+          collections={collections}
+          hasDraftChanges={hasDraftChanges ?? false}
+          hasMessages={(messages?.length ?? 0) > 0}
+          onEditScope={onEditScope}
+        />
+      )}
 
       {/* Input area */}
       <div className="chat-input-container">
@@ -350,11 +468,11 @@ export function Conversation({
               type="text"
               value={input}
               onChange={(e) => setInput(e.target.value)}
-              placeholder={lastV9?.suggestion || 'Ask a research question...'}
-              disabled={isSending}
+              placeholder={lastV9?.suggestion || 'Ask a question...'}
+              disabled={showThinkingIndicator}
               className="chat-input"
             />
-            {isSending && session?.id === processingSessionId ? (
+            {showThinkingIndicator ? (
               <button
                 type="button"
                 className="btn-stop"
@@ -395,6 +513,7 @@ function ChatBubble({
   onEscalate,
   onPrefillInput,
   onMakeActiveScope,
+  onShowEvidence,
   collections,
 }: {
   message: ChatMessage;
@@ -403,6 +522,7 @@ function ChatBubble({
   onEscalate?: (action: string, text: string, carryContext?: Record<string, unknown>) => void;
   onPrefillInput?: (text: string) => void;
   onMakeActiveScope?: (scope: UserSelectedScope) => void;
+  onShowEvidence?: () => void;
   collections?: CollectionNode[];
 }) {
   const isUser = message.role === 'user';
@@ -424,6 +544,7 @@ function ChatBubble({
     confidence: v9.confidence,
     can_think_deeper: v9.can_think_deeper,
     remaining_gaps: v9.remaining_gaps,
+    suggested_queries: v9.suggested_queries,
     suggestion: v9.suggestion,
     elapsed_ms: v9.elapsed_ms,
     cited_chunk_ids: v9.cited_chunk_ids,
@@ -433,6 +554,8 @@ function ChatBubble({
     scope_override: v9.scope_override,
     expansion_info: v9.expansion_info,
   } : message.v9_meta || null;
+
+  const suggestedQueries = v9meta?.suggested_queries ?? [];
 
   // Citation map for inline citation linking
   const citationMap = v9meta?.citation_map || {};
@@ -551,7 +674,36 @@ function ChatBubble({
             escalations={escalations}
             onEscalate={onEscalate}
             onPrefillInput={onPrefillInput}
+            onShowEvidence={onShowEvidence}
           />
+        )}
+
+        {/* Suggested queries (Think Deeper) — clickable to run new search */}
+        {intent === 'think_deeper' && suggestedQueries.length > 0 && (
+          <div style={{ marginTop: '12px' }}>
+            <div style={{ fontSize: '12px', color: 'var(--color-text-secondary, #888)', marginBottom: '6px' }}>
+              Try a new search:
+            </div>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px' }}>
+              {suggestedQueries.map((q, i) => (
+                <button
+                  key={i}
+                  type="button"
+                  className="btn-secondary"
+                  style={{ fontSize: '12px', padding: '4px 10px' }}
+                  onClick={() => {
+                    if (onEscalate) {
+                      onEscalate('new_retrieval', q, { intent_hint: 'new_retrieval' });
+                    } else {
+                      onPrefillInput?.(q);
+                    }
+                  }}
+                >
+                  {q.length > 60 ? q.slice(0, 57) + '...' : q}
+                </button>
+              ))}
+            </div>
+          </div>
         )}
         
         {/* V9 footer with elapsed time */}
@@ -680,38 +832,43 @@ function ScopeBanner({ scope }: { scope: ScopeMeta }) {
 
 /**
  * Escalation block: structured "what now" actions when follow-up evidence is insufficient.
+ * When an action is taken, collapses to show only the decision and execution status.
  */
 function EscalationBlock({
   escalations,
   onEscalate,
   onPrefillInput,
+  onShowEvidence,
 }: {
   escalations: EscalationOption[];
   onEscalate?: (action: string, text: string, carryContext?: Record<string, unknown>) => void;
   onPrefillInput?: (text: string) => void;
+  onShowEvidence?: () => void;
 }) {
+  const [actionTaken, setActionTaken] = useState<{ label: string; action: string } | null>(null);
+
   const handleClick = (opt: EscalationOption) => {
+    if (opt.action === 'show_evidence') {
+      onShowEvidence?.();
+      const claimsEl = document.querySelector('.chat-claims');
+      if (claimsEl) claimsEl.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      return;
+    }
+    setActionTaken({ label: opt.label, action: opt.action });
     if (opt.action === 'think_deeper') {
       onEscalate?.(opt.action, opt.prefilled_query || '', {
         entities: opt.carry_entities,
-        intent_hint: opt.description,
+        intent_hint: 'think_deeper',
       });
     } else if (opt.action === 'new_retrieval') {
-      // Send the prefilled query as a new search immediately
       if (opt.prefilled_query) {
         onEscalate?.(opt.action, opt.prefilled_query, {
           entities: opt.carry_entities,
-          intent_hint: opt.description,
+          intent_hint: 'new_retrieval',
         });
       } else {
-        // No prefilled query — fall back to pre-filling the input for manual entry
+        setActionTaken(null);
         onPrefillInput?.('');
-      }
-    } else if (opt.action === 'show_evidence') {
-      // Scroll to the claims/citations section of the current message
-      const claimsEl = document.querySelector('.chat-claims');
-      if (claimsEl) {
-        claimsEl.scrollIntoView({ behavior: 'smooth', block: 'start' });
       }
     }
   };
@@ -721,6 +878,24 @@ function EscalationBlock({
     new_retrieval: '\u{1F504}',  // arrows counterclockwise
     show_evidence: '\u{1F4CB}',  // clipboard
   };
+
+  if (actionTaken) {
+    return (
+      <div style={{
+        marginTop: '12px',
+        padding: '8px 12px',
+        border: '1px solid rgba(255,255,255,0.1)',
+        borderRadius: '8px',
+        background: 'rgba(255,255,255,0.03)',
+        fontSize: '12px',
+        color: 'var(--color-text-muted, #888)',
+      }}>
+        <span style={{ fontWeight: 500 }}>Executing: </span>
+        {actionTaken.label}
+        <span style={{ marginLeft: 6, opacity: 0.8 }}>…</span>
+      </div>
+    );
+  }
 
   return (
     <div style={{
@@ -844,8 +1019,13 @@ function RichAnswerText({
     return <div className="chat-answer-text">{text}</div>;
   }
 
-  const resolveCitation = (label: string): CitationDetail | undefined =>
-    citationMap[label] ?? citationMap[stripConfidenceFromLabel(label)];
+  const resolveCitation = (label: string): CitationDetail | undefined => {
+    const direct = citationMap[label] ?? citationMap[stripConfidenceFromLabel(label)];
+    if (direct) return direct;
+    const lower = label.toLowerCase();
+    const key = Object.keys(citationMap).find(k => k.toLowerCase() === lower);
+    return key ? citationMap[key] : undefined;
+  };
 
   // Parse text to find [...] citation brackets and split into segments
   const segments: Array<{ type: 'text'; value: string } | { type: 'citations'; labels: string[] }> = [];
@@ -954,7 +1134,7 @@ function MembersList({ members, onEvidenceClick }: { members: ChatMember[]; onEv
                     key={citIdx}
                     className="citation-btn"
                     onClick={() => handleCitationClick(cit)}
-                    title={cit.quote || 'View source'}
+                    title={cit.quote || 'View document'}
                     disabled={!cit.document_id}
                   >
                     {cit.source_name ? cit.source_name.substring(0, 15) : `p.${cit.page_number || '?'}`}
@@ -1024,7 +1204,7 @@ function ClaimsList({ claims, onEvidenceClick }: { claims: ChatClaim[]; onEviden
                       key={citIdx}
                       className="claim-source-link"
                       onClick={() => handleCitationClick(cit)}
-                      title={cit.quote ? `"${cit.quote}"` : 'View source document'}
+                      title={cit.quote ? `"${cit.quote}"` : 'View document'}
                       disabled={!cit.document_id}
                     >
                       <span className="source-name">
@@ -1137,6 +1317,16 @@ function ActiveScopeBar({
         scopeChanged
           ? <span className="scope-tag-changed">changed since last query</span>
           : <span style={{ fontSize: '11px', color: 'var(--color-text-muted)' }}>(same as last query)</span>
+      )}
+      {onEditScope && (
+        <button
+          type="button"
+          className="btn-link"
+          onClick={onEditScope}
+          style={{ fontSize: '11px', marginLeft: 'auto', padding: '0 4px' }}
+        >
+          Edit
+        </button>
       )}
     </div>
   );

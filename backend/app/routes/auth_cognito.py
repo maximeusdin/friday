@@ -57,9 +57,9 @@ def _get_cognito_client_secret() -> str | None:
 
 
 UI_REDIRECT_AFTER_LOGIN = os.environ.get("UI_REDIRECT_AFTER_LOGIN", "https://fridayarchive.org/")
-REDIRECT_URI = os.environ.get(
-    "COGNITO_REDIRECT_URI", "https://api.fridayarchive.org/auth/oauth/cognito/callback"
-)
+# Backend callback: Cognito redirects here; we exchange code, set cookie, 302 to UI_REDIRECT_AFTER_LOGIN.
+COGNITO_REDIRECT_URI_DEFAULT = "https://api.fridayarchive.org/auth/oauth/cognito/callback"
+REDIRECT_URI = os.environ.get("COGNITO_REDIRECT_URI", COGNITO_REDIRECT_URI_DEFAULT)
 
 SESSION_COOKIE_NAME = os.environ.get("SESSION_COOKIE_NAME", "friday_session")
 # Domain with leading dot so cookie is sent from fridayarchive.org → api.fridayarchive.org
@@ -112,6 +112,22 @@ def _auth_configured() -> bool:
     return bool(COGNITO_DOMAIN and COGNITO_CLIENT_ID and COGNITO_ISSUER and APP_SESSION_SECRET)
 
 
+def _auth_config_hint() -> str:
+    """Return a hint for missing auth config (local dev)."""
+    missing = []
+    if not COGNITO_DOMAIN:
+        missing.append("COGNITO_DOMAIN")
+    if not COGNITO_CLIENT_ID:
+        missing.append("COGNITO_CLIENT_ID")
+    if not COGNITO_ISSUER:
+        missing.append("COGNITO_ISSUER")
+    if not APP_SESSION_SECRET:
+        missing.append("APP_SESSION_SECRET")
+    if missing:
+        return f" Set in .env: {', '.join(missing)}. See .env.example."
+    return ""
+
+
 async def _get_jwks() -> dict:
     global _JWKS, _JWKS_FETCHED_AT
     now = time.time()
@@ -126,21 +142,24 @@ async def _get_jwks() -> dict:
         return _JWKS
 
 
-def _set_state_cookie(resp: Response, state: str) -> None:
-    resp.set_cookie(
-        "oauth_state",
-        state,
-        max_age=STATE_COOKIE_MAX_AGE,
-        httponly=True,
-        secure=COOKIE_SECURE,
-        samesite=COOKIE_SAMESITE,
-        domain=COOKIE_DOMAIN,
-        path="/",
-    )
+def _set_state_cookie(resp: Response, state: str, cookie_domain: str | None = None) -> None:
+    domain = cookie_domain if cookie_domain else COOKIE_DOMAIN
+    # For localhost, omit domain so cookie works for the host
+    kwargs = {
+        "max_age": STATE_COOKIE_MAX_AGE,
+        "httponly": True,
+        "secure": COOKIE_SECURE,
+        "samesite": COOKIE_SAMESITE,
+        "path": "/",
+    }
+    if domain and domain != "localhost":
+        kwargs["domain"] = domain
+    resp.set_cookie("oauth_state", state, **kwargs)
 
 
-def _pop_state_cookie(resp: Response) -> None:
-    resp.delete_cookie("oauth_state", domain=COOKIE_DOMAIN, path="/")
+def _pop_state_cookie(resp: Response, cookie_domain: str | None = None) -> None:
+    domain = cookie_domain if cookie_domain is not None else COOKIE_DOMAIN
+    resp.delete_cookie("oauth_state", domain=domain or None, path="/")
 
 
 def _create_app_session(sub: str, email: str | None, exp_seconds: int = SESSION_TTL_SECONDS) -> str:
@@ -149,17 +168,24 @@ def _create_app_session(sub: str, email: str | None, exp_seconds: int = SESSION_
     return jwt.encode(payload, APP_SESSION_SECRET, algorithm="HS256")
 
 
-def _set_session_cookie(resp: Response, session_jwt: str) -> None:
-    resp.set_cookie(
-        SESSION_COOKIE_NAME,
-        session_jwt,
-        max_age=SESSION_TTL_SECONDS,
-        httponly=True,
-        secure=COOKIE_SECURE,
-        samesite=COOKIE_SAMESITE,
-        domain=COOKIE_DOMAIN,
-        path="/",
-    )
+def _set_session_cookie(
+    resp: Response,
+    session_jwt: str,
+    cookie_domain: str | None = None,
+    secure: bool | None = None,
+) -> None:
+    domain = cookie_domain if cookie_domain is not None else COOKIE_DOMAIN
+    secure_val = secure if secure is not None else COOKIE_SECURE
+    kwargs: dict = {
+        "max_age": SESSION_TTL_SECONDS,
+        "httponly": True,
+        "secure": secure_val,
+        "samesite": "lax" if not secure_val else COOKIE_SAMESITE,
+        "path": "/",
+    }
+    if domain:
+        kwargs["domain"] = domain
+    resp.set_cookie(SESSION_COOKIE_NAME, session_jwt, **kwargs)
 
 
 def _clear_session_cookie(resp: Response) -> None:
@@ -253,25 +279,116 @@ async def auth_login_post(request: Request):
 
 # OAuth (Cognito): separate paths so POST /auth/login is form/password only.
 @router.get("/oauth/cognito/login")
-async def auth_oauth_cognito_login(request: Request):
-    """Start Cognito OAuth2 flow: redirect to Cognito hosted UI."""
+async def auth_oauth_cognito_login(
+    request: Request,
+    redirect_uri: str | None = None,
+    return_url: str | None = None,
+):
+    """Start Cognito OAuth2 flow: redirect to Cognito hosted UI.
+
+    Query params:
+      redirect_uri: Where Cognito should redirect after login (default from env).
+        Prod: https://api.fridayarchive.org/auth/oauth/cognito/callback
+        Localhost: http://localhost:8000/auth/oauth/cognito/callback
+      return_url: Where to send the user after exchange (optional).
+    """
     if not _auth_configured():
         log.error("OAuth login: auth not configured (COGNITO_DOMAIN=%s, CLIENT_ID=%s, ISSUER=%s, SECRET=%s)",
                   bool(COGNITO_DOMAIN), bool(COGNITO_CLIENT_ID), bool(COGNITO_ISSUER), bool(APP_SESSION_SECRET))
-        raise HTTPException(status_code=503, detail="Auth not configured")
+        raise HTTPException(
+            status_code=503,
+            detail="Auth not configured." + _auth_config_hint(),
+        )
+
+    effective_redirect_uri = (redirect_uri or "").strip() or REDIRECT_URI
     state = secrets.token_urlsafe(32)
+
     params = {
         "client_id": COGNITO_CLIENT_ID,
         "response_type": "code",
         "scope": "openid email profile",
-        "redirect_uri": REDIRECT_URI,
+        "redirect_uri": effective_redirect_uri,
         "state": state,
     }
     url = f"{COGNITO_DOMAIN}/oauth2/authorize?{urlencode(params)}"
     resp = RedirectResponse(url=url, status_code=302)
-    _set_state_cookie(resp, state)
-    log.info("OAuth login: setting oauth_state cookie (domain=%s, secure=%s, samesite=%s) state=%s…%s redirect=%s",
-             COOKIE_DOMAIN, COOKIE_SECURE, COOKIE_SAMESITE, state[:8], state[-4:], REDIRECT_URI)
+
+    # For localhost callback, use cookie domain that works (omit or localhost)
+    cookie_domain = COOKIE_DOMAIN
+    if "localhost" in effective_redirect_uri or "127.0.0.1" in effective_redirect_uri:
+        cookie_domain = "localhost"  # Ensures cookie is sent when frontend calls backend
+    _set_state_cookie(resp, state, cookie_domain)
+
+    log.info("OAuth login: redirect_uri=%s state=%s…%s",
+             effective_redirect_uri, state[:8], state[-4:])
+    return resp
+
+
+@router.post("/oauth/cognito/exchange")
+async def auth_oauth_cognito_exchange(request: Request):
+    """Exchange Cognito auth code for session. Called by frontend callback page.
+
+    Body: { "code": "...", "state": "...", "redirect_uri": "..." }
+    Validates state cookie, exchanges code, sets session cookie, returns { "ok": true }.
+    """
+    if not _auth_configured():
+        raise HTTPException(status_code=503, detail="Auth not configured")
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="JSON body required")
+    code = (body.get("code") or "").strip()
+    state = (body.get("state") or "").strip()
+    redirect_uri = (body.get("redirect_uri") or "").strip()
+    if not code or not state:
+        raise HTTPException(status_code=400, detail="Missing code or state")
+    if not redirect_uri:
+        raise HTTPException(status_code=400, detail="Missing redirect_uri")
+
+    cookie_state = request.cookies.get("oauth_state")
+    if not cookie_state:
+        log.error("OAuth exchange: oauth_state cookie MISSING")
+        raise HTTPException(status_code=400, detail="Missing oauth_state cookie — start login again")
+    if cookie_state != state:
+        log.error("OAuth exchange: state MISMATCH")
+        raise HTTPException(status_code=400, detail="State mismatch — start login again")
+
+    token_url = f"{COGNITO_DOMAIN}/oauth2/token"
+    client_secret = _get_cognito_client_secret()
+    data = {
+        "grant_type": "authorization_code",
+        "client_id": COGNITO_CLIENT_ID,
+        "code": code,
+        "redirect_uri": redirect_uri,
+    }
+    headers = {"Content-Type": "application/x-www-form-urlencoded"}
+    auth = (COGNITO_CLIENT_ID, client_secret) if client_secret else None
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        r = await client.post(token_url, data=data, headers=headers, auth=auth)
+        if r.status_code != 200:
+            log.error("Token exchange FAILED: status=%s body=%s", r.status_code, r.text[:300])
+            raise HTTPException(status_code=400, detail=f"Token exchange failed: {r.text[:200]}")
+        token_payload = r.json()
+
+    id_token = token_payload.get("id_token")
+    if not id_token:
+        raise HTTPException(status_code=400, detail="No id_token returned")
+
+    jwks = await _get_jwks()
+    claims = _verify_cognito_id_token(id_token, jwks)
+    sub = claims["sub"]
+    email = claims.get("email")
+
+    session_jwt = _create_app_session(sub=sub, email=email)
+    resp = JSONResponse({"ok": True})
+    is_localhost = "localhost" in redirect_uri or "127.0.0.1" in redirect_uri
+    state_cookie_domain = "localhost" if is_localhost else COOKIE_DOMAIN
+    _pop_state_cookie(resp, cookie_domain=state_cookie_domain)
+    # For localhost: domain=localhost, secure=False (localhost uses HTTP)
+    cookie_domain = "localhost" if is_localhost else None
+    _set_session_cookie(resp, session_jwt, cookie_domain=cookie_domain, secure=not is_localhost)
+    log.info("OAuth exchange SUCCESS: sub=%s email=%s", sub, email)
     return resp
 
 

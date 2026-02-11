@@ -282,6 +282,7 @@ export interface V9Meta {
   confidence?: string;
   can_think_deeper: boolean;
   remaining_gaps: string[];
+  suggested_queries?: string[];  // Think Deeper: LLM-generated queries to explore
   suggestion: string;
   elapsed_ms: number;
   run_id?: number;
@@ -447,6 +448,7 @@ export interface V9ChatResponse {
 
   remaining_gaps: string[];
   next_best_actions: string[];
+  suggested_queries?: string[];  // Think Deeper: LLM-generated queries to explore
 
   run_history: V9RunSummary[];
 
@@ -497,6 +499,9 @@ export interface V9EvidenceBullet {
   tags: string[];
   chunk_ids: number[];
   doc_ids: number[];
+  pages?: number[];
+  /** Document source names (one per doc_id) for display. */
+  source_names?: string[];
 }
 
 /**
