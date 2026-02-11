@@ -8,24 +8,8 @@ import psycopg2
 import psycopg2.extras
 
 
-# -----------------------------
-# Embedding provider (pluggable)
-# -----------------------------
-def embed_texts(texts: List[str]) -> List[List[float]]:
-    provider = os.getenv("EMBED_PROVIDER", "").lower().strip()
-
-    if provider in ("openai", "oai"):
-        from openai import OpenAI  # type: ignore
-
-        model = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small")
-        client = OpenAI()
-        resp = client.embeddings.create(model=model, input=texts)
-        return [d.embedding for d in resp.data]
-
-    raise RuntimeError(
-        "No embedding provider configured.\n"
-        "Set EMBED_PROVIDER=openai and OPENAI_API_KEY, or replace embed_texts()."
-    )
+# Use shared embed_texts (supports EMBED_CONCURRENCY, truncation)
+from scripts.embed_venona_chunks import embed_texts
 
 
 # -----------------------------
@@ -153,6 +137,7 @@ def main():
     ap.add_argument("--chunk-pv", default="chunk_v1_full")
     ap.add_argument("--collection-slug", default="silvermaster")
     ap.add_argument("--batch-size", type=int, default=64)
+    ap.add_argument("--concurrency", type=int, default=None, help="Parallel API requests per batch (EMBED_CONCURRENCY)")
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--min-chars", type=int, default=50)
     ap.add_argument("--prefer-clean-text", action="store_true", help="Embed clean_text if available (recommended for Silvermaster)")
@@ -160,6 +145,9 @@ def main():
     ap.add_argument("--fill-missing-only", action="store_true", help="Only embed rows where embedding IS NULL")
     ap.add_argument("--sleep", type=float, default=0.0, help="Sleep seconds between batches (rate limit)")
     args = ap.parse_args()
+
+    if args.concurrency is not None:
+        os.environ["EMBED_CONCURRENCY"] = str(args.concurrency)
 
     if args.rebuild and args.fill_missing_only:
         raise RuntimeError("Choose only one: --rebuild OR --fill-missing-only")

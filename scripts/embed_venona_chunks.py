@@ -1,7 +1,9 @@
 import os
+import sys
 import time
 import argparse
 import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Optional, Tuple
 
 import psycopg2
@@ -44,26 +46,25 @@ def truncate_text(text: str, max_chars: int = MAX_EMBED_CHARS) -> Tuple[str, boo
     return truncated, True
 
 
+def _embed_texts_single(texts: List[str], model: str) -> List[List[float]]:
+    """Single-threaded embedding call. Used by embed_texts for parallelization."""
+    from openai import OpenAI  # type: ignore
+
+    client = OpenAI()
+    resp = client.embeddings.create(model=model, input=texts)
+    return [d.embedding for d in resp.data]
+
+
 def embed_texts(texts: List[str], verbose: bool = True) -> List[List[float]]:
     """
-    Replace this function with your actual embedding provider.
-
-    Recommended pattern:
-      - Put provider logic behind env vars
-      - Keep outputs deterministic for identical input strings
-      - Keep model + dimension stable while embedding into a given column
-
-    For now, this raises with instructions.
+    Embed texts via configured provider. Supports parallel requests via EMBED_CONCURRENCY.
     """
     provider = os.getenv("EMBED_PROVIDER", "").lower().strip()
 
     if provider in ("openai", "oai"):
-        # Minimal OpenAI example (requires: pip install openai)
-        # and env var OPENAI_API_KEY.
         from openai import OpenAI  # type: ignore
 
         model = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small")
-        client = OpenAI()
 
         # Truncate oversized texts
         processed_texts = []
@@ -73,13 +74,29 @@ def embed_texts(texts: List[str], verbose: bool = True) -> List[List[float]]:
             processed_texts.append(truncated)
             if was_truncated:
                 truncated_count += 1
-        
+
         if truncated_count > 0 and verbose:
             print(f"  [truncated {truncated_count}/{len(texts)} oversized chunks]", end="", flush=True)
 
-        # OpenAI supports batching; keep batch sizes reasonable.
-        resp = client.embeddings.create(model=model, input=processed_texts)
-        return [d.embedding for d in resp.data]
+        concurrency = int(os.getenv("EMBED_CONCURRENCY", "1"))
+        if concurrency <= 1 or len(processed_texts) <= 1:
+            return _embed_texts_single(processed_texts, model)
+
+        # Split into N sub-batches and run in parallel
+        n = min(concurrency, len(processed_texts))
+        size = (len(processed_texts) + n - 1) // n
+        chunks = [processed_texts[i : i + size] for i in range(0, len(processed_texts), size)]
+
+        results: List[List[float]] = [None] * len(processed_texts)  # type: ignore
+        with ThreadPoolExecutor(max_workers=n) as ex:
+            futures = {ex.submit(_embed_texts_single, c, model): i for i, c in enumerate(chunks)}
+            for fut in as_completed(futures):
+                idx = futures[fut]
+                start = sum(len(chunks[j]) for j in range(idx))
+                sub_result = fut.result()
+                for k, vec in enumerate(sub_result):
+                    results[start + k] = vec
+        return results
 
     raise RuntimeError(
         "No embedding provider configured.\n"
@@ -174,7 +191,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--chunk-pv", default="chunk_v1_full")
     ap.add_argument("--collection-slug", default="venona")
-    ap.add_argument("--batch-size", type=int, default=64)
+    ap.add_argument("--batch-size", type=int, default=64, help="Chunks per batch (OpenAI supports up to 2048/request)")
+    ap.add_argument("--concurrency", type=int, default=None, help="Parallel API requests per batch (default: EMBED_CONCURRENCY env, or 1)")
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--rebuild", action="store_true", help="NULL out then recompute embeddings for target set")
     ap.add_argument("--fill-missing-only", action="store_true", help="Only embed rows where embedding IS NULL")
@@ -183,6 +201,11 @@ def main():
 
     if args.rebuild and args.fill_missing_only:
         raise RuntimeError("Choose only one: --rebuild OR --fill-missing-only")
+
+    if args.concurrency is not None:
+        os.environ["EMBED_CONCURRENCY"] = str(args.concurrency)
+    if os.getenv("EMBED_CONCURRENCY", "1") != "1":
+        print(f"  [concurrency] EMBED_CONCURRENCY={os.getenv('EMBED_CONCURRENCY')} parallel requests per batch", file=sys.stderr)
 
     conn = get_conn()
     conn.autocommit = False

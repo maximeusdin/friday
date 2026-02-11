@@ -103,6 +103,7 @@ class CitationDetail(BaseModel):
     chunk_id: int
     document_id: Optional[int] = None
     page: Optional[int] = None
+    label: Optional[str] = None  # Human-readable label when key is chunk id (e.g. "Vassiliev p4")
 
 
 class V9Meta(BaseModel):
@@ -668,6 +669,7 @@ def get_chat_history(session_id: int, user=Depends(require_user)):
                                 chunk_id=detail.get("chunk_id", 0),
                                 document_id=detail.get("document_id"),
                                 page=detail.get("page"),
+                                label=detail.get("label"),
                             )
                     v9_meta = V9Meta(
                         intent=metadata.get("intent"),
@@ -1270,6 +1272,211 @@ class V9ChatResponse(BaseModel):
     elapsed_ms: float = 0.0
 
 
+@router.post("/{session_id}/v10/message/stream")
+async def v10_message_stream(session_id: int, req: V9ChatRequest, user=Depends(require_user)):
+    """
+    V10 session-aware message endpoint with SSE streaming progress.
+
+    Returns a Server-Sent Events stream with:
+    - event: progress — step-by-step status updates
+    - event: evidence_update — newly discovered evidence
+    - event: result — final response JSON (V9ChatResponse-compatible shape)
+    - event: error — if something goes wrong
+
+    Body:
+        { "text": "...", "action": "default" | "think_deeper" }
+    """
+    assert_session_owned(session_id, user["sub"])
+    text = req.text.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Text cannot be empty")
+
+    explicit_action = None
+    if req.action == "think_deeper":
+        explicit_action = "think_deeper"
+
+    # Build scope
+    scope = None
+    if hasattr(req, "scope_collections") and req.scope_collections:
+        from retrieval.agent.v9_types import ScopeFilter
+        scope = ScopeFilter(collections=req.scope_collections)
+
+    conn = get_conn()
+
+    # Verify session + persist user message
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM research_sessions WHERE id = %s", (session_id,))
+            if not cur.fetchone():
+                conn.close()
+                raise HTTPException(status_code=404, detail="Session not found")
+            cur.execute(
+                "INSERT INTO research_messages (session_id, role, content) "
+                "VALUES (%s, 'user', %s) RETURNING id",
+                (session_id, text),
+            )
+            user_msg_id = cur.fetchone()[0]
+            conn.commit()
+    except HTTPException:
+        raise
+    except Exception as e:
+        conn.close()
+        raise HTTPException(status_code=500, detail=f"DB error: {e}")
+
+    progress_queue: queue.Queue = queue.Queue()
+
+    def progress_callback(step, status, message, details=None):
+        """Push progress events onto the queue for the SSE generator."""
+        progress_queue.put({
+            "type": "progress" if step != "evidence_update" else "evidence_update",
+            "step": step,
+            "status": status,
+            "message": message,
+            "details": details or {},
+            "timestamp": time.time(),
+        })
+
+    def run_v10_thread():
+        """Run V10 dispatch in a background thread."""
+        try:
+            from retrieval.agent.v10_dispatch import dispatch_v10_message
+            result = dispatch_v10_message(
+                conn, session_id, text,
+                explicit_action=explicit_action,
+                scope=scope,
+                verbose=True,
+                progress_callback=progress_callback,
+            )
+            progress_queue.put({"type": "done", "result": result})
+        except Exception as e:
+            import traceback
+            progress_queue.put({
+                "type": "error",
+                "message": str(e),
+                "traceback": traceback.format_exc(),
+            })
+
+    # Start V10 in background thread
+    v10_thread = threading.Thread(target=run_v10_thread, daemon=True)
+    v10_thread.start()
+
+    def _safe_float(x, default: float = 0.0) -> float:
+        if x is None:
+            return default
+        try:
+            f = float(x)
+            return f if math.isfinite(f) else default
+        except (TypeError, ValueError):
+            return default
+
+    def event_generator():
+        """Yield SSE events from the progress queue."""
+        try:
+            while True:
+                try:
+                    event = progress_queue.get(timeout=30)
+                except queue.Empty:
+                    yield ": keepalive\n\n"
+                    continue
+
+                if event["type"] == "progress":
+                    yield f"event: progress\ndata: {json.dumps(event)}\n\n"
+
+                elif event["type"] == "evidence_update":
+                    yield f"event: evidence_update\ndata: {json.dumps(event)}\n\n"
+
+                elif event["type"] == "done":
+                    result = event["result"]
+
+                    # Build citation map
+                    raw_cit_map = result.citation_map or {}
+                    cit_map_for_storage = {
+                        label: {"chunk_id": d.get("chunk_id", d) if isinstance(d, dict) else d,
+                                "document_id": d.get("document_id") if isinstance(d, dict) else None,
+                                "page": d.get("page") if isinstance(d, dict) else None}
+                        for label, d in raw_cit_map.items()
+                    }
+
+                    # Persist assistant message
+                    try:
+                        v10_metadata = {
+                            "v10": True,
+                            "intent": result.intent,
+                            "confidence": result.confidence,
+                            "cited_chunk_ids": result.cited_chunk_ids,
+                            "can_think_deeper": result.can_think_deeper,
+                            "elapsed_ms": _safe_float(result.elapsed_ms),
+                            "run_id": result.run_id,
+                            "evidence_set_id": result.evidence_set_id,
+                            "unresolved_aliases": result.unresolved_aliases,
+                            "citation_map": cit_map_for_storage,
+                        }
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                "INSERT INTO research_messages (session_id, role, content, metadata) "
+                                "VALUES (%s, 'assistant', %s, %s)",
+                                (session_id, result.answer, Json(v10_metadata)),
+                            )
+                            conn.commit()
+                    except Exception as save_err:
+                        print(f"[V10 Stream] Error saving assistant message: {save_err}", file=sys.stderr)
+
+                    # Build run_history
+                    run_history: List[Dict] = []
+                    try:
+                        from retrieval.agent.v9_session import load_recent_runs
+                        recent = load_recent_runs(conn, session_id, limit=10)
+                        for run in recent.runs:
+                            run_history.append({
+                                "run_id": run.run_id,
+                                "query_index": run.query_index,
+                                "query_text": run.query_text,
+                                "label": run.label,
+                                "status": run.status,
+                                "evidence_set_id": run.evidence_set_id,
+                                "evidence_summary": run.evidence_summary,
+                            })
+                    except Exception:
+                        pass
+
+                    # V9-compatible response shape (all fields the frontend expects)
+                    response_dict = {
+                        "intent": result.intent,
+                        "answer": result.answer,
+                        "cited_chunk_ids": result.cited_chunk_ids or [],
+                        "confidence": result.confidence,
+                        "active_run_id": result.run_id,
+                        "active_run_status": result.run_status,
+                        "active_evidence_set_id": result.evidence_set_id,
+                        "referenced_run_id": None,
+                        "referenced_evidence_set_id": None,
+                        "can_think_deeper": result.can_think_deeper,
+                        "remaining_gaps": [],
+                        "next_best_actions": [],
+                        "run_history": run_history,
+                        "routing_reasoning": "",
+                        "routing_confidence": 0.0,
+                        "citation_map": cit_map_for_storage,
+                        "suggestion": "",
+                        "scope_meta": None,
+                        "escalations": [],
+                        "scope_override": None,
+                        "expansion_info": None,
+                        "unresolved_aliases": result.unresolved_aliases,
+                        "elapsed_ms": _safe_float(result.elapsed_ms),
+                    }
+                    yield f"event: result\ndata: {json.dumps(response_dict)}\n\n"
+                    break
+
+                elif event["type"] == "error":
+                    yield f"event: error\ndata: {json.dumps({'error': event['message']})}\n\n"
+                    break
+        finally:
+            conn.close()
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
 @router.post("/{session_id}/v9/message/stream")
 async def v9_message_stream(session_id: int, req: V9ChatRequest, user=Depends(require_user)):
     """
@@ -1367,7 +1574,7 @@ async def v9_message_stream(session_id: int, req: V9ChatRequest, user=Depends(re
         try:
             while True:
                 try:
-                    event = progress_queue.get(timeout=120)
+                    event = progress_queue.get(timeout=30)
                 except queue.Empty:
                     # Keepalive to prevent ALB timeout
                     yield ": keepalive\n\n"
@@ -1601,7 +1808,7 @@ def v9_message(session_id: int, req: V9ChatRequest, user=Depends(require_user)):
         # Convert citation_map to serializable format
         raw_cit_map = result.citation_map or {}
         cit_map_for_storage = {
-            label: {"chunk_id": d["chunk_id"], "document_id": d.get("document_id"), "page": d.get("page")}
+            label: {"chunk_id": d["chunk_id"], "document_id": d.get("document_id"), "page": d.get("page"), "label": d.get("label")}
             for label, d in raw_cit_map.items()
         }
 
@@ -1857,6 +2064,7 @@ def v10_message(session_id: int, req: V10ChatRequest, user=Depends(require_user)
                 chunk_id=d.get("chunk_id", 0),
                 document_id=d.get("document_id"),
                 page=d.get("page"),
+                label=d.get("label"),
             )
 
         response = V10ChatResponse(

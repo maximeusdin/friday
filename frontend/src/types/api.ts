@@ -270,6 +270,8 @@ export interface CitationDetail {
   chunk_id: number;
   document_id?: number;
   page?: number;
+  /** Human-readable label (e.g. "Vassiliev p4") when citation is keyed by chunk id */
+  label?: string;
 }
 
 /**

@@ -582,6 +582,72 @@ textarea:focus {
   text-align: center;
 }
 
+/* Splash (no session) */
+.splash-content {
+  padding: var(--spacing-lg);
+  max-width: 56rem;
+  margin: 0 auto;
+}
+.splash-hero {
+  margin-bottom: var(--spacing-xl);
+  text-align: center;
+}
+.splash-title {
+  font-size: 1.5rem;
+  font-weight: 600;
+  color: var(--color-text-primary);
+  margin: 0 0 0.5rem 0;
+}
+.splash-subtitle {
+  font-size: 0.95rem;
+  color: var(--color-text-secondary);
+  margin: 0;
+}
+.splash-section {
+  margin-bottom: var(--spacing-xl);
+}
+.splash-section-title {
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: var(--color-text-primary);
+  margin: 0 0 0.5rem 0;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+.splash-list {
+  margin: 0;
+  padding-left: 1.25rem;
+  color: var(--color-text-secondary);
+  font-size: 0.9rem;
+  line-height: 1.6;
+}
+.splash-list li {
+  margin-bottom: 0.35rem;
+}
+.splash-collections-intro {
+  font-size: 0.85rem;
+  color: var(--color-text-muted);
+  margin: 0 0 0.5rem 0;
+}
+.splash-collections-list {
+  margin: 0;
+  padding-left: 1.25rem;
+  font-size: 0.9rem;
+  color: var(--color-text-secondary);
+  line-height: 1.5;
+}
+.splash-collections-list li {
+  margin-bottom: 0.25rem;
+}
+.splash-collection-name {
+  font-weight: 500;
+  color: var(--color-text-primary);
+}
+.splash-collection-meta {
+  color: var(--color-text-muted);
+  font-size: 0.85rem;
+}
+
 /* Utility */
 .text-muted {
   color: var(--color-text-muted);
@@ -1388,6 +1454,105 @@ textarea:focus {
   100% { transform: translateX(400%); }
 }
 
+.workflow-progress-minimal {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: var(--spacing-sm);
+}
+.workflow-progress-minimal .progress-bar {
+  flex: 1;
+  min-width: 0;
+}
+
+.progress-spinner {
+  display: inline-block;
+  font-size: 14px;
+  animation: spin 1s linear infinite;
+}
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+.workflow-progress-top {
+  margin-top: var(--spacing-sm);
+}
+.workflow-progress-top .workflow-progress {
+  margin-top: 0;
+}
+.workflow-progress-label {
+  font-size: 11px;
+  color: var(--color-text-muted);
+  margin-top: 4px;
+}
+
+.workflow-panel-evidence {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+.workflow-panel-evidence .workflow-bullets-section {
+  flex: 1;
+  overflow-y: auto;
+}
+.workflow-panel-evidence .workflow-evidence-primary {
+  flex: 1;
+  min-height: 80px;
+}
+.workflow-panel-evidence .evidence-placeholder {
+  font-size: 12px;
+  color: var(--color-text-muted, #888);
+  padding: var(--spacing-sm) 0;
+  font-style: italic;
+}
+
+.workflow-summary-compact {
+  font-size: 11px;
+  color: var(--color-text-muted);
+  margin-top: var(--spacing-sm);
+}
+.workflow-progress-bullets {
+  margin-top: var(--spacing-md);
+}
+.workflow-progress-bullets .progress-bullets-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.workflow-progress-bullets .progress-bullet {
+  font-size: 12px;
+  padding: 4px 0;
+  padding-left: 14px;
+  position: relative;
+}
+.workflow-progress-bullets .progress-bullet::before {
+  content: '•';
+  position: absolute;
+  left: 0;
+  color: var(--color-primary, #4a90d9);
+}
+.workflow-bullets-section {
+  margin-top: var(--spacing-md);
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+}
+.workflow-bullets-section .evidence-bullets-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-sm);
+}
+.workflow-details {
+  font-size: 12px;
+  color: var(--color-text-secondary);
+}
+.workflow-details-summary {
+  cursor: pointer;
+  font-weight: 500;
+  padding: 4px 0;
+}
+
 
 /* =============================================================================
    Scope UX — Staged Commit Model
@@ -1464,7 +1629,7 @@ textarea:focus {
 .scope-banner-clean {
   padding: 4px 8px;
   font-size: 11px;
-  color: var(--color-text-muted, #888);
+  color: #555;
   border-bottom: 1px solid var(--color-border, #e0e0e0);
   flex-shrink: 0;
 }

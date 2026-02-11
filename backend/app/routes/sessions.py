@@ -198,15 +198,56 @@ def get_session(session_id: int, user=Depends(require_user)):
 @router.delete("/{session_id}")
 def delete_session(session_id: int, user=Depends(require_user)):
     """
-    Delete a session and all its related data (messages, plans).
+    Delete a session and all its related data (messages, plans, v9_runs, evidence_sets,
+    think_deeper_runs, etc.). Deletes in FK-safe order.
     """
     assert_session_owned(session_id, user["sub"])
     conn = get_conn()
     try:
         with conn.cursor() as cur:
+            # 1. Null out session pointers to break circular refs
+            cur.execute(
+                "UPDATE research_sessions SET active_run_id = NULL, active_evidence_set_id = NULL "
+                "WHERE id = %s AND user_sub = %s",
+                (session_id, user["sub"]),
+            )
+            # 2. Delete think_deeper_steps (references think_deeper_runs)
+            cur.execute(
+                "DELETE FROM think_deeper_steps WHERE td_run_id IN "
+                "(SELECT id FROM think_deeper_runs WHERE v9_run_id IN "
+                "(SELECT id FROM v9_runs WHERE session_id = %s))",
+                (session_id,),
+            )
+            # 3. Delete think_deeper_runs (references v9_runs, blocks v9_runs delete)
+            cur.execute(
+                "DELETE FROM think_deeper_runs WHERE v9_run_id IN "
+                "(SELECT id FROM v9_runs WHERE session_id = %s)",
+                (session_id,),
+            )
+            # 4. Delete v9_run_steps (references v9_runs)
+            cur.execute(
+                "DELETE FROM v9_run_steps WHERE run_id IN "
+                "(SELECT id FROM v9_runs WHERE session_id = %s)",
+                (session_id,),
+            )
+            # 5. Delete evidence_items (references evidence_sets)
+            cur.execute(
+                "DELETE FROM evidence_items WHERE evidence_set_id IN "
+                "(SELECT id FROM evidence_sets WHERE session_id = %s)",
+                (session_id,),
+            )
+            # 6. Delete v9_runs (references research_sessions)
+            cur.execute("DELETE FROM v9_runs WHERE session_id = %s", (session_id,))
+            # 7. Delete evidence_sets (references research_sessions)
+            cur.execute("DELETE FROM evidence_sets WHERE session_id = %s", (session_id,))
+            # 8. Delete messages and plans
             cur.execute("DELETE FROM research_messages WHERE session_id = %s", (session_id,))
             cur.execute("DELETE FROM research_plans WHERE session_id = %s", (session_id,))
-            cur.execute("DELETE FROM research_sessions WHERE id = %s AND user_sub = %s", (session_id, user["sub"]))
+            # 9. Delete the session
+            cur.execute(
+                "DELETE FROM research_sessions WHERE id = %s AND user_sub = %s",
+                (session_id, user["sub"]),
+            )
             conn.commit()
         return {"ok": True}
     finally:

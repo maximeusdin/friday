@@ -1188,19 +1188,19 @@ def print_help():
     """Print help message."""
     print("""
 Commands:
-  <query>       Submit a research query (uses V9 by default)
+  <query>       Submit a research query (V11 default: canonical embeddings, stripped V9)
   
-  === V9 Reasoning Workspace Loop is now the DEFAULT ===
-  V9 features:
+  === V11 is the DEFAULT (plain query) ===
+  V11 features:
     - Model drives tools (search, fetch, expand_entities w/ co-mentions)
     - Auto-detects scope (collections, date range) from question
     - Structured output: roster[]/timeline[]/evidence[]/edges[] by task_type
     - Sufficiency contract with per-task-type thresholds
     - Advisory verification (never blocks answer)
   
-  /v10 <query>  V10 Scope-aware Alias Identity Layer (span-lattice, scoped aliases)
-  /v9 <query>   Explicitly use V9 Reasoning Workspace Loop (same as plain query - DEFAULT)
-  /deeper [msg]  Think Deeper: autonomous Actor/Judge loop on last V9/V10 result
+  /v9 <query>   V9 Reasoning Workspace Loop (full v9: PEM, concordance, query resolution)
+  /v10 <query>  V10 Scope-aware Alias Identity Layer
+  /deeper [msg]  Think Deeper: autonomous Actor/Judge loop on last result
                  Optional follow-up message to guide the investigation
                  Runs additional retrieval+verification steps to find new evidence
                  Can be chained: each /deeper builds on the previous result
@@ -1246,6 +1246,10 @@ Workflow Modes:
                 - Hard bottleneck forces convergence to 30-50 spans
                 - Responsiveness check: does answer actually satisfy question?
                 - Progress-gated rounds: stop if no quality evidence gained
+  V11 (default): Stripped V9 with canonical embeddings:
+                - No PEM lane, no query entity resolution, no concordance expansion
+                - Canonical embeddings (chunk_embeddings_canonical) by default
+                - Optional lightweight PEM via V11_USE_LIGHTWEIGHT_PEM=1
   V10 (/v10):   Scope-aware Alias Identity Layer:
                 - Span-lattice query interpretation with dominance relationships
                 - Collection-scoped alias semantics (Venona/Vassiliev codenames stay scoped)
@@ -1253,7 +1257,7 @@ Workflow Modes:
                 - Structured entity/alias boosts (replaces query rewriting)
                 - Entity-aware grounding and alias-annotated rendering
                 - Full ThinkDeeper compatibility with V10 artifact persistence
-  V9 (/v9):     Reasoning Workspace Loop V9.2 (DEFAULT):
+  V9 (/v9):     Reasoning Workspace Loop V9.2:
                 - Model drives tools (search_chunks, fetch_chunks, expand_entities)
                 - expand_entities supports names[] + include_comentions for roster power
                 - Auto-detects scope (collections/dates) from question text
@@ -1276,10 +1280,17 @@ V6 Query Examples:
   /v6 who were members of the Silvermaster network? Provide citations from Vassiliev.
   /v6 list Soviet agents in the Treasury Department
 
-V7 Query Examples (DEFAULT - with citation enforcement):
+V7 Query Examples:
   /v7 who were members of the Silvermaster network?  (all claims will have citations)
   /v7 list Soviet agents in the Treasury Department  (unsupported claims are dropped)
-  who handled Julius Rosenberg?                      (plain queries use V7 by default)
+
+Plain query (V11 default):
+  who handled Julius Rosenberg?                      (plain queries use V11 by default)
+
+Environment / Manual fallbacks:
+  USE_V9_AGENT=1              Use v9 as default for plain queries and dispatch (instead of v11)
+  USE_ORIGINAL_EMBEDDINGS=1   Use original embeddings from chunk_embeddings (not canonical)
+  V11_USE_LIGHTWEIGHT_PEM=1   Enable lightweight PEM for venona/vassiliev chunks (v11)
 """)
 
 def interactive_mode(session_id: int, auto_execute: bool = False, pre_bundling_mode: str = "micro", bottleneck_mode: str = "score"):
@@ -1297,6 +1308,7 @@ def interactive_mode(session_id: int, auto_execute: bool = False, pre_bundling_m
     last_v9_workspace = None  # Track last V9 workspace for /deeper
     last_v9_question = None   # Track last V9 question for /deeper
     last_v9_run_id = None     # Track last V9 run_id (v9_runs) for /deeper DB persistence
+    last_use_v9_fallback = False  # True if last run used v9 agent (USE_V9_AGENT=1), else v11
     
     print_header()
     print(f"Session: {session_label} (ID: {session_id})")
@@ -1825,7 +1837,7 @@ def interactive_mode(session_id: int, auto_execute: bool = False, pre_bundling_m
             elif cmd == "/v9":
                 if not arg:
                     print("Usage: /v9 <query>")
-                    print("V9.2 Reasoning Workspace Loop (DEFAULT mode)")
+                    print("V9.2 Reasoning Workspace Loop")
                     print("Examples:")
                     print("  /v9 who were members of the Silvermaster network?")
                     print("  /v9 what evidence is there for Soviet awareness of the proximity fuse?")
@@ -1854,6 +1866,7 @@ def interactive_mode(session_id: int, auto_execute: bool = False, pre_bundling_m
                     if result.workspace:
                         last_v9_workspace = result.workspace
                         last_v9_question = query_text
+                        last_use_v9_fallback = True  # v9 resynthesis uses v9
                     if result.workspace and result.workspace.chunks:
                         # Clear any aborted transaction state from the V9 pipeline
                         try:
@@ -1944,6 +1957,7 @@ def interactive_mode(session_id: int, auto_execute: bool = False, pre_bundling_m
                     if result.workspace:
                         last_v9_workspace = result.workspace
                         last_v9_question = query_text
+                        last_use_v9_fallback = True  # v10 resynthesis uses v9
                     if result.workspace and result.workspace.chunks:
                         # Clear any aborted transaction state
                         try:
@@ -2005,7 +2019,7 @@ def interactive_mode(session_id: int, auto_execute: bool = False, pre_bundling_m
             elif cmd == "/deeper":
                 # Think Deeper: autonomous Actor/Judge loop on last V9 result
                 if last_v9_workspace is None:
-                    print("No V9 result to deepen. Run a query first (plain text or /v9 <query>).")
+                    print("No result to deepen. Run a query first (plain text or /v10 <query>).")
                     continue
                 
                 user_followup = arg.strip() if arg else None
@@ -2096,18 +2110,40 @@ def interactive_mode(session_id: int, auto_execute: bool = False, pre_bundling_m
                     print(f"  Workspace now: {new_total} chunks (was {baseline_chunks})")
                     
                     # ── Re-synthesize answer using enriched workspace ─────
-                    # Run V9 on the expanded workspace with a small tool budget
+                    # Run V9 or V11 on the expanded workspace with a small tool budget
                     # so it focuses on synthesis rather than more retrieval.
+                    # Build Findings Brief from Think Deeper FindingStore for grounded claims.
                     print(f"\n  Re-synthesizing answer with enriched evidence...")
                     try:
-                        from retrieval.agent.v9_runner import run_v9_query, format_v9_result
-                        resynthesized = run_v9_query(
-                            conn=conn,
-                            question=last_v9_question,
-                            verbose=False,
-                            _resume_workspace=last_v9_workspace,
-                            max_tool_calls=3,  # small budget: focus on synthesis, not more retrieval
-                        )
+                        from retrieval.agent.v9_runner import format_v9_result
+                        from retrieval.agent.v9_deep_findings import build_findings_brief
+                        chunk_id_to_label = {c.chunk_id: f"{c.collection_slug or ''} {c.page or ''}".strip()
+                                            for c in td_result.selected_chunks}
+                        findings_brief = build_findings_brief(
+                            td_result.finding_store_entries, top_n=10,
+                            chunk_id_to_label=chunk_id_to_label,
+                        ) if td_result.finding_store_entries else None
+                        if last_use_v9_fallback:
+                            from retrieval.agent.v9_runner import run_v9_query
+                            resynthesized = run_v9_query(
+                                conn=conn,
+                                question=last_v9_question,
+                                verbose=False,
+                                _resume_workspace=last_v9_workspace,
+                                max_tool_calls=3,  # small budget: focus on synthesis, not more retrieval
+                                _findings_brief=findings_brief,
+                            )
+                        else:
+                            from retrieval.agent.v11_runner import run_v11_query
+                            resynthesized = run_v11_query(
+                                conn=conn,
+                                question=last_v9_question,
+                                verbose=False,
+                                _resume_workspace=last_v9_workspace,
+                                max_tool_calls=3,
+                                use_lightweight_pem=os.getenv("V11_USE_LIGHTWEIGHT_PEM", "0").strip().lower() in ("1", "true", "yes"),
+                                _findings_brief=findings_brief,
+                            )
                         print(f"\n{'='*60}")
                         print(f"  UPDATED ANSWER (with Think Deeper evidence)")
                         print(f"{'='*60}")
@@ -2118,6 +2154,12 @@ def interactive_mode(session_id: int, auto_execute: bool = False, pre_bundling_m
                             last_v9_workspace = resynthesized.workspace
                     except Exception as synth_err:
                         print(f"  Warning: Re-synthesis failed: {synth_err}", file=sys.stderr)
+                        # Fallback: show Think Deeper narrative so user always gets something
+                        if td_result.narrative:
+                            print(f"\n{'='*60}")
+                            print(f"  THINK DEEPER SUMMARY (re-synthesis skipped)")
+                            print(f"{'='*60}")
+                            print(td_result.narrative)
                         print(f"  (New evidence is still merged into workspace for next /deeper)")
                     
                     print(f"{'='*60}")
@@ -2366,21 +2408,29 @@ def interactive_mode(session_id: int, auto_execute: bool = False, pre_bundling_m
             
             continue
         
-        # Process as a query - V9 is now the DEFAULT for all queries
-        # (V7 via /v7, V6 via /v6, old agentic modes via /v1-/v4)
+        # Process as a query - V11 is the DEFAULT (canonical embeddings, stripped V9)
+        # USE_V9_AGENT=1 → v9; /v9 → v9, /v10 → v10, /v7 → v7, etc.
         
-        # DEFAULT: V9 Reasoning Workspace Loop (model drives tools, synthesis first, advisory verification)
         query_text = user_input
-        print(f"\n[V9 Mode] Processing: \"{query_text}\"...")
+        use_v9_as_default = os.getenv("USE_V9_AGENT", "0").strip().lower() in ("1", "true", "yes")
+        if use_v9_as_default:
+            print(f"\n[V9 Mode] Processing: \"{query_text}\"... (USE_V9_AGENT=1)")
+        else:
+            print(f"\n[V11 Mode] Processing: \"{query_text}\"...")
         
         try:
-            from retrieval.agent.v9_runner import run_v9_query, format_v9_result
-            
-            result = run_v9_query(
-                conn=conn,
-                question=query_text,
-                verbose=True,
-            )
+            from retrieval.agent.v9_runner import format_v9_result
+            if use_v9_as_default:
+                from retrieval.agent.v9_runner import run_v9_query
+                result = run_v9_query(conn=conn, question=query_text, verbose=True)
+            else:
+                from retrieval.agent.v11_runner import run_v11_query
+                result = run_v11_query(
+                    conn=conn,
+                    question=query_text,
+                    verbose=True,
+                    use_lightweight_pem=os.getenv("V11_USE_LIGHTWEIGHT_PEM", "0").strip().lower() in ("1", "true", "yes"),
+                )
             
             print(format_v9_result(result, include_verification=True))
             
@@ -2388,10 +2438,11 @@ def interactive_mode(session_id: int, auto_execute: bool = False, pre_bundling_m
             if result.workspace:
                 last_v9_workspace = result.workspace
                 last_v9_question = query_text
+                last_use_v9_fallback = use_v9_as_default
             
             # Create result set for summarize compatibility
             if result.workspace and result.workspace.chunks:
-                # Clear any aborted transaction state from the V9 pipeline
+                # Clear any aborted transaction state
                 try:
                     conn.rollback()
                 except Exception:
@@ -2410,34 +2461,32 @@ def interactive_mode(session_id: int, auto_execute: bool = False, pre_bundling_m
                             from retrieval.ops import log_retrieval_run
                             from scripts.execute_plan import create_result_set
                             
+                            mode_tag = "V9" if use_v9_as_default else "V11"
                             run_id = log_retrieval_run(
                                 conn=conn,
-                                query_text=query_text,
+                                query_text=f"[AGENTIC_{mode_tag}] {query_text}",
                                 search_type="hybrid",
                                 chunk_pv=chunk_pv,
                                 embedding_model=None,
                                 top_k=len(chunk_ids),
                                 returned_chunk_ids=chunk_ids,
                                 retrieval_config_json={
-                                    "mode": "agentic_v9",
-                                    "grounded_claims": result.verification.grounded_claims if result.verification else 0,
-                                    "weak_claims": result.verification.weak_claims if result.verification else 0,
-                                    "unsupported_claims": result.verification.unsupported_claims if result.verification else 0,
+                                    "mode": f"agentic_{mode_tag.lower()}",
                                 },
                                 auto_commit=False,
                                 session_id=session_id,
                             )
                             conn.commit()
                             
-                            result_set_id_v9 = create_result_set(
+                            result_set_id = create_result_set(
                                 conn,
                                 run_id=run_id,
                                 chunk_ids=chunk_ids,
-                                name=f"V9: {query_text[:40]}... (run {run_id})",
+                                name=f"{mode_tag}: {query_text[:40]}... (run {run_id})",
                                 session_id=session_id,
                             )
-                            current_result_set_id = result_set_id_v9
-                            print(f"  Created result set #{result_set_id_v9}", file=sys.stderr)
+                            current_result_set_id = result_set_id
+                            print(f"  Created result set #{result_set_id}", file=sys.stderr)
                 except Exception as e:
                     print(f"  Warning: Could not create result set: {e}", file=sys.stderr)
             
@@ -2454,7 +2503,8 @@ def interactive_mode(session_id: int, auto_execute: bool = False, pre_bundling_m
                 )
                 last_v9_run_id = v9_run.run_id
                 update_run_status(conn, v9_run.run_id, "paused")
-                print(f"  V9 run #{v9_run.run_id} created (paused, ready for /deeper)", file=sys.stderr)
+                mode_tag = "V9" if use_v9_as_default else "V11"
+                print(f"  {mode_tag} run #{v9_run.run_id} created (paused, ready for /deeper)", file=sys.stderr)
             except Exception as e:
                 print(f"  Warning: Could not create v9_run for Think Deeper: {e}", file=sys.stderr)
                 last_v9_run_id = None
@@ -2462,7 +2512,7 @@ def interactive_mode(session_id: int, auto_execute: bool = False, pre_bundling_m
             print()
                 
         except Exception as e:
-            print(f"\nV9 workflow error: {e}")
+            print(f"\nV11 workflow error: {e}")
             import traceback
             traceback.print_exc()
             print()
@@ -2575,20 +2625,20 @@ def one_shot_query(session_label: str, query: str, auto_execute: bool = True, fo
             print("\nFalling back to V1 agentic mode...\n")
     
     # Check if we should use agentic mode (enabled by default for all queries)
-    # Default agentic path is V9 (Reasoning Workspace Loop)
+    # Default agentic path is V10 (Scope-aware Alias Identity Layer)
     use_agentic = force_agentic or AGENTIC_MODE_ENABLED
     
     if use_agentic:
-        print("[V9 Mode - Reasoning Workspace Loop]")
+        print("[V10 Mode - Scope-aware Alias Identity Layer]")
         print()
         try:
-            from retrieval.agent.v9_runner import run_v9_query, format_v9_result
-            result = run_v9_query(conn=conn, question=query, verbose=True)
-            print(format_v9_result(result, include_verification=True))
+            from retrieval.agent.v10_runner import run_v10_query, format_v10_result
+            v10_result = run_v10_query(conn=conn, question=query, verbose=True)
+            print(format_v10_result(v10_result, include_identity=True))
             conn.close()
             return
         except Exception as e:
-            print(f"V9 workflow error: {e}")
+            print(f"V10 workflow error: {e}")
             import traceback
             traceback.print_exc()
             print("\nFalling back to traditional mode...\n")

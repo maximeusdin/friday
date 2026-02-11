@@ -18,6 +18,7 @@ export default function Home() {
   const [activeEvidence, setActiveEvidence] = useState<EvidenceRef | null>(null);
   const [lastV9Response, setLastV9Response] = useState<V9ChatResponse | null>(null);
   const [isProcessing, setIsProcessing] = useState(false);
+  const [processingSessionId, setProcessingSessionId] = useState<number | null>(null);
   const [progressSteps, setProgressSteps] = useState<V9ProgressEvent[]>([]);
   const [evidenceBullets, setEvidenceBullets] = useState<V9EvidenceBullet[]>([]);
 
@@ -49,8 +50,6 @@ export default function Home() {
     setActiveSession(session);
     setActiveEvidence(null);
     setLastV9Response(null);
-    setProgressSteps([]);
-    setEvidenceBullets([]);
     // Scope: deterministic reset
     setActiveScope(session.scope_json || { mode: 'full_archive' });
     setActiveScopeRevision(1); // deterministic reset, not increment
@@ -65,6 +64,7 @@ export default function Home() {
     setActiveEvidence(null);
     setLastV9Response(null);
     setIsProcessing(false);
+    setProcessingSessionId(null);
     setProgressSteps([]);
     setEvidenceBullets([]);
     setActiveScope(null);
@@ -111,9 +111,10 @@ export default function Home() {
     }
   }, []);
 
-  const handleProcessingChange = (processing: boolean) => {
+  const handleProcessingChange = useCallback((processing: boolean, sessionId?: number) => {
     setIsProcessing(processing);
-  };
+    setProcessingSessionId(processing && sessionId != null ? sessionId : null);
+  }, []);
 
   const handleEvidenceClick = (evidence: EvidenceRef | null) => {
     setActiveEvidence(evidence);
@@ -228,6 +229,8 @@ export default function Home() {
                 onEditScope={handleEditScope}
                 onQuerySent={handleQuerySent}
                 onMakeActiveScope={handleApplyScope}
+                isProcessing={isProcessing}
+                processingSessionId={processingSessionId}
               />
             </>
           )}
@@ -238,6 +241,7 @@ export default function Home() {
           <RightPane
             v9Response={lastV9Response}
             isProcessing={isProcessing}
+            processingSessionId={processingSessionId}
             onEvidenceClick={handleEvidenceClick}
             progressSteps={progressSteps}
             evidenceBullets={evidenceBullets}

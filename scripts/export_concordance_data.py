@@ -4,6 +4,8 @@ Export concordance data to CSV files for examination.
 
 Exports:
 - concordance_entries.csv: All entries with their parsed data
+- entry_document_pages.csv: One row per (alias_norm, canonical_name, document): each alias at that
+  document/location on its own line; pages merged when the same alias appears multiple times
 - entities.csv: All entities from concordance
 - entity_aliases.csv: All aliases with their types
 - entity_links.csv: All relationships (cover_name_of, changed_to, etc.)
@@ -12,10 +14,12 @@ Exports:
 """
 
 import os
+import re
 import sys
 import csv
 import argparse
 from pathlib import Path
+from collections import defaultdict
 from typing import List, Tuple, Optional
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -23,10 +27,12 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from retrieval.ops import get_conn
+from retrieval.surface_norm import normalize_surface
 
 # Import citation parser to extract pages grouped by document
 from concordance.validate_entity_mentions_from_citations import (
-    parse_citation_text
+    parse_citation_text,
+    parse_page_numbers,
 )
 
 
@@ -45,6 +51,133 @@ def expand_page_ranges(pages: List[Tuple[int, Optional[int]]]) -> List[int]:
             for page_num in range(start, end + 1):
                 expanded.append(page_num)
     return sorted(set(expanded))  # Remove duplicates and sort
+
+
+# Page list must be only digits, spaces, commas, en-dash, hyphen (reject prose)
+_PAGE_LIST_RE = re.compile(r'^\d[\d\s,–\-]*$', re.UNICODE)
+
+# Strip "See X." and "See Also X." cross-ref phrases so citation blocks are not hidden
+_SEE_ALSO_RE = re.compile(r'\bSee\s+Also\s+[^.]+\.', re.IGNORECASE)
+_SEE_RE = re.compile(r'\bSee\s+[^.]+\.', re.IGNORECASE)
+
+
+def _strip_see_see_also(text: str) -> str:
+    """Remove 'See X.' and 'See Also X.' phrases so we don't skip citation blocks that follow."""
+    t = _SEE_ALSO_RE.sub(' ', text)
+    t = _SEE_RE.sub(' ', t)
+    return t
+
+
+# Start of a document citation (Vassiliev or Venona)
+_VASSILIEV_VENONA_RE = re.compile(r'(Vassiliev|Venona)', re.IGNORECASE)
+
+# Garbage alias_norms to exclude from entry_document_pages (matches ingest_concordance_tab_aware)
+_GARBAGE_ALIAS_NORMS = frozenset({
+    'american', 'bureau', 'soviet', 'russian', 'department', 'states', 'united',
+    'unidentified', 'unknown', 'information', 'intelligence',
+    'partial', 'german', 'a', 'kgb',
+})
+_GARBAGE_SUBSTRINGS = ('unidentified', 'unknown', 'ussr', 'venona', 'vassiliev', 'undeciphered')
+
+
+def _is_garbage_alias(alias_norm: str) -> bool:
+    """Skip aliases that poison PEM (matches ingest exclusions)."""
+    if not alias_norm:
+        return True
+    t = alias_norm.lower()
+    if t in _GARBAGE_ALIAS_NORMS:
+        return True
+    return any(s in t for s in _GARBAGE_SUBSTRINGS)
+
+
+_PHRASE_DEDUP_STOPWORDS = frozenset({"of", "the", "a", "an", "and", "or", "for", "de", "la", "le"})
+
+
+def _phrase_key(alias_norm: str) -> str:
+    """Normalize phrase for deduping (office of X = office X = X office)."""
+    if not alias_norm:
+        return ""
+    words = [w for w in alias_norm.lower().split() if w not in _PHRASE_DEDUP_STOPWORDS]
+    return " ".join(sorted(words)) if words else ""
+
+
+def _is_boring_alias(alias_norm: str, canonical_norm: str) -> bool:
+    """Skip case-only (Jacob=JACOB) or phrase-equivalent (office X = office of X) variants."""
+    if not alias_norm or not canonical_norm:
+        return False
+    if alias_norm == canonical_norm:
+        return True  # case-only variant
+    if len(alias_norm.split()) > 1 and _phrase_key(alias_norm) == _phrase_key(canonical_norm):
+        return True  # phrase-equivalent
+    return False
+
+
+def _extract_one_document_block(block: str) -> Optional[Tuple[str, List[int]]]:
+    """Parse a single block that starts with Vassiliev or Venona: document title and page list."""
+    comma_pos = block.find(',')
+    if comma_pos < 0:
+        return None
+    document_title = block[:comma_pos].strip()
+    after_comma = block[comma_pos + 1:].strip()
+    # Truncate at semicolon so we only take this document's page list
+    if ';' in after_comma:
+        after_comma = after_comma.split(';')[0].strip()
+    if after_comma.endswith('.'):
+        after_comma = after_comma[:-1].strip()
+    if not after_comma or not _PAGE_LIST_RE.match(after_comma):
+        return None
+    page_tuples = parse_page_numbers(after_comma)
+    expanded = expand_page_ranges(page_tuples)
+    if not expanded:
+        return None
+    return (document_title, expanded)
+
+
+def _split_on_vassiliev_venona(block: str) -> List[str]:
+    """
+    Split block on each occurrence of Vassiliev or Venona so each segment starts with
+    a document citation. Returns list of sub-blocks (each starting with Vassiliev or Venona).
+    """
+    sub_blocks = []
+    for m in _VASSILIEV_VENONA_RE.finditer(block):
+        start = m.start()
+        sub = block[start:].strip()
+        if sub:
+            sub_blocks.append(sub)
+    return sub_blocks
+
+
+def parse_documents_and_pages_from_raw_text(raw_text: str) -> List[Tuple[str, List[int]]]:
+    """
+    Extract every source document and page list from raw_text.
+    
+    - Strips "See X." and "See Also X." so citations after cross-refs are not missed.
+    - Splits on semicolons; for each block, splits again on every Vassiliev/Venona so
+      each occurrence yields a clean document title and page list (one row per document).
+    - Validates page list (digits/ranges only). Ranges (e.g. 66–67, 103–4) are expanded.
+    """
+    if not raw_text:
+        return []
+    
+    # Normalize: single line, collapse spaces; strip See / See Also cross-ref phrases
+    text = re.sub(r'\s+', ' ', raw_text.strip())
+    text = _strip_see_see_also(text)
+    
+    result = []
+    for block in text.split(';'):
+        block = block.strip()
+        if not block:
+            continue
+        # Split on every Vassiliev/Venona so each occurrence can be a clean document row
+        for sub_block in _split_on_vassiliev_venona(block):
+            one = _extract_one_document_block(sub_block)
+            if one:
+                doc_title, pages = one
+                # Keep only if title is "clean" (no second Vassiliev/Venona in the title)
+                if len(_VASSILIEV_VENONA_RE.findall(doc_title)) <= 1:
+                    result.append(one)
+    
+    return result
 
 
 def parse_citation_pages_by_document(citation_text: str) -> List[Tuple[str, List[int]]]:
@@ -102,14 +235,99 @@ def export_concordance_entries(output_dir: str, source_slug: Optional[str] = Non
         query += " ORDER BY cs.slug, ce.entry_seq"
         
         cur.execute(query, params)
+        entries_rows = cur.fetchall()
         
         with open(output_dir / "concordance_entries.csv", 'w', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
             writer.writerow(['id', 'source_slug', 'source_title', 'entry_key', 'entry_seq', 'raw_text'])
-            for row in cur.fetchall():
+            for row in entries_rows:
                 writer.writerow(row)
         
         print(f"Exported concordance_entries to {output_dir / 'concordance_entries.csv'}", file=sys.stderr)
+        
+        # Entry -> list of (alias_norm, canonical_name, alias_type) for this source
+        # Crossrefs ("see"): ingest attaches entry_key as alias to the *target* entity (alias_type="see").
+        # So crossref entries have no entity of their own; their only alias points to the target.
+        entry_aliases_query = """
+            SELECT ce.id, ea.alias_norm, e.canonical_name, ea.alias_type
+            FROM concordance_entries ce
+            JOIN concordance_sources cs ON ce.source_id = cs.id
+            JOIN entity_aliases ea ON ea.entry_id = ce.id
+            JOIN entities e ON e.id = ea.entity_id
+        """
+        if source_slug:
+            entry_aliases_query += " WHERE cs.slug = %s"
+        entry_aliases_query += " ORDER BY ce.id"
+        cur.execute(entry_aliases_query, [source_slug] if source_slug else [])
+        entry_to_aliases = defaultdict(list)
+        see_aliases = set()  # (alias_norm, canonical_norm) that are cross-refs
+        for entry_id, alias_norm, canonical_name, alias_type in cur.fetchall():
+            if alias_norm and canonical_name is not None:
+                canonical_norm = normalize_surface(canonical_name) if canonical_name else ""
+                entry_to_aliases[entry_id].append((alias_norm, canonical_name, alias_type))
+                if alias_type == "see":
+                    see_aliases.add((alias_norm, canonical_norm))
+        
+        # Export entry_document_pages: one row per (alias_norm, canonical_name, document_norm); clean names only
+        grouped = defaultdict(lambda: {"document_title": None, "canonical_name": None, "pages": []})
+        for row in entries_rows:
+            entry_id, source_slug, source_title, entry_key, entry_seq, raw_text = row
+            aliases = entry_to_aliases.get(entry_id)
+            if not aliases:
+                continue
+            doc_pages_list = parse_documents_and_pages_from_raw_text(raw_text or '')
+            for document_title, pages in doc_pages_list:
+                document_norm = normalize_surface(document_title) if document_title else ""
+                if not document_norm:
+                    continue
+                for alias_norm, canonical_name, _alias_type in aliases:
+                    if _is_garbage_alias(alias_norm):
+                        continue
+                    canonical_norm = normalize_surface(canonical_name) if canonical_name else ""
+                    # Collapse phrase-equivalent aliases (office X = office of X = X office) into canonical form
+                    effective_alias = canonical_norm if _is_boring_alias(alias_norm, canonical_norm) else alias_norm
+                    key = (effective_alias, canonical_norm, document_norm)
+                    if grouped[key]["document_title"] is None:
+                        grouped[key]["document_title"] = document_title
+                        grouped[key]["canonical_name"] = canonical_name
+                    grouped[key]["pages"].extend(pages)
+        # Propagate target entity's document/pages to see-aliases (cross-refs have no blocks in raw_text)
+        canonical_to_docs = defaultdict(list)
+        for (alias_norm, canonical_norm, document_norm), data in grouped.items():
+            pages_list = sorted(set(data["pages"]))
+            canonical_to_docs[canonical_norm].append((
+                document_norm,
+                data["document_title"],
+                data["canonical_name"],
+                pages_list,
+            ))
+        for (alias_norm, canonical_norm) in see_aliases:
+            if _is_garbage_alias(alias_norm):
+                continue
+            effective_alias = canonical_norm if _is_boring_alias(alias_norm, canonical_norm) else alias_norm
+            for document_norm, document_title, canonical_name, pages_list in canonical_to_docs.get(canonical_norm, []):
+                key = (effective_alias, canonical_norm, document_norm)
+                if grouped[key]["document_title"] is None:
+                    grouped[key]["document_title"] = document_title
+                    grouped[key]["canonical_name"] = canonical_name
+                grouped[key]["pages"].extend(pages_list)
+        # One row per (alias_norm, canonical_name, document): each alias at that location gets its own line
+        with open(output_dir / "entry_document_pages.csv", 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow(['alias_norm', 'canonical_name', 'document_title', 'document_norm', 'pages'])
+            for (alias_norm, canonical_norm, document_norm), data in sorted(grouped.items()):
+                if _is_garbage_alias(alias_norm):
+                    continue
+                pages_sorted = sorted(set(data["pages"]))
+                pages_str = ','.join(str(p) for p in pages_sorted)
+                writer.writerow([
+                    alias_norm,
+                    data["canonical_name"],
+                    data["document_title"],
+                    document_norm,
+                    pages_str,
+                ])
+        print(f"Exported entry_document_pages to {output_dir / 'entry_document_pages.csv'}", file=sys.stderr)
         
         # Export entities (from concordance sources)
         query = """
@@ -405,15 +623,14 @@ def export_concordance_entries(output_dir: str, source_slug: Optional[str] = Non
 
 
 def get_most_recent_source_slug(conn) -> Optional[str]:
-    """Get the most recent concordance source slug (by highest id, assuming newer sources have higher ids)."""
+    """Get the most recent concordance source slug that has at least one entry."""
     with conn.cursor() as cur:
-        # Try to get by created_at if available, else by id (newer = higher id)
+        # Only consider sources that have entries (ignore empty placeholder sources)
         cur.execute("""
-            SELECT slug 
-            FROM concordance_sources 
-            ORDER BY 
-                CASE WHEN created_at IS NOT NULL THEN created_at ELSE NULL END DESC NULLS LAST,
-                id DESC
+            SELECT cs.slug
+            FROM concordance_sources cs
+            WHERE EXISTS (SELECT 1 FROM concordance_entries ce WHERE ce.source_id = cs.id)
+            ORDER BY cs.created_at DESC NULLS LAST, cs.id DESC
             LIMIT 1
         """)
         row = cur.fetchone()

@@ -641,7 +641,7 @@ export async function sendV9MessageStreaming(
 
   let response: Response;
   try {
-    response = await fetch(`${directUrl}/sessions/${sessionId}/v9/message/stream`, {
+    response = await fetch(`${directUrl}/sessions/${sessionId}/v10/message/stream`, {
       method: 'POST',
       credentials: 'include',
       headers: { 'Content-Type': 'application/json' },

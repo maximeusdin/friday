@@ -2,7 +2,7 @@
 
 import { useState, useEffect, useCallback, useMemo } from 'react';
 import type {
-  V9ChatResponse, V9RunSummary, EvidenceRef, V9ProgressEvent, V9EvidenceBullet,
+  V9ChatResponse, EvidenceRef, V9ProgressEvent, V9EvidenceBullet,
   CollectionNode, DocumentNode, UserSelectedScope, RunScopeInfo,
 } from '@/types/api';
 import { api } from '@/lib/api';
@@ -15,6 +15,7 @@ import { scopeFingerprint } from '@/lib/scope';
 interface RightPaneProps {
   v9Response: V9ChatResponse | null;
   isProcessing: boolean;
+  processingSessionId?: number | null;
   onEvidenceClick: (evidence: EvidenceRef | null) => void;
   progressSteps?: V9ProgressEvent[];
   evidenceBullets?: V9EvidenceBullet[];
@@ -31,6 +32,7 @@ interface RightPaneProps {
 export function RightPane({
   v9Response,
   isProcessing,
+  processingSessionId = null,
   onEvidenceClick,
   progressSteps = [],
   evidenceBullets = [],
@@ -134,7 +136,7 @@ export function RightPane({
           }}
         >
           Investigation
-          {isProcessing && <span style={{ marginLeft: 6, fontSize: 10 }}>&#x25CF;</span>}
+          {isProcessing && sessionId === processingSessionId && <span style={{ marginLeft: 6, fontSize: 10 }}>&#x25CF;</span>}
         </button>
       </div>
 
@@ -177,6 +179,7 @@ export function RightPane({
           <InvestigationPanel
             v9={v9Response}
             isProcessing={isProcessing}
+            isActiveSessionProcessing={sessionId === processingSessionId}
             progressSteps={progressSteps}
             evidenceBullets={evidenceBullets}
             onEvidenceClick={onEvidenceClick}
@@ -481,15 +484,16 @@ function ScopePanel({
           placeholder="Filter collections..."
           value={searchFilter}
           onChange={(e) => setSearchFilter(e.target.value)}
+          onKeyDown={(e) => { if (e.key === 'Enter') e.preventDefault(); }}
           disabled={!isCustom}
           style={{
-            width: '100%',
             padding: '4px 6px',
             border: '1px solid var(--color-border, #ddd)',
             borderRadius: '3px',
             fontSize: '12px',
             marginBottom: '6px',
             opacity: isCustom ? 1 : 0.5,
+            color: '#212529',
           }}
         />
 
@@ -549,7 +553,7 @@ function ScopePanel({
                     onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') toggleExpand(col.id); }}
                     style={{
                       cursor: 'pointer', fontSize: '10px', width: 16, flexShrink: 0,
-                      color: '#555', display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+                      color: '#333', display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
                       userSelect: 'none',
                     }}
                     title="Expand / collapse documents"
@@ -563,7 +567,7 @@ function ScopePanel({
                   }}>
                     {col.title || col.slug || `Collection #${col.id}`}
                   </span>
-                  <span style={{ color: '#888', fontSize: '11px', flexShrink: 0, marginLeft: 4 }}>
+                  <span style={{ color: '#555', fontSize: '11px', flexShrink: 0, marginLeft: 4 }}>
                     ({col.document_count})
                   </span>
                 </div>
@@ -607,7 +611,7 @@ function ScopePanel({
 
       {/* Sticky footer — Apply / Revert + selection count */}
       <div className="scope-footer">
-        <div style={{ fontSize: '12px', color: 'var(--color-text-secondary, #666)', marginBottom: 6 }}>
+        <div style={{ fontSize: '12px', color: '#333', marginBottom: 6 }}>
           {draftScope.mode === 'full_archive' ? (
             'Selected: Full archive'
           ) : (
@@ -648,23 +652,61 @@ function ScopePanel({
 
 
 // =============================================================================
-// Investigation Panel — V9 metadata (unchanged)
+// Investigation Panel — minimal progress + evidence-focused
 // =============================================================================
+
+const DEFAULT_MAX_TOOL_CALLS = 12;
+
+function toUserFriendlyProgress(step: V9ProgressEvent): string {
+  switch (step.step) {
+    case 'tool_call': {
+      const tool = (step.details?.tool as string) || '';
+      if (tool.startsWith('search_chunks') || tool === 'search_chunks') return 'Searching documents...';
+      if (tool.startsWith('fetch_chunks') || tool === 'fetch_chunks') return 'Reading documents...';
+      if (tool.startsWith('expand_entities') || tool === 'expand_entities') return 'Resolving identities...';
+      if (tool.startsWith('alias_index') || tool.includes('alias')) return 'Looking up references...';
+      if (tool.startsWith('search') || tool.includes('search')) return 'Searching...';
+      return 'Gathering evidence...';
+    }
+    case 'turn_start':
+      return 'Investigating...';
+    case 'investigation':
+      return 'Searching and analyzing...';
+    case 'entity_resolution':
+      return 'Resolving entities...';
+    case 'synthesis':
+      return 'Synthesizing answer...';
+    case 'evidence_update':
+      return 'Found evidence...';
+    case 'routing':
+      return 'Understanding your question...';
+    default:
+      if (step.message?.toLowerCase().includes('search')) return 'Searching...';
+      if (step.message?.toLowerCase().includes('round')) return 'Analyzing evidence...';
+      if (step.message?.toLowerCase().includes('fetch')) return 'Reading documents...';
+      if (step.message?.toLowerCase().includes('synthes')) return 'Synthesizing answer...';
+      return step.message || 'Investigating...';
+  }
+}
 
 function InvestigationPanel({
   v9,
   isProcessing,
+  isActiveSessionProcessing,
   progressSteps = [],
   evidenceBullets = [],
   onEvidenceClick,
 }: {
   v9: V9ChatResponse | null;
   isProcessing: boolean;
+  isActiveSessionProcessing: boolean;
   progressSteps?: V9ProgressEvent[];
   evidenceBullets?: V9EvidenceBullet[];
   onEvidenceClick?: (evidence: EvidenceRef | null) => void;
 }) {
-  if (!isProcessing && !v9) {
+  const hasData = v9 || evidenceBullets.length > 0;
+  const showContent = hasData || isActiveSessionProcessing;
+  if (!showContent) {
     return (
       <div className="workflow-panel">
         <div className="workflow-header">
@@ -678,207 +720,126 @@ function InvestigationPanel({
     );
   }
 
-  if (isProcessing && !v9) {
+  // Tool-count-based progress: count tool_call steps, estimate % complete
+  const progressStepsFiltered = progressSteps.filter(s => s.step !== 'evidence_update');
+  const toolCallCount = progressStepsFiltered.filter(s => s.step === 'tool_call').length;
+  const toolCallNumber = progressStepsFiltered
+    .filter(s => s.details?.tool_call_number != null)
+    .map(s => s.details?.tool_call_number as number)
+    .pop();
+  const effectiveToolCount = toolCallNumber ?? toolCallCount;
+  const progressPercent = !isActiveSessionProcessing && v9
+    ? 100
+    : Math.min(95, Math.round((effectiveToolCount / DEFAULT_MAX_TOOL_CALLS) * 100));
+  const showIndeterminate = isActiveSessionProcessing && effectiveToolCount === 0;
+
+  const renderMinimalProgress = () => (
+    <div className="workflow-progress-minimal">
+      <div className="progress-bar">
+        <div
+          className={`progress-bar-fill ${showIndeterminate ? 'progress-indeterminate' : ''}`}
+          style={!showIndeterminate ? { width: `${progressPercent}%` } : undefined}
+        />
+      </div>
+      {isActiveSessionProcessing && (
+        <span className="progress-spinner" aria-hidden>⟳</span>
+      )}
+    </div>
+  );
+
+  const renderProgressBullets = () => {
+    const steps = progressStepsFiltered.filter(s => s.step !== 'evidence_update');
+    if (steps.length === 0) return null;
+    const seen = new Set<string>();
+    const unique: V9ProgressEvent[] = [];
+    for (const s of steps) {
+      const label = toUserFriendlyProgress(s);
+      if (!seen.has(label)) {
+        seen.add(label);
+        unique.push(s);
+      }
+    }
     return (
-      <div className="workflow-panel">
-        <div className="workflow-header">
-          <h3>Investigation</h3>
-          <span className="workflow-status running">Running...</span>
-        </div>
-
-        {/* Live progress steps */}
-        {progressSteps.length > 0 ? (
-          <div className="workflow-actions">
-            <div className="actions-header">Progress</div>
-            {progressSteps.filter(s => s.step !== 'evidence_update').map((step, i, arr) => (
-              <div
-                key={i}
-                className={`action-item ${i === arr.length - 1 ? 'action-running' : 'action-completed'}`}
-              >
-                <div className="action-main">
-                  <span className="action-icon">
-                    {i === arr.length - 1 ? '⟳' : '✓'}
-                  </span>
-                  <div className="action-content">
-                    <div className="action-message">{step.message}</div>
-                  </div>
-                </div>
-              </div>
-            ))}
-          </div>
-        ) : (
-          <>
-            <div className="workflow-progress">
-              <div className="progress-bar">
-                <div className="progress-bar-fill progress-indeterminate" />
-              </div>
-            </div>
-            <div className="empty-state">
-              <p className="text-sm">Searching archives and analyzing evidence...</p>
-            </div>
-          </>
-        )}
-
-        {/* Live evidence bullets */}
-        {evidenceBullets.length > 0 && (
-          <div className="workflow-actions" style={{ marginTop: 'var(--spacing-sm)' }}>
-            <div className="actions-header">Evidence Found ({evidenceBullets.length})</div>
-            {evidenceBullets.map((bullet, i) => (
-              <div key={i} className="evidence-bullet-live">
-                <div className="bullet-text">{bullet.text}</div>
-                <div className="bullet-meta">
-                  {bullet.tags.map(t => (
-                    <span key={t} className="bullet-tag">{t}</span>
-                  ))}
-                  {bullet.doc_ids.length > 0 && bullet.chunk_ids.length > 0 && onEvidenceClick && (
-                    <button
-                      className="bullet-source-link"
-                      onClick={() => onEvidenceClick({
-                        document_id: bullet.doc_ids[0],
-                        pdf_page: 1,
-                        chunk_id: bullet.chunk_ids[0],
-                      })}
-                    >
-                      View source
-                    </button>
-                  )}
-                </div>
-              </div>
-            ))}
-          </div>
-        )}
+      <div className="workflow-progress-bullets">
+        <div className="actions-header">Progress</div>
+        <ul className="progress-bullets-list">
+          {unique.map((step, i) => (
+            <li key={i} className="progress-bullet">
+              {toUserFriendlyProgress(step)}
+            </li>
+          ))}
+        </ul>
       </div>
     );
-  }
+  };
 
-  if (!v9) return null;
-
-  return (
-    <div className="workflow-panel">
-      <div className="workflow-header">
-        <h3>Investigation</h3>
-        <span className={`workflow-status ${v9.confidence === 'high' ? 'success' : 'partial'}`}>
-          {v9.confidence} confidence
-        </span>
-      </div>
-
-      {/* Summary stats */}
-      <div className="workflow-summary">
-        <div className="summary-item">
-          <span className="summary-label">Intent</span>
-          <span className="summary-value" style={{ textTransform: 'capitalize' }}>
-            {v9.intent.replace(/_/g, ' ')}
-          </span>
-        </div>
-        <div className="summary-item">
-          <span className="summary-label">Citations</span>
-          <span className="summary-value">{v9.cited_chunk_ids.length}</span>
-        </div>
-        {v9.elapsed_ms > 0 && (
-          <div className="summary-item">
-            <span className="summary-label">Time</span>
-            <span className="summary-value">{(v9.elapsed_ms / 1000).toFixed(1)}s</span>
-          </div>
-        )}
-        {v9.active_run_status && (
-          <div className="summary-item">
-            <span className="summary-label">Status</span>
-            <span className="summary-value">{v9.active_run_status}</span>
-          </div>
-        )}
-      </div>
-
-      {/* Routing reasoning */}
-      {v9.routing_reasoning && (
-        <div className="workflow-actions">
-          <div className="actions-header">Routing</div>
-          <div className="action-item action-completed">
-            <div className="action-main">
-              <span className="action-icon">&#x1F9ED;</span>
-              <div className="action-content">
-                <div className="action-message">{v9.routing_reasoning}</div>
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Remaining gaps */}
-      {v9.remaining_gaps.length > 0 && (
-        <div className="workflow-actions">
-          <div className="actions-header">Remaining Gaps</div>
-          {v9.remaining_gaps.map((gap, idx) => (
-            <div key={idx} className="action-item action-completed">
-              <div className="action-main">
-                <span className="action-icon">&#x26A0;</span>
-                <div className="action-content">
-                  <div className="action-message">{gap}</div>
-                </div>
+  const renderEvidenceBullets = () => (
+    <div className="workflow-bullets-section workflow-evidence-primary">
+      <div className="actions-header">Evidence ({evidenceBullets.length})</div>
+      {evidenceBullets.length > 0 ? (
+        <div className="evidence-bullets-list">
+          {evidenceBullets.map((bullet, i) => (
+            <div key={i} className="evidence-bullet-live">
+              <div className="bullet-text">{bullet.text}</div>
+              <div className="bullet-meta">
+                {bullet.doc_ids?.length > 0 && bullet.chunk_ids?.length > 0 && onEvidenceClick && (
+                  <button
+                    className="bullet-source-link"
+                    onClick={() => onEvidenceClick({
+                      document_id: bullet.doc_ids[0],
+                      pdf_page: 1,
+                      chunk_id: bullet.chunk_ids[0],
+                    })}
+                  >
+                    View source
+                  </button>
+                )}
               </div>
             </div>
           ))}
         </div>
-      )}
-
-      {/* Suggestion */}
-      {v9.suggestion && (
-        <div className="workflow-actions">
-          <div className="actions-header">Suggested Next</div>
-          <div className="action-item action-completed">
-            <div className="action-main">
-              <span className="action-icon">&#x1F4A1;</span>
-              <div className="action-content">
-                <div className="action-message">{v9.suggestion}</div>
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Think deeper prompt */}
-      {v9.can_think_deeper && (
-        <div style={{
-          padding: 'var(--spacing-md)',
-          background: 'var(--color-highlight, #fff8e1)',
-          borderRadius: 'var(--radius)',
-          marginTop: 'var(--spacing-sm)',
-          fontSize: '13px',
-        }}>
-          This run can be resumed with extended budget.
-          Use the &ldquo;Think Deeper&rdquo; button below the answer.
-        </div>
-      )}
-
-      {/* Run history */}
-      {v9.run_history.length > 0 && (
-        <div className="workflow-actions" style={{ marginTop: 'var(--spacing-md)' }}>
-          <div className="actions-header">Run History ({v9.run_history.length})</div>
-          {v9.run_history.map((run) => (
-            <RunHistoryItem key={run.run_id} run={run} />
-          ))}
+      ) : (
+        <div className="evidence-placeholder">
+          {isActiveSessionProcessing ? 'Gathering evidence...' : 'No evidence yet'}
         </div>
       )}
     </div>
   );
-}
 
-function RunHistoryItem({ run }: { run: V9RunSummary }) {
-  return (
-    <div className="action-item action-completed">
-      <div className="action-main">
-        <span className="action-icon">
-          {run.status === 'completed' ? '✓' : run.status === 'paused' ? '⏸' : '⟳'}
-        </span>
-        <div className="action-content">
-          <div className="action-label" style={{ fontSize: '12px', fontWeight: 500 }}>
-            #{run.query_index} {run.label || run.query_text.substring(0, 50)}
-          </div>
-          <div className="action-message" style={{ fontSize: '11px' }}>
-            {run.status}
-            {run.evidence_summary && ` — ${run.evidence_summary}`}
-          </div>
+  // Processing: Evidence first (key), then progress bar, then progress bullets
+  if (isActiveSessionProcessing && !v9) {
+    return (
+      <div className="workflow-panel workflow-panel-evidence">
+        <div className="workflow-header">
+          <h3>Investigation</h3>
         </div>
+        {renderEvidenceBullets()}
+        {renderMinimalProgress()}
+        {renderProgressBullets()}
       </div>
+    );
+  }
+
+  // Completed: Evidence first (key), then progress bar, then progress bullets, then summary
+  return (
+    <div className="workflow-panel workflow-panel-evidence">
+      <div className="workflow-header">
+        <h3>Investigation</h3>
+      </div>
+      {renderEvidenceBullets()}
+      {renderMinimalProgress()}
+      {renderProgressBullets()}
+      {v9 && (
+        <div className="workflow-summary-compact">
+          <span>{v9.intent.replace(/_/g, ' ')}</span>
+          {v9.cited_chunk_ids.length > 0 && (
+            <span> · {v9.cited_chunk_ids.length} citations</span>
+          )}
+          {v9.elapsed_ms > 0 && (
+            <span> · {(v9.elapsed_ms / 1000).toFixed(1)}s</span>
+          )}
+        </div>
+      )}
     </div>
   );
 }

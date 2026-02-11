@@ -42,6 +42,9 @@ export function SessionList({ activeSessionId, onSessionSelect, onSessionDelete 
         onSessionDelete?.(deletedId);
       }
     },
+    onError: () => {
+      setConfirmDeleteId(null);
+    },
   });
 
   const handleCreate = (e: React.FormEvent) => {

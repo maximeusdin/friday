@@ -1928,7 +1928,7 @@ def get_co_mentioned_entities(
     result_set_id: int,
     user=Depends(require_user),
     entity_id: int = Query(...),
-    window: str = Query("document", regex="^(chunk|document)$"),
+    window: str = Query("document", pattern="^(chunk|document)$"),
     limit: int = Query(20, ge=1, le=100),
 ):
     """Entities that co-occur with target entity within result set."""
@@ -2000,8 +2000,8 @@ def get_co_mentioned_entities(
 def get_date_facets(
     result_set_id: int,
     user=Depends(require_user),
-    granularity: str = Query("year", regex="^(year|month)$"),
-    time_basis: str = Query("mentioned_date", regex="^(mentioned_date|document_date)$"),
+    granularity: str = Query("year", pattern="^(year|month)$"),
+    time_basis: str = Query("mentioned_date", pattern="^(mentioned_date|document_date)$"),
     limit: int = Query(50, ge=1, le=200),
 ):
     """

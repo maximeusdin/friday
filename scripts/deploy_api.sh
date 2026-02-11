@@ -335,11 +335,21 @@ aws ecs update-service \
   --output text \
   --query "service.deployments"
 
-echo "Waiting for service to become stable..."
+echo "Waiting for ECS deployment to complete (typically 3–5 minutes)..."
 aws ecs wait services-stable \
   --region "${AWS_REGION}" \
   --cluster "${ECS_CLUSTER}" \
-  --services "${ECS_SERVICE}"
+  --services "${ECS_SERVICE}" &
+WAIT_PID=$!
+ELAPSED=0
+while kill -0 "${WAIT_PID}" 2>/dev/null; do
+  sleep 30
+  kill -0 "${WAIT_PID}" 2>/dev/null || break
+  ELAPSED=$((ELAPSED + 30))
+  echo "  Still waiting... (${ELAPSED}s elapsed)"
+done
+wait "${WAIT_PID}" || { echo "ERROR: ECS service did not become stable."; exit 1; }
+echo "ECS deployment complete."
 
 ############################################
 # 8) Verify /health shows the deployed SHA (with retries)
