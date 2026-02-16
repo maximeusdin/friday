@@ -1188,7 +1188,7 @@ def print_help():
     """Print help message."""
     print("""
 Commands:
-  <query>       Submit a research query (V11 default: canonical embeddings, stripped V9)
+  <query>       Submit a research query (V11 default: neutral embeddings, stripped V9)
   
   === V11 is the DEFAULT (plain query) ===
   V11 features:
@@ -1246,9 +1246,10 @@ Workflow Modes:
                 - Hard bottleneck forces convergence to 30-50 spans
                 - Responsiveness check: does answer actually satisfy question?
                 - Progress-gated rounds: stop if no quality evidence gained
-  V11 (default): Stripped V9 with canonical embeddings:
+  V11 (default): Stripped V9 with neutral embeddings by default:
+                - Tools: search (default), search_canonical, search_lexical, expand_query, expand_from_evidence
+                - Neutral embeddings by default; search_canonical for codename/alias-heavy queries when V/V in scope
                 - No PEM lane, no query entity resolution, no concordance expansion
-                - Canonical embeddings (chunk_embeddings_canonical) by default
                 - Optional lightweight PEM via V11_USE_LIGHTWEIGHT_PEM=1
   V10 (/v10):   Scope-aware Alias Identity Layer:
                 - Span-lattice query interpretation with dominance relationships
@@ -1289,16 +1290,20 @@ Plain query (V11 default):
 
 Environment / Manual fallbacks:
   USE_V9_AGENT=1              Use v9 as default for plain queries and dispatch (instead of v11)
-  USE_ORIGINAL_EMBEDDINGS=1   Use original embeddings from chunk_embeddings (not canonical)
+  USE_CANONICAL_EMBEDDINGS=1  Opt-in to canonical embeddings for V11 (default is neutral)
   V11_USE_LIGHTWEIGHT_PEM=1   Enable lightweight PEM for venona/vassiliev chunks (v11)
   THINK_DEEPER_MAX_STEPS=N    Max turns for /deeper (default 8). Use 2-3 for quick tests.
   THINK_DEEPER_MAX_TOOL_CALLS Max tool calls for /deeper (default 10). Use 15 for full Tier 2.
-  THINK_DEEPER_TIER1_AUTO=0   Disable auto Tier 1 deepen (0 = only /deeper runs deepen).
   V11_QUERY_MAX_TURNS=N       Max tool calls (V9/V11) or rounds (V10) for initial query (default 5). Use 2 for fast /deeper setup.
+  DIAG_SCOPE_BIAS=1           Scope diagnostics (default in CLI): per-collection hits, fulltext, tokens. Set 0 to disable.
 """)
 
-def interactive_mode(session_id: int, auto_execute: bool = False, pre_bundling_mode: str = "micro", bottleneck_mode: str = "score", deeper_max_steps: int = 8, deeper_max_tool_calls: int = 10, query_max_turns: int = 5, tier1_auto: bool = True):
+def interactive_mode(session_id: int, auto_execute: bool = False, pre_bundling_mode: str = "micro", bottleneck_mode: str = "score", deeper_max_steps: int = 8, deeper_max_tool_calls: int = 10, query_max_turns: int = 5):
     """Run interactive CLI mode."""
+    # Enable scope-bias diagnostics (per-collection hits, fulltext, tokens) for CLI runs
+    if os.getenv("DIAG_SCOPE_BIAS", "1").strip().lower() in ("1", "true", "yes"):
+        os.environ["DIAG_SCOPE_BIAS"] = "1"
+
     conn = get_conn()
     
     # Get session info
@@ -1919,10 +1924,18 @@ def interactive_mode(session_id: int, auto_execute: bool = False, pre_bundling_m
                         update_run_status(conn, v9_run.run_id, "paused")
                         print(f"  V9 run #{v9_run.run_id} created (paused, ready for /deeper)", file=sys.stderr)
                     except Exception as e:
+                        try:
+                            conn.rollback()
+                        except Exception:
+                            pass
                         print(f"  Warning: Could not create v9_run for Think Deeper: {e}", file=sys.stderr)
                         last_v9_run_id = None
                     print()
                 except Exception as e:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
                     print(f"\nV9 workflow error: {e}")
                     import traceback
                     traceback.print_exc()
@@ -2010,10 +2023,18 @@ def interactive_mode(session_id: int, auto_execute: bool = False, pre_bundling_m
                         update_run_status(conn, v9_run.run_id, "paused")
                         print(f"  V10 run #{v9_run.run_id} created (paused, ready for /deeper)", file=sys.stderr)
                     except Exception as e:
+                        try:
+                            conn.rollback()
+                        except Exception:
+                            pass
                         print(f"  Warning: Could not create v9_run for Think Deeper: {e}", file=sys.stderr)
                         last_v9_run_id = None
                     print()
                 except Exception as e:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
                     print(f"\nV10 workflow error: {e}")
                     import traceback
                     traceback.print_exc()
@@ -2170,6 +2191,10 @@ def interactive_mode(session_id: int, auto_execute: bool = False, pre_bundling_m
                     print(f"\n  Type /deeper again to continue deepening, or enter a new query.\n")
                     
                 except Exception as e:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
                     print(f"\nThink Deeper error: {e}")
                     import traceback
                     traceback.print_exc()
@@ -2412,7 +2437,7 @@ def interactive_mode(session_id: int, auto_execute: bool = False, pre_bundling_m
             
             continue
         
-        # Process as a query - V11 is the DEFAULT (canonical embeddings, stripped V9)
+        # Process as a query - V11 is the DEFAULT (neutral embeddings, stripped V9)
         # USE_V9_AGENT=1 → v9; /v9 → v9, /v10 → v10, /v7 → v7, etc.
         
         query_text = user_input
@@ -2443,7 +2468,7 @@ def interactive_mode(session_id: int, auto_execute: bool = False, pre_bundling_m
                 last_v9_question = query_text
                 last_use_v9_fallback = use_v9_as_default
             
-            # Create v9_run early (needed for Tier 1 and /deeper)
+            # Create v9_run early (needed for /deeper)
             last_v9_run_id = None
             try:
                 conn.rollback()
@@ -2460,97 +2485,15 @@ def interactive_mode(session_id: int, auto_execute: bool = False, pre_bundling_m
                 mode_tag = "V9" if use_v9_as_default else "V11"
                 print(f"  {mode_tag} run #{v9_run.run_id} created (paused, ready for /deeper)", file=sys.stderr)
             except Exception as e:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
                 print(f"  Warning: Could not create v9_run for Think Deeper: {e}", file=sys.stderr)
             
-            # Tier 1 auto-deepen: run BEFORE we output. Defer output until Tier 1 is done.
-            if tier1_auto and last_v9_workspace and last_v9_question:
-                from retrieval.agent.v9_deep_tiering import (
-                    compute_tier1_triggers,
-                    think_deeper_tier1,
-                    _count_grounded_claims,
-                )
-                triggers = compute_tier1_triggers(result, query_text)
-                run_tier1, use_micro = triggers.should_run_tier1()
-                if run_tier1:
-                    if triggers.reasons:
-                        print(f"  [Tier 1] Auto-deepen triggered: {', '.join(triggers.reasons)}", file=sys.stderr)
-                    original_grounded = _count_grounded_claims(result)
-                    try:
-                        td_result = think_deeper_tier1(
-                            conn=conn,
-                            seed_question=last_v9_question,
-                            workspace=last_v9_workspace,
-                            micro=use_micro,
-                            verbose=True,
-                            v9_run_id=last_v9_run_id,
-                        )
-                        # Merge new chunks into workspace
-                        from retrieval.agent.v9_types import WorkspaceChunk
-                        existing_ids = {c.chunk_id for c in last_v9_workspace.fulltext_chunks}
-                        merged_count = 0
-                        for cc in td_result.selected_chunks:
-                            if cc.chunk_id not in existing_ids:
-                                last_v9_workspace.fulltext_chunks.append(
-                                    WorkspaceChunk(
-                                        chunk_id=cc.chunk_id,
-                                        text=cc.text,
-                                        doc_id=cc.doc_id,
-                                        page=cc.page,
-                                        source_label=cc.collection_slug,
-                                        collection_slug=cc.collection_slug,
-                                        score=cc.score,
-                                    )
-                                )
-                                existing_ids.add(cc.chunk_id)
-                                merged_count += 1
-                        if merged_count > 0:
-                            # Re-synthesize with enriched evidence
-                            from retrieval.agent.v9_runner import format_v9_result
-                            from retrieval.agent.v9_deep_findings import build_findings_brief
-                            chunk_id_to_label = {c.chunk_id: f"{c.collection_slug or ''} {c.page or ''}".strip()
-                                                for c in td_result.selected_chunks}
-                            findings_brief = build_findings_brief(
-                                td_result.finding_store_entries, top_n=10,
-                                chunk_id_to_label=chunk_id_to_label,
-                            ) if td_result.finding_store_entries else None
-                            print(f"  Re-synthesizing with {merged_count} new chunks...", file=sys.stderr)
-                            if use_v9_as_default:
-                                from retrieval.agent.v9_runner import run_v9_query
-                                resynth = run_v9_query(
-                                    conn=conn,
-                                    question=last_v9_question,
-                                    verbose=False,
-                                    _resume_workspace=last_v9_workspace,
-                                    max_tool_calls=3,
-                                    _findings_brief=findings_brief,
-                                )
-                            else:
-                                from retrieval.agent.v11_runner import run_v11_query
-                                resynth = run_v11_query(
-                                    conn=conn,
-                                    question=last_v9_question,
-                                    verbose=False,
-                                    _resume_workspace=last_v9_workspace,
-                                    max_tool_calls=3,
-                                    use_lightweight_pem=os.getenv("V11_USE_LIGHTWEIGHT_PEM", "0").strip().lower() in ("1", "true", "yes"),
-                                    _findings_brief=findings_brief,
-                                )
-                            # Only adopt re-synth if it's better (has grounded claims)
-                            resynth_grounded = _count_grounded_claims(resynth)
-                            if resynth_grounded >= original_grounded:
-                                result = resynth
-                                if result.workspace:
-                                    last_v9_workspace = result.workspace
-                                extra = " (micro)" if use_micro else ""
-                                print(f"  [Tier 1] Quick deeper pass{extra} added {merged_count} chunks.", file=sys.stderr)
-                            else:
-                                print(f"  [Tier 1] Re-synthesis produced fewer grounded claims; keeping original answer.", file=sys.stderr)
-                        elif merged_count == 0:
-                            print(f"  [Tier 1] No new chunks; keeping original answer.", file=sys.stderr)
-                    except Exception as tier1_err:
-                        print(f"  Warning: Tier 1 auto-deepen failed: {tier1_err}", file=sys.stderr)
+            # Think Deeper is only via /deeper — no auto-trigger (Tier 1 removed).
             
-            # Output once, after Tier 1 (if any) is complete
+            # Output
             print(format_v9_result(result, include_verification=True))
             
             # Create result set for summarize compatibility
@@ -2874,12 +2817,6 @@ Examples:
         metavar="N",
         help="Initial query: max tool calls (V9/V11) or rounds (V10). Default 5. Use 2 for fast /deeper setup. Env: V11_QUERY_MAX_TURNS"
     )
-    parser.add_argument(
-        "--no-tier1-auto",
-        action="store_true",
-        help="Disable auto Tier 1 deepen (run Tier 1 only when /deeper is invoked)"
-    )
-    
     args = parser.parse_args()
     
     # Update agentic mode based on flags
@@ -2919,14 +2856,11 @@ Examples:
     # Deeper Tier 2: max tool calls (default 10, can go to 15)
     deeper_max_tool_calls = int(os.getenv("THINK_DEEPER_MAX_TOOL_CALLS", "10"))
     
-    # Tier 1 auto-deepen: enable unless --no-tier1-auto
-    tier1_auto = not args.no_tier1_auto and os.getenv("THINK_DEEPER_TIER1_AUTO", "1").strip().lower() in ("1", "true", "yes")
-    
     # One-shot or interactive
     if args.query:
         one_shot_query(args.session, args.query, args.auto_execute, force_agentic=args.agentic, force_v2=args.v2, pre_bundling_mode=args.pre_bundling, bottleneck_mode=args.bottleneck_mode)
     else:
-        interactive_mode(session_id, args.auto_execute, pre_bundling_mode=args.pre_bundling, bottleneck_mode=args.bottleneck_mode, deeper_max_steps=deeper_max_steps, deeper_max_tool_calls=deeper_max_tool_calls, query_max_turns=query_max_turns, tier1_auto=tier1_auto)
+        interactive_mode(session_id, args.auto_execute, pre_bundling_mode=args.pre_bundling, bottleneck_mode=args.bottleneck_mode, deeper_max_steps=deeper_max_steps, deeper_max_tool_calls=deeper_max_tool_calls, query_max_turns=query_max_turns)
 
 
 if __name__ == "__main__":

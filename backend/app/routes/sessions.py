@@ -145,6 +145,11 @@ def list_sessions(user=Depends(require_user)):
                 )
                 for row in rows
             ]
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Database error listing sessions: {str(e)[:200]}",
+        )
     finally:
         conn.close()
 

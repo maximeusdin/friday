@@ -289,7 +289,7 @@ class NextAction(BaseModel):
 class ModelInfo(BaseModel):
     """Information about the model used for synthesis."""
     name: str
-    snapshot: Optional[str] = None  # e.g., "gpt-4o-mini-2024-07-18"
+    snapshot: Optional[str] = None  # e.g., "gpt-4.1-mini-2025-04-14"
     provider: str = "openai"
     temperature: float = 0.3
     max_tokens: int = 2000

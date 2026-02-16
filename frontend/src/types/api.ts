@@ -293,6 +293,8 @@ export interface V9Meta {
   escalations?: EscalationOption[];
   scope_override?: ScopeOverrideInfo;
   expansion_info?: ExpansionInfo;
+  /** Evidence bullets discovered during investigation (persisted with message). */
+  evidence_bullets?: V9EvidenceBullet[];
 }
 
 /**
@@ -444,6 +446,9 @@ export interface V9ChatResponse {
   active_evidence_set_id?: number;
   referenced_run_id?: number;
   referenced_evidence_set_id?: number;
+  /** Persisted metadata may use run_id / evidence_set_id instead of active_* */
+  run_id?: number;
+  evidence_set_id?: number;
   can_think_deeper: boolean;
 
   remaining_gaps: string[];

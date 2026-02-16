@@ -226,6 +226,7 @@ UPDATED_TASKDEF_OBJ="$(echo "${TASKDEF_OBJ}" | jq \
   | .containerDefinitions[$idx].environment |= (
       ( . // [] )
       | map(select(
+          .name != "USE_V9_AGENT" and
           .name != "S3_PDF_BUCKET" and
           .name != "COGNITO_DOMAIN" and
           .name != "COGNITO_ISSUER" and
@@ -241,6 +242,7 @@ UPDATED_TASKDEF_OBJ="$(echo "${TASKDEF_OBJ}" | jq \
           .name != "DB_PORT"
         ))
       + [
+          {"name":"USE_V9_AGENT","value":"0"},
           {"name":"S3_PDF_BUCKET","value":$s3bucket},
           {"name":"COGNITO_DOMAIN","value":$cognito_domain},
           {"name":"COGNITO_ISSUER","value":$cognito_issuer},

@@ -27,7 +27,6 @@ export default function Home() {
   const [activeScopeRevision, setActiveScopeRevision] = useState(0);
   const [lastUsedScope, setLastUsedScope] = useState<UserSelectedScope | null>(null);
   const pendingRunScopeRef = useRef<UserSelectedScope | null>(null);
-  const [activeRightTab, setActiveRightTab] = useState<'scope' | 'investigation'>('scope');
   const [hasDraftChanges, setHasDraftChanges] = useState(false);
   const [collections, setCollections] = useState<CollectionNode[]>([]);
 
@@ -38,11 +37,6 @@ export default function Home() {
       setTimeout(() => load().catch(console.error), 2000);
     });
   }, []);
-
-  // Auto-switch to investigation tab when a query starts processing
-  useEffect(() => {
-    if (isProcessing) setActiveRightTab('investigation');
-  }, [isProcessing]);
 
   // --- Session handlers ---
 
@@ -55,7 +49,6 @@ export default function Home() {
     setActiveScopeRevision(1); // deterministic reset, not increment
     setLastUsedScope(null);
     pendingRunScopeRef.current = null;
-    setActiveRightTab('scope');
     setHasDraftChanges(false);
   };
 
@@ -93,7 +86,7 @@ export default function Home() {
   }, []);
 
   const handleEditScope = useCallback(() => {
-    setActiveRightTab('scope');
+    // Right pane is scope-only; no tab to switch
   }, []);
 
   // --- V9 response handler ---
@@ -219,7 +212,6 @@ export default function Home() {
                 onProcessingChange={handleProcessingChange}
                 onEvidenceClick={handleEvidenceClick}
                 onProgressUpdate={handleProgressUpdate}
-                onShowEvidence={() => setActiveRightTab('investigation')}
                 activeScope={activeScope}
                 lastUsedScope={lastUsedScope}
                 collections={collections}
@@ -241,15 +233,8 @@ export default function Home() {
         <div className="pane" style={{ borderRight: 'none' }}>
           <RightPane
             v9Response={lastV9Response}
-            isProcessing={isProcessing}
-            processingSessionId={processingSessionId}
-            onEvidenceClick={handleEvidenceClick}
-            progressSteps={progressSteps}
-            evidenceBullets={evidenceBullets}
             sessionId={activeSession?.id}
             activeScope={activeScope}
-            activeTab={activeRightTab}
-            onTabChange={setActiveRightTab}
             onApplyScope={handleApplyScope}
             onDraftDirtyChange={handleDraftDirtyChange}
             activeScopeRevision={activeScopeRevision}

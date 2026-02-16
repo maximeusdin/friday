@@ -47,10 +47,21 @@ export function SessionList({ activeSessionId, onSessionSelect, onSessionDelete 
     },
   });
 
+  /** If the label already exists, return next available: "Name (1)", "Name (2)", etc. */
+  const resolveLabel = (base: string): string => {
+    const existing = new Set((sessions ?? []).map((s) => s.label));
+    if (!existing.has(base)) return base;
+    let n = 1;
+    while (existing.has(`${base} (${n})`)) n++;
+    return `${base} (${n})`;
+  };
+
   const handleCreate = (e: React.FormEvent) => {
     e.preventDefault();
-    if (newLabel.trim()) {
-      createMutation.mutate({ label: newLabel.trim() });
+    const base = newLabel.trim();
+    if (base) {
+      const label = resolveLabel(base);
+      createMutation.mutate({ label });
     }
   };
 

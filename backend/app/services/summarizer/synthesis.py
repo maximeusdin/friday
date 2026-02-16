@@ -32,7 +32,7 @@ from .bundles import format_bundles_for_prompt
 # Model Configuration
 # =============================================================================
 
-DEFAULT_MODEL = "gpt-4o-mini"
+DEFAULT_MODEL = "gpt-4.1-mini-2025-04-14"
 DEFAULT_TEMPERATURE = 0.3
 DEFAULT_MAX_TOKENS = 2000
 
@@ -658,7 +658,7 @@ INSTRUCTIONS:
 - Focus on answering the question, not describing the documents"""
 
         response = client.chat.completions.create(
-            model=os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini"),
+            model=os.getenv("OPENAI_CHAT_MODEL", "gpt-4.1-mini-2025-04-14"),
             messages=[
                 {"role": "system", "content": "You are a precise research assistant. Summarize archival evidence to answer the user's question."},
                 {"role": "user", "content": prompt}

@@ -70,17 +70,9 @@ if ! psql "$DATABASE_URL" -c "SELECT 1" > /dev/null 2>&1; then
     echo_err "Cannot connect to AWS RDS. Check credentials and network."
     exit 1
 fi
-echo_info "AWS RDS connection OK: $RDSHOST"
+echo_info "AWS RDS connection OK (DATABASE_URL set)"
 
-# Set environment variables for Python scripts
-export DB_HOST="$RDSHOST"
-export DB_PORT=5432
-export DB_NAME=friday
-export DB_USER=friday
-export DB_PASS="$RDSPASS"
-
-# Also export DATABASE_URL for scripts that use it
-export DATABASE_URL
+# DATABASE_URL is used by psql and Python scripts
 
 echo ""
 

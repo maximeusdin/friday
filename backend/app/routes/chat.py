@@ -37,6 +37,30 @@ from fastapi import Depends
 router = APIRouter()
 
 
+def _format_api_error_for_user(e: Exception) -> str:
+    """Turn OpenAI/API exceptions into user-friendly messages."""
+    msg = str(e).strip()
+    if not msg:
+        return "An unexpected error occurred. Please try again."
+    err_type = type(e).__name__
+    # OpenAI SDK exceptions (openai 1.x)
+    if "RateLimitError" in err_type or "rate limit" in msg.lower() or "429" in msg:
+        return "OpenAI rate limit reached — please wait a moment and try again."
+    if "APIConnectionError" in err_type or "Connection" in err_type:
+        return "Could not reach OpenAI — check your network or try again later."
+    if "Timeout" in err_type or "timeout" in msg.lower():
+        return "Request timed out — the query may be too complex. Try again or simplify."
+    if "AuthenticationError" in err_type or "401" in msg or "invalid api key" in msg.lower():
+        return "OpenAI authentication failed — check API key configuration."
+    if "APIError" in err_type or "503" in msg or "502" in msg:
+        return "OpenAI service temporarily unavailable — try again in a few minutes."
+    # Keep first sentence of raw message if under ~120 chars, else generic
+    first = msg.split(".")[0].strip() or msg
+    if len(first) <= 120:
+        return first
+    return "An error occurred while processing your request. Please try again."
+
+
 # =============================================================================
 # Request/Response Models
 # =============================================================================
@@ -121,6 +145,7 @@ class V9Meta(BaseModel):
     citation_map: Dict[str, CitationDetail] = {}
     scope_meta: Optional[Dict[str, Any]] = None
     escalations: List[Dict[str, Any]] = []
+    evidence_bullets: List[Dict[str, Any]] = []
 
 
 class ChatMessage(BaseModel):
@@ -686,6 +711,7 @@ def get_chat_history(session_id: int, user=Depends(require_user)):
                         citation_map=cit_details,
                         scope_meta=metadata.get("scope_meta"),
                         escalations=metadata.get("escalations", []),
+                        evidence_bullets=metadata.get("evidence_bullets", []),
                     )
                 
                 messages.append(ChatMessage(
@@ -746,7 +772,7 @@ def test_openai_connection(user=Depends(require_user)):
         
         # Simple test call
         response = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-4.1-mini-2025-04-14",
             messages=[{"role": "user", "content": "Say 'ok'"}],
             max_tokens=5,
         )
@@ -1024,10 +1050,12 @@ def _sse_event_stream(
     thread = threading.Thread(target=run_v7_thread, daemon=True)
     thread.start()
     
+    # Initial heartbeat so proxies/ALBs see connection is alive
+    yield ": keepalive\n\n"
     # Yield SSE events as they come
     while True:
         try:
-            event = progress_queue.get(timeout=300)  # 5 min timeout
+            event = progress_queue.get(timeout=15)  # Keepalive every 15s to prevent ALB timeout
             
             if event.get("type") == "done":
                 # V6 finished, save assistant message and yield final result
@@ -1353,9 +1381,10 @@ async def v10_message_stream(session_id: int, req: V9ChatRequest, user=Depends(r
             progress_queue.put({"type": "done", "result": result})
         except Exception as e:
             import traceback
+            user_msg = _format_api_error_for_user(e)
             progress_queue.put({
                 "type": "error",
-                "message": str(e),
+                "message": user_msg,
                 "traceback": traceback.format_exc(),
             })
 
@@ -1375,9 +1404,11 @@ async def v10_message_stream(session_id: int, req: V9ChatRequest, user=Depends(r
     def event_generator():
         """Yield SSE events from the progress queue."""
         try:
+            # Initial heartbeat so proxies/ALBs see connection is alive before first event
+            yield ": keepalive\n\n"
             while True:
                 try:
-                    event = progress_queue.get(timeout=30)
+                    event = progress_queue.get(timeout=15)
                 except queue.Empty:
                     yield ": keepalive\n\n"
                     continue
@@ -1460,7 +1491,7 @@ async def v10_message_stream(session_id: int, req: V9ChatRequest, user=Depends(r
                         "routing_reasoning": "",
                         "routing_confidence": 0.0,
                         "citation_map": cit_map_for_storage,
-                        "suggestion": "",
+                        "suggestion": getattr(result, "suggestion", "") or "",
                         "scope_meta": None,
                         "escalations": [],
                         "scope_override": None,
@@ -1553,9 +1584,10 @@ async def v9_message_stream(session_id: int, req: V9ChatRequest, user=Depends(re
             progress_queue.put({"type": "done", "result": result})
         except Exception as e:
             import traceback
+            user_msg = _format_api_error_for_user(e)
             progress_queue.put({
                 "type": "error",
-                "message": str(e),
+                "message": user_msg,
                 "traceback": traceback.format_exc(),
             })
 
@@ -1574,12 +1606,15 @@ async def v9_message_stream(session_id: int, req: V9ChatRequest, user=Depends(re
 
     def event_generator():
         """Yield SSE events from the progress queue."""
+        accumulated_evidence_bullets: List[Dict[str, Any]] = []
         try:
+            # Initial heartbeat so proxies/ALBs see connection is alive before first event
+            yield ": keepalive\n\n"
             while True:
                 try:
-                    event = progress_queue.get(timeout=30)
+                    event = progress_queue.get(timeout=15)
                 except queue.Empty:
-                    # Keepalive to prevent ALB timeout
+                    # Keepalive to prevent ALB timeout (15s interval is safe for 60s idle timeout)
                     yield ": keepalive\n\n"
                     continue
 
@@ -1587,6 +1622,14 @@ async def v9_message_stream(session_id: int, req: V9ChatRequest, user=Depends(re
                     yield f"event: progress\ndata: {json.dumps(event)}\n\n"
 
                 elif event["type"] == "evidence_update":
+                    # Accumulate bullets for persistence
+                    details = event.get("details") or {}
+                    new_bullets = details.get("bullets") or []
+                    for b in new_bullets:
+                        if isinstance(b, dict):
+                            accumulated_evidence_bullets.append(b)
+                        else:
+                            accumulated_evidence_bullets.append({"text": str(b), "tags": [], "chunk_ids": [], "doc_ids": []})
                     yield f"event: evidence_update\ndata: {json.dumps(event)}\n\n"
 
                 elif event["type"] == "done":
@@ -1599,7 +1642,7 @@ async def v9_message_stream(session_id: int, req: V9ChatRequest, user=Depends(re
                         for label, d in raw_cit_map.items()
                     }
 
-                    # Persist assistant message
+                    # Persist assistant message (including accumulated evidence bullets)
                     _nr = getattr(result, "novelty_report", None)
                     _suggested = (_nr.get("suggested_queries") or []) if isinstance(_nr, dict) else []
                     _gaps = (_nr.get("remaining_gaps") or []) if isinstance(_nr, dict) else []
@@ -1619,6 +1662,7 @@ async def v9_message_stream(session_id: int, req: V9ChatRequest, user=Depends(re
                             "citation_map": cit_map_for_storage,
                             "scope_meta": result.scope_meta.to_dict() if result.scope_meta else None,
                             "escalations": [e.to_dict() for e in result.escalations] if result.escalations else [],
+                            "evidence_bullets": accumulated_evidence_bullets,
                         }
                         with conn.cursor() as cur:
                             cur.execute(

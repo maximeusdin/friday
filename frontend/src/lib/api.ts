@@ -724,7 +724,12 @@ export async function sendV9MessageStreaming(
     }
   } catch (e: unknown) {
     if (isAbort(e)) return;
-    throw e;
+    const msg = e instanceof Error ? e.message : String(e);
+    const friendly =
+      msg === 'Failed to fetch' || msg === 'network error' || msg.includes('fetch')
+        ? 'Connection was lost — the request may have timed out. Try again.'
+        : msg;
+    callbacks.onError?.(friendly);
   }
 }
 

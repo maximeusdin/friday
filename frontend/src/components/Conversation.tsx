@@ -21,13 +21,22 @@ const PROGRESS_PHRASES = [
   'Checking citations...',
 ];
 
+/** Strip chunk_id=..., chunk_ids: [], etc. from bullet text (LLM sometimes echoes prompt format). */
+function sanitizeBulletText(text: string): string {
+  return text
+    .replace(/\s*[\[\(]chunk_id=\d+[\)\]]\s*/gi, ' ')
+    .replace(/\s*[\[\(]chunk_ids:\s*\[\d*(?:,\s*\d*)*\]\s*[\)\]]\s*/gi, ' ')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+}
+
 /** Map technical progress to user-friendly text. Uses backend message when available. */
 function toUserFriendlyProgress(step: V9ProgressEvent, stepIndex?: number): string {
   switch (step.step) {
     case 'tool_call': {
-      // Prefer backend message when it contains context (e.g. "Searching for: X", "Loading N chunks...")
+      // Prefer backend message when it contains context (e.g. "Searching for: X", "Loading N passages...")
       const msg = (step.message || '').trim();
-      if (msg && (msg.startsWith('Searching for:') || msg.startsWith('Loading ') || msg.includes('chunks'))) {
+      if (msg && (msg.startsWith('Searching for:') || msg.startsWith('Loading ') || msg.includes('passages'))) {
         return msg;
       }
       const tool = (step.details?.tool as string) || '';
@@ -41,7 +50,10 @@ function toUserFriendlyProgress(step: V9ProgressEvent, stepIndex?: number): stri
       return PROGRESS_PHRASES[idx % PROGRESS_PHRASES.length];
     }
     case 'turn_start':
+    case 'turn_prepare':
       return 'Investigating...';
+    case 'model_call':
+      return 'Analyzing evidence...';
     case 'investigation':
       return 'Searching and analyzing...';
     case 'entity_resolution':
@@ -51,6 +63,7 @@ function toUserFriendlyProgress(step: V9ProgressEvent, stepIndex?: number): stri
     case 'evidence_update':
       return 'Found evidence...';
     case 'routing':
+    case 'routing_start':
       return 'Understanding your question...';
     case 'investigation_start':
     case 'retrieval_prepare':
@@ -90,7 +103,6 @@ interface ConversationProps {
   onMakeActiveScope?: (scope: UserSelectedScope) => void;
   isProcessing?: boolean;
   processingSessionId?: number | null;
-  onShowEvidence?: () => void;
   /** Persisted progress/bullets from parent (so dots persist when returning from doc view). */
   progressSteps?: V9ProgressEvent[];
   evidenceBullets?: V9EvidenceBullet[];
@@ -101,7 +113,7 @@ interface ConversationProps {
 export function Conversation({
   session, onV9Response, onProcessingChange, onEvidenceClick, onProgressUpdate,
   activeScope, lastUsedScope, collections, hasDraftChanges, onEditScope, onQuerySent, onMakeActiveScope,
-  isProcessing = false, processingSessionId = null, onShowEvidence,
+  isProcessing = false, processingSessionId = null,
   progressSteps: progressStepsProp, evidenceBullets: evidenceBulletsProp,
   lastV9Response: lastV9ResponseProp,
 }: ConversationProps) {
@@ -238,9 +250,8 @@ export function Conversation({
     } catch (err: unknown) {
       if (abortRef.current) return;
       let msg = err instanceof Error ? err.message : String(err);
-      if (msg === 'Failed to fetch' || msg.includes('fetch')) {
-        msg =
-          'Failed to fetch — check network and CORS. Backend health: https://api.fridayarchive.org/health (API routes use /api/...).';
+      if (msg === 'Failed to fetch' || msg === 'network error' || msg.includes('fetch')) {
+        msg = 'Connection was lost — the request may have timed out. Try again.';
       }
       setSendError(msg);
     } finally {
@@ -269,11 +280,22 @@ export function Conversation({
   };
 
   const handleThinkDeeper = () => {
-    if (!displayLastV9?.can_think_deeper) return;
-    // Re-send the last user question with think_deeper action
+    // API returns active_run_id / active_evidence_set_id; persisted metadata may use run_id / evidence_set_id
+    const runId = displayLastV9?.active_run_id ?? displayLastV9?.run_id;
+    const evidenceSetId = displayLastV9?.active_evidence_set_id ?? displayLastV9?.evidence_set_id;
+    if (!runId || !evidenceSetId) return;
+    // Get query: last user message, or from run_history when messages are stale
     const lastUserMsg = messages?.filter(m => m.role === 'user').pop();
-    if (lastUserMsg) {
-      sendV9(lastUserMsg.content, 'think_deeper');
+    let queryText = lastUserMsg?.content?.trim();
+    if (!queryText && displayLastV9?.run_history?.length) {
+      const run = displayLastV9.run_history.find((r) => r.run_id === runId);
+      queryText = run?.query_text?.trim();
+    }
+    if (queryText) {
+      sendV9(queryText, 'think_deeper', {
+        run_id: runId,
+        evidence_set_id: evidenceSetId,
+      });
     }
   };
 
@@ -363,8 +385,9 @@ export function Conversation({
                 onEvidenceClick={onEvidenceClick}
                 v9={idx === messages.length - 1 && message.role === 'assistant' ? lastV9 : null}
                 onMakeActiveScope={handleMakeActive}
-                onShowEvidence={onShowEvidence}
                 collections={collections}
+                evidenceBullets={idx === messages.length - 1 && message.role === 'assistant' ? displayEvidenceBullets : undefined}
+                isLastAndProcessing={idx === messages.length - 1 && message.role === 'assistant' && showThinkingIndicator}
                 onEscalate={(action, text, carryContext) => {
                   if (action === 'think_deeper') {
                     sendV9(text, 'think_deeper', carryContext);
@@ -396,24 +419,25 @@ export function Conversation({
                 ? toUserFriendlyProgress(lastStep!, displayProgressSteps.length - 1)
                 : 'Investigating...';
           return (
-            <div className="chat-thinking">
-              <div className="thinking-indicator">
-                <span className="thinking-dot"></span>
-                <span className="thinking-dot"></span>
-                <span className="thinking-dot"></span>
+            <div className="chat-message chat-message-assistant">
+              <div className="chat-answer">
+                {displayEvidenceBullets.length > 0 && (
+                  <EvidenceBulletsBlock
+                    bullets={displayEvidenceBullets}
+                    onEvidenceClick={onEvidenceClick}
+                    isStreaming
+                  />
+                )}
+                <div className="chat-thinking">
+                  <span className="thinking-text">{statusLabel}</span>
+                  <div className="thinking-progress-bar" aria-hidden>
+                    <div
+                      className="thinking-progress-fill"
+                      style={{ width: `${barPercent}%` }}
+                    />
+                  </div>
+                </div>
               </div>
-              <span className="thinking-text">{statusLabel}</span>
-              <div className="thinking-progress-bar" aria-hidden>
-                <div
-                  className="thinking-progress-fill"
-                  style={{ width: `${barPercent}%` }}
-                />
-              </div>
-              {displayEvidenceBullets.length > 0 && (
-                <span className="thinking-bullet-count">
-                  {displayEvidenceBullets.length} evidence bullet{displayEvidenceBullets.length !== 1 ? 's' : ''} found
-                </span>
-              )}
             </div>
           );
         })()}
@@ -426,9 +450,14 @@ export function Conversation({
           </div>
         )}
 
-        {/* Think Deeper button — always show when last response supports it (persists across doc view) */}
-        {displayLastV9?.can_think_deeper && !isSending && (
+        {/* Think Deeper button — always shown after a retrieval answer (user-initiated only) */}
+        {(displayLastV9?.can_think_deeper || ((displayLastV9?.active_run_id ?? displayLastV9?.run_id) && (displayLastV9?.active_evidence_set_id ?? displayLastV9?.evidence_set_id))) && !isSending && (
           <div style={{ padding: 'var(--spacing-sm) var(--spacing-md)', textAlign: 'center' }}>
+            {displayLastV9.suggestion && (
+              <div className="text-sm text-muted" style={{ marginBottom: '6px' }}>
+                {displayLastV9.suggestion}
+              </div>
+            )}
             <button
               className="btn-secondary"
               onClick={handleThinkDeeper}
@@ -506,6 +535,50 @@ export function Conversation({
   );
 }
 
+function EvidenceBulletsBlock({
+  bullets,
+  onEvidenceClick,
+  isStreaming = false,
+}: {
+  bullets: V9EvidenceBullet[];
+  onEvidenceClick?: (evidence: EvidenceRef) => void;
+  isStreaming?: boolean;
+}) {
+  if (bullets.length === 0) return null;
+  return (
+    <div className="chat-evidence-block">
+      <div className="chat-section-header">
+        <span className="chat-section-title">
+          Evidence ({bullets.length})
+          {isStreaming && <span style={{ marginLeft: 6, fontSize: 10, color: 'var(--color-text-muted)' }}>• streaming</span>}
+        </span>
+      </div>
+      <div className="evidence-bullets-list">
+        {bullets.map((bullet, i) => (
+          <div key={i} className="evidence-bullet-live">
+            <div className="bullet-text">{sanitizeBulletText(bullet.text)}</div>
+            <div className="bullet-meta">
+              {bullet.doc_ids?.length > 0 && bullet.chunk_ids?.length > 0 && onEvidenceClick && (
+                <button
+                  className="bullet-source-link"
+                  type="button"
+                  onClick={() => onEvidenceClick({
+                    document_id: bullet.doc_ids[0],
+                    pdf_page: bullet.pages?.[0] ?? 1,
+                    chunk_id: bullet.chunk_ids[0],
+                  })}
+                >
+                  {bullet.source_names?.[0] || 'View document'}
+                </button>
+              )}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function ChatBubble({
   message,
   onEvidenceClick,
@@ -513,8 +586,9 @@ function ChatBubble({
   onEscalate,
   onPrefillInput,
   onMakeActiveScope,
-  onShowEvidence,
   collections,
+  evidenceBullets,
+  isLastAndProcessing,
 }: {
   message: ChatMessage;
   onEvidenceClick?: (evidence: EvidenceRef) => void;
@@ -522,8 +596,9 @@ function ChatBubble({
   onEscalate?: (action: string, text: string, carryContext?: Record<string, unknown>) => void;
   onPrefillInput?: (text: string) => void;
   onMakeActiveScope?: (scope: UserSelectedScope) => void;
-  onShowEvidence?: () => void;
   collections?: CollectionNode[];
+  evidenceBullets?: V9EvidenceBullet[];
+  isLastAndProcessing?: boolean;
 }) {
   const isUser = message.role === 'user';
 
@@ -652,6 +727,21 @@ function ChatBubble({
           <ScopeBanner scope={scopeMeta} />
         )}
 
+        {/* Evidence bullets — prefer persisted (v9_meta), fall back to live stream */}
+        {(() => {
+          const bullets = (v9meta?.evidence_bullets && v9meta.evidence_bullets.length > 0)
+            ? v9meta.evidence_bullets
+            : (evidenceBullets ?? []);
+          if (bullets.length === 0) return null;
+          return (
+            <EvidenceBulletsBlock
+              bullets={bullets}
+              onEvidenceClick={onEvidenceClick}
+              isStreaming={!!isLastAndProcessing}
+            />
+          );
+        })()}
+
         <RichAnswerText
           text={message.content}
           citationMap={citationMap}
@@ -674,7 +764,6 @@ function ChatBubble({
             escalations={escalations}
             onEscalate={onEscalate}
             onPrefillInput={onPrefillInput}
-            onShowEvidence={onShowEvidence}
           />
         )}
 
@@ -795,7 +884,7 @@ function ScopeBanner({ scope }: { scope: ScopeMeta }) {
         </span>
       </div>
       <div style={{ color: 'var(--color-text-secondary, #999)' }}>
-        {scope.chunk_count} chunks &middot; {scope.document_count} document{scope.document_count !== 1 ? 's' : ''}
+        {scope.chunk_count} passages &middot; {scope.document_count} document{scope.document_count !== 1 ? 's' : ''}
         {scope.time_range && <> &middot; {scope.time_range}</>}
       </div>
       {visibleEntities.length > 0 && (
@@ -838,18 +927,15 @@ function EscalationBlock({
   escalations,
   onEscalate,
   onPrefillInput,
-  onShowEvidence,
 }: {
   escalations: EscalationOption[];
   onEscalate?: (action: string, text: string, carryContext?: Record<string, unknown>) => void;
   onPrefillInput?: (text: string) => void;
-  onShowEvidence?: () => void;
 }) {
   const [actionTaken, setActionTaken] = useState<{ label: string; action: string } | null>(null);
 
   const handleClick = (opt: EscalationOption) => {
     if (opt.action === 'show_evidence') {
-      onShowEvidence?.();
       const claimsEl = document.querySelector('.chat-claims');
       if (claimsEl) claimsEl.scrollIntoView({ behavior: 'smooth', block: 'start' });
       return;
@@ -994,6 +1080,11 @@ function stripConfidenceFromLabel(label: string): string {
   return label.replace(/\s*\((?:high|medium|low)\)$/i, '').trim();
 }
 
+/** Strip page number from citation label for display (show document name only). */
+function stripPageFromLabel(label: string): string {
+  return label.replace(/\s+p\.?\s*\d+\s*$/i, '').trim() || label;
+}
+
 /**
  * Renders answer text with inline citations as clickable links.
  *
@@ -1078,9 +1169,10 @@ function RichAnswerText({
             {seg.labels.map((label, j) => {
               const detail = resolveCitation(label);
               if (detail && detail.document_id) {
-                const displayLabel = (detail.label && /^\d+$/.test(label))
+                const rawLabel = (detail.label && /^\d+$/.test(label))
                   ? detail.label
                   : (detail.label || stripConfidenceFromLabel(label));
+                const displayLabel = stripPageFromLabel(stripConfidenceFromLabel(rawLabel));
                 return (
                   <button
                     key={j}
@@ -1092,8 +1184,8 @@ function RichAnswerText({
                   </button>
                 );
               }
-              // Label not in map — render as plain text (strip confidence for display)
-              return <span key={j} className="inline-citation-unresolved">[{stripConfidenceFromLabel(label) || label}]</span>;
+              // Label not in map — render as plain text (strip confidence and page for display)
+              return <span key={j} className="inline-citation-unresolved">[{stripPageFromLabel(stripConfidenceFromLabel(label)) || label}]</span>;
             })}
           </span>
         );
@@ -1137,7 +1229,7 @@ function MembersList({ members, onEvidenceClick }: { members: ChatMember[]; onEv
                     title={cit.quote || 'View document'}
                     disabled={!cit.document_id}
                   >
-                    {cit.source_name ? cit.source_name.substring(0, 15) : `p.${cit.page_number || '?'}`}
+                    {cit.source_name ? cit.source_name.substring(0, 25) : 'Document'}
                   </button>
                 ))}
               </span>
@@ -1212,9 +1304,6 @@ function ClaimsList({ claims, onEvidenceClick }: { claims: ChatClaim[]; onEviden
                           ? cit.source_name.substring(0, 25)
                           : 'Document'}
                       </span>
-                      {cit.page_number && (
-                        <span className="source-page">p.{cit.page_number}</span>
-                      )}
                     </button>
                   ))}
                 </div>

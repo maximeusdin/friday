@@ -123,6 +123,34 @@ def http_exception_handler(_request: Request, exc: HTTPException):
         },
     )
 
+
+@app.exception_handler(Exception)
+def unhandled_exception_handler(request: Request, exc: Exception):
+    """
+    Catch unhandled exceptions, log them, and return a consistent JSON 500.
+    Without this, FastAPI returns plain "Internal Server Error" (21 chars) with no detail.
+    """
+    import traceback
+
+    log.error(
+        "Unhandled exception: %s\nPath: %s %s\nTraceback:\n%s",
+        exc,
+        request.method,
+        request.url.path,
+        traceback.format_exc(),
+    )
+    # In debug mode, include error detail in response (for local diagnosis)
+    msg = str(exc)[:200] if os.getenv("FRIDAY_DEBUG") == "1" else "Internal server error"
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": {
+                "code": "INTERNAL_ERROR",
+                "message": msg,
+            }
+        },
+    )
+
 # CORS: frontend at https://fridayarchive.org, API at https://api.fridayarchive.org.
 # Do not use allow_origins=["*"] with credentials — browser blocks it.
 app.add_middleware(

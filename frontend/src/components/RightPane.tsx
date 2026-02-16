@@ -2,27 +2,19 @@
 
 import { useState, useEffect, useCallback, useMemo } from 'react';
 import type {
-  V9ChatResponse, EvidenceRef, V9ProgressEvent, V9EvidenceBullet,
-  CollectionNode, DocumentNode, UserSelectedScope, RunScopeInfo,
+  V9ChatResponse, CollectionNode, DocumentNode, UserSelectedScope, RunScopeInfo,
 } from '@/types/api';
 import { api } from '@/lib/api';
 import { scopeFingerprint } from '@/lib/scope';
 
 // =============================================================================
-// RightPane — controlled tabs, draft scope, rebase logic
+// RightPane — scope-only (investigation moved to main chat)
 // =============================================================================
 
 interface RightPaneProps {
   v9Response: V9ChatResponse | null;
-  isProcessing: boolean;
-  processingSessionId?: number | null;
-  onEvidenceClick: (evidence: EvidenceRef | null) => void;
-  progressSteps?: V9ProgressEvent[];
-  evidenceBullets?: V9EvidenceBullet[];
   sessionId?: number | null;
   activeScope?: UserSelectedScope | null;
-  activeTab: 'scope' | 'investigation';
-  onTabChange: (tab: 'scope' | 'investigation') => void;
   onApplyScope: (scope: UserSelectedScope) => void;
   onDraftDirtyChange: (dirty: boolean) => void;
   activeScopeRevision: number;
@@ -31,15 +23,8 @@ interface RightPaneProps {
 
 export function RightPane({
   v9Response,
-  isProcessing,
-  processingSessionId = null,
-  onEvidenceClick,
-  progressSteps = [],
-  evidenceBullets = [],
   sessionId,
   activeScope,
-  activeTab,
-  onTabChange,
   onApplyScope,
   onDraftDirtyChange,
   activeScopeRevision,
@@ -102,52 +87,9 @@ export function RightPane({
 
   return (
     <>
-      {/* Tab Header */}
-      <div className="pane-header" style={{ display: 'flex', gap: '0', padding: 0 }}>
-        <button
-          onClick={() => onTabChange('scope')}
-          style={{
-            flex: 1,
-            padding: '10px 12px',
-            border: 'none',
-            borderBottom: activeTab === 'scope' ? '2px solid var(--color-accent, #1a73e8)' : '2px solid transparent',
-            background: activeTab === 'scope' ? 'var(--color-bg, #fff)' : 'transparent',
-            fontWeight: activeTab === 'scope' ? 600 : 400,
-            fontSize: '13px',
-            cursor: 'pointer',
-            color: activeTab === 'scope' ? 'var(--color-text, #333)' : 'var(--color-text-secondary, #666)',
-          }}
-        >
-          Scope
-          {dirty && <span style={{ marginLeft: 6, color: '#e67e22', fontSize: 10 }}>&#x25CF;</span>}
-        </button>
-        <button
-          onClick={() => onTabChange('investigation')}
-          style={{
-            flex: 1,
-            padding: '10px 12px',
-            border: 'none',
-            borderBottom: activeTab === 'investigation' ? '2px solid var(--color-accent, #1a73e8)' : '2px solid transparent',
-            background: activeTab === 'investigation' ? 'var(--color-bg, #fff)' : 'transparent',
-            fontWeight: activeTab === 'investigation' ? 600 : 400,
-            fontSize: '13px',
-            cursor: 'pointer',
-            color: activeTab === 'investigation' ? 'var(--color-text, #333)' : 'var(--color-text-secondary, #666)',
-          }}
-        >
-          Investigation
-          {isProcessing && sessionId === processingSessionId && <span style={{ marginLeft: 6, fontSize: 10 }}>&#x25CF;</span>}
-        </button>
-      </div>
-
-      {/* Content — flex column when scope tab so footer sticks */}
-      <div
-        className="pane-content"
-        style={activeTab === 'scope' ? { display: 'flex', flexDirection: 'column', overflow: 'hidden', padding: 0, alignItems: 'stretch' } : undefined}
-      >
-        {activeTab === 'scope' ? (
-          <>
-            {/* Rebase banner (active scope changed while draft is dirty) */}
+      <div className="pane-header">Scope</div>
+      <div className="pane-content" style={{ display: 'flex', flexDirection: 'column', overflow: 'hidden', padding: 0, alignItems: 'stretch' }}>
+        {/* Rebase banner (active scope changed while draft is dirty) */}
             {activeChanged && dirty && (
               <div className="scope-rebase-banner">
                 <div style={{ fontSize: '12px', fontWeight: 500, marginBottom: 6 }}>
@@ -174,17 +116,6 @@ export function RightPane({
               lastRunScope={v9Response?.scope_override?.run_scope as RunScopeInfo | undefined}
               expansionInfo={v9Response?.expansion_info}
             />
-          </>
-        ) : (
-          <InvestigationPanel
-            v9={v9Response}
-            isProcessing={isProcessing}
-            isActiveSessionProcessing={sessionId === processingSessionId}
-            progressSteps={progressSteps}
-            evidenceBullets={evidenceBullets}
-            onEvidenceClick={onEvidenceClick}
-          />
-        )}
       </div>
     </>
   );
@@ -651,234 +582,3 @@ function ScopePanel({
 }
 
 
-// =============================================================================
-// Investigation Panel — minimal progress + evidence-focused
-// =============================================================================
-
-const DEFAULT_MAX_TOOL_CALLS = 12;
-
-/** Strip chunk_id=..., chunk_ids: [], etc. from bullet text (LLM sometimes echoes prompt format). */
-function sanitizeBulletText(text: string): string {
-  return text
-    .replace(/\s*[\[\(]chunk_id=\d+[\)\]]\s*/gi, ' ')
-    .replace(/\s*[\[\(]chunk_ids:\s*\[\d*(?:,\s*\d*)*\]\s*[\)\]]\s*/gi, ' ')
-    .replace(/\s{2,}/g, ' ')
-    .trim();
-}
-
-const PROGRESS_PHRASES = [
-  'Searching archives...',
-  'Reviewing documents...',
-  'Cross-referencing sources...',
-  'Extracting key findings...',
-  'Verifying evidence...',
-  'Building answer...',
-  'Following leads...',
-  'Checking citations...',
-];
-
-function toUserFriendlyProgress(step: V9ProgressEvent, stepIndex?: number): string {
-  switch (step.step) {
-    case 'tool_call': {
-      // Prefer backend message when it contains context (e.g. "Searching for: X", "Loading N chunks...")
-      const msg = (step.message || '').trim();
-      if (msg && (msg.startsWith('Searching for:') || msg.startsWith('Loading ') || msg.includes('chunks'))) {
-        return msg;
-      }
-      const tool = (step.details?.tool as string) || '';
-      const idx = stepIndex ?? 0;
-      if (tool.startsWith('search_chunks') || tool === 'search_chunks') {
-        return PROGRESS_PHRASES[idx % PROGRESS_PHRASES.length];
-      }
-      if (tool.startsWith('fetch_chunks') || tool === 'fetch_chunks') return 'Reading documents...';
-      if (tool.startsWith('expand_entities') || tool === 'expand_entities') return 'Resolving identities...';
-      if (tool.startsWith('alias_index') || tool.includes('alias')) return 'Looking up references...';
-      return PROGRESS_PHRASES[idx % PROGRESS_PHRASES.length];
-    }
-    case 'turn_start':
-      return 'Investigating...';
-    case 'investigation':
-      return 'Searching and analyzing...';
-    case 'entity_resolution':
-      return 'Resolving entities...';
-    case 'synthesis':
-      return 'Synthesizing answer...';
-    case 'evidence_update':
-      return 'Found evidence...';
-    case 'routing':
-      return 'Understanding your question...';
-    case 'investigation_start':
-    case 'retrieval_prepare':
-      return 'Starting investigation...';
-    case 'context_build':
-      return 'Building context...';
-    case 'follow_up_start':
-    case 'follow_up':
-      return 'Searching evidence...';
-    case 'think_deeper_start':
-      return 'Resuming Think Deeper...';
-    default:
-      if (step.message?.toLowerCase().includes('search')) return 'Searching archives...';
-      if (step.message?.toLowerCase().includes('round')) return 'Cross-referencing sources...';
-      if (step.message?.toLowerCase().includes('fetch')) return 'Reading documents...';
-      if (step.message?.toLowerCase().includes('synthes')) return 'Synthesizing answer...';
-      return PROGRESS_PHRASES[(stepIndex ?? 0) % PROGRESS_PHRASES.length] || step.message || 'Investigating...';
-  }
-}
-
-function InvestigationPanel({
-  v9,
-  isProcessing,
-  isActiveSessionProcessing,
-  progressSteps = [],
-  evidenceBullets = [],
-  onEvidenceClick,
-}: {
-  v9: V9ChatResponse | null;
-  isProcessing: boolean;
-  isActiveSessionProcessing: boolean;
-  progressSteps?: V9ProgressEvent[];
-  evidenceBullets?: V9EvidenceBullet[];
-  onEvidenceClick?: (evidence: EvidenceRef | null) => void;
-}) {
-  const hasData = v9 || evidenceBullets.length > 0;
-  const showContent = hasData || isActiveSessionProcessing;
-  if (!showContent) {
-    return (
-      <div className="workflow-panel">
-        <div className="workflow-header">
-          <h3>Investigation</h3>
-        </div>
-        <div className="empty-state">
-          <p>No investigation yet</p>
-          <p className="text-sm">Ask a question to start</p>
-        </div>
-      </div>
-    );
-  }
-
-  // Tool-count-based progress: count tool_call steps, estimate % complete
-  const progressStepsFiltered = progressSteps.filter(s => s.step !== 'evidence_update');
-  const toolCallCount = progressStepsFiltered.filter(s => s.step === 'tool_call').length;
-  const toolCallNumber = progressStepsFiltered
-    .filter(s => s.details?.tool_call_number != null)
-    .map(s => s.details?.tool_call_number as number)
-    .pop();
-  const effectiveToolCount = toolCallNumber ?? toolCallCount;
-  const progressPercent = !isActiveSessionProcessing && v9
-    ? 100
-    : Math.min(95, Math.round((effectiveToolCount / DEFAULT_MAX_TOOL_CALLS) * 100));
-  const showIndeterminate = isActiveSessionProcessing && effectiveToolCount === 0;
-
-  const renderMinimalProgress = () => (
-    <div className="workflow-progress-minimal">
-      <div className="progress-bar">
-        <div
-          className={`progress-bar-fill ${showIndeterminate ? 'progress-indeterminate' : ''}`}
-          style={!showIndeterminate ? { width: `${progressPercent}%` } : undefined}
-        />
-      </div>
-      {isActiveSessionProcessing && (
-        <span className="progress-spinner" aria-hidden>⟳</span>
-      )}
-    </div>
-  );
-
-  const renderProgressBullets = () => {
-    const steps = progressStepsFiltered.filter(s => s.step !== 'evidence_update');
-    if (steps.length === 0) return null;
-    const seen = new Set<string>();
-    const unique: { step: V9ProgressEvent; idx: number }[] = [];
-    for (let i = 0; i < steps.length; i++) {
-      const s = steps[i];
-      const label = toUserFriendlyProgress(s, i);
-      if (!seen.has(label)) {
-        seen.add(label);
-        unique.push({ step: s, idx: i });
-      }
-    }
-    return (
-      <div className="workflow-progress-bullets">
-        <div className="actions-header">Progress</div>
-        <ul className="progress-bullets-list">
-          {unique.map(({ step, idx }, i) => (
-            <li key={i} className="progress-bullet">
-              {toUserFriendlyProgress(step, idx)}
-            </li>
-          ))}
-        </ul>
-      </div>
-    );
-  };
-
-  const renderEvidenceBullets = () => (
-    <div className="workflow-bullets-section workflow-evidence-primary">
-      <div className="actions-header">Evidence ({evidenceBullets.length})</div>
-      {evidenceBullets.length > 0 ? (
-        <div className="evidence-bullets-list">
-          {evidenceBullets.map((bullet, i) => (
-            <div key={i} className="evidence-bullet-live">
-              <div className="bullet-text">{sanitizeBulletText(bullet.text)}</div>
-              <div className="bullet-meta">
-                {bullet.doc_ids?.length > 0 && bullet.chunk_ids?.length > 0 && onEvidenceClick && (
-                  <button
-                    className="bullet-source-link"
-                    onClick={() => onEvidenceClick({
-                      document_id: bullet.doc_ids[0],
-                      pdf_page: bullet.pages?.[0] ?? 1,
-                      chunk_id: bullet.chunk_ids[0],
-                    })}
-                  >
-                    {bullet.source_names?.[0] || (bullet.pages?.[0] ? `p.${bullet.pages[0]}` : 'View document')}
-                    {bullet.pages?.[0] && bullet.source_names?.[0] && ` (p.${bullet.pages[0]})`}
-                  </button>
-                )}
-              </div>
-            </div>
-          ))}
-        </div>
-      ) : (
-        <div className="evidence-placeholder">
-          {isActiveSessionProcessing ? 'Gathering evidence...' : 'No evidence yet'}
-        </div>
-      )}
-    </div>
-  );
-
-  // Processing: Evidence first (key), then progress bar, then progress bullets
-  if (isActiveSessionProcessing && !v9) {
-    return (
-      <div className="workflow-panel workflow-panel-evidence">
-        <div className="workflow-header">
-          <h3>Investigation</h3>
-        </div>
-        {renderEvidenceBullets()}
-        {renderMinimalProgress()}
-        {renderProgressBullets()}
-      </div>
-    );
-  }
-
-  // Completed: Evidence first (key), then progress bar, then progress bullets, then summary
-  return (
-    <div className="workflow-panel workflow-panel-evidence">
-      <div className="workflow-header">
-        <h3>Investigation</h3>
-      </div>
-      {renderEvidenceBullets()}
-      {renderMinimalProgress()}
-      {renderProgressBullets()}
-      {v9 && (
-        <div className="workflow-summary-compact">
-          <span>{v9.intent.replace(/_/g, ' ')}</span>
-          {v9.cited_chunk_ids.length > 0 && (
-            <span> · {v9.cited_chunk_ids.length} citations</span>
-          )}
-          {v9.elapsed_ms > 0 && (
-            <span> · {(v9.elapsed_ms / 1000).toFixed(1)}s</span>
-          )}
-        </div>
-      )}
-    </div>
-  );
-}

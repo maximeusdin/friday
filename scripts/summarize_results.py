@@ -210,7 +210,7 @@ def call_llm_summarize(prompt: str, model: Optional[str] = None) -> str:
         raise RuntimeError("Missing OPENAI_API_KEY environment variable")
     
     if model is None:
-        model = os.getenv("OPENAI_MODEL_SUMMARY", "gpt-4o-mini")
+        model = os.getenv("OPENAI_MODEL_SUMMARY", "gpt-4.1-mini-2025-04-14")
     
     client = OpenAI(api_key=api_key)
     
@@ -356,7 +356,7 @@ def main():
     )
     ap.add_argument(
         "--model", type=str, default=None,
-        help="LLM model to use (default: OPENAI_MODEL_SUMMARY or gpt-4o-mini)"
+        help="LLM model to use (default: OPENAI_MODEL_SUMMARY or gpt-4.1-mini-2025-04-14)"
     )
     ap.add_argument(
         "--save", action="store_true",
