@@ -55,13 +55,18 @@ PRIME_TOP_K = int(os.getenv("V13_PRIME_TOP_K", "50"))
 # --- v14 coverage mode (roster/count/aggregation) ---
 # Top-N chunks per collection in the coverage sweep (keep SMALL: V7's bottleneck flooded
 # synthesis by grading every span from every collection — we cap hard and rank within each).
-COVERAGE_PER_COLLECTION = int(os.getenv("V14_COVERAGE_PER_COLLECTION", "10"))
-# Max fetch slots any single collection can take. Kept low so a file that is ABOUT one
-# subject (e.g. the Winton Burdett FBI file — every page says "journalist") can't dominate
-# the roster; richness is dampened with sqrt so it tilts, not concentrates.
-COVERAGE_PER_COLLECTION_FETCH_MAX = int(os.getenv("V14_COVERAGE_PER_COL_FETCH_MAX", "5"))
+COVERAGE_PER_COLLECTION = int(os.getenv("V14_COVERAGE_PER_COLLECTION", "12"))
+# Max fetch slots any single collection can take. Equal allocation among the top-N richest
+# collections gives each roster source (incl. Vassiliev) real depth without any single-subject
+# FBI file dominating; combined with the normalized target set this is wording-invariant.
+COVERAGE_PER_COLLECTION_FETCH_MAX = int(os.getenv("V14_COVERAGE_PER_COL_FETCH_MAX", "7"))
 # Total chunks auto-fetched in coverage mode (allocated across collections), batched-summarized.
-COVERAGE_MAX_FETCH = int(os.getenv("V14_COVERAGE_MAX_FETCH", "54"))
+COVERAGE_MAX_FETCH = int(os.getenv("V14_COVERAGE_MAX_FETCH", "60"))
+# Concentrate the fetch budget on the N richest collections for the target (by match count)
+# rather than spreading 1 chunk across every collection with a marginal mention — this keeps
+# real depth in genuine sources (Vassiliev, SISS, HUAC, the FBI case files) while still
+# spanning the corpus. Fewer collections * more depth each = better roster coverage.
+COVERAGE_MAX_COLLECTIONS = int(os.getenv("V14_COVERAGE_MAX_COLLECTIONS", "12"))
 # Intents that trigger coverage-first retrieval. ROSTER ONLY — enumerating people across the
 # corpus is where breadth wins. COUNT is deliberately excluded: a count needs the one
 # authoritative list (e.g. "49 engineers, 22 journalists"), and breadth dilutes it (the V7
@@ -85,6 +90,11 @@ _PLANNER_SYS = (
     '  "enumeration_target": for count/roster/aggregation questions, the SINGLE common noun '
     'being counted or listed (e.g. "journalists", "engineers", "agents", "sources"); empty '
     "for lookup/compare/timeline. This is the category to enumerate across the whole corpus.\n"
+    '  "target_synonyms": for roster/count, NORMALIZE the enumeration target to its standard '
+    "occupational/category noun PLUS common synonyms, so different phrasings map to the SAME "
+    'set. Reporters, newspapermen, correspondents, pressmen -> ["journalist","reporter",'
+    '"correspondent","newspaperman","editor","press"]. Scientists/physicists -> ["scientist",'
+    '"physicist"]. Engineers -> ["engineer"]. Return [] for lookup/compare/timeline.\n'
     "Names may appear in the text only as codenames; still emit the canonical names the user gave."
 )
 
@@ -95,7 +105,8 @@ def plan_query(question: str, *, model: str = _PLANNER_MODEL, verbose: bool = Fa
     LLM plan augmented with deterministic anchor extraction (numbers, quoted phrases,
     Capitalized proper-noun runs) so we never depend solely on the model for anchors.
     """
-    plan: Dict[str, Any] = {"intent": "lookup", "entities": [], "anchors": [], "queries": [], "enumeration_target": ""}
+    plan: Dict[str, Any] = {"intent": "lookup", "entities": [], "anchors": [], "queries": [],
+                            "enumeration_target": "", "target_synonyms": []}
 
     api_key = os.getenv("OPENAI_API_KEY")
     if api_key:
@@ -534,7 +545,22 @@ def _co_entity_terms(conn, chunk_ids: List[int], cols, exclude: List[str]) -> Li
 
 
 def _coverage_targets(plan: Dict[str, Any], content_anchors: List[str]) -> List[str]:
-    """Common nouns to enumerate across the corpus (e.g. ['journalists','engineers'])."""
+    """Normalized common nouns to enumerate across the corpus.
+
+    Prefer the planner's target_synonyms (a canonical category set — 'reporters',
+    'newspapermen', 'correspondents' all normalize to the SAME set), so the coverage sweep
+    is stable across query wording. Falls back to the enumeration target + a content anchor.
+    """
+    # Ultra-generic nouns match everything ("press conference", any "editor"/"agent"/"source")
+    # and inflate unrelated collections — drop them from the coverage sweep.
+    _GENERIC = {"editor", "editors", "press", "agent", "agents", "source", "sources", "spy",
+                "spies", "operative", "operatives", "informant", "informants", "official",
+                "officials", "member", "members", "person", "people", "contact", "contacts",
+                "asset", "assets", "figure", "figures", "worker", "workers"}
+    syns = [str(s).strip() for s in (plan.get("target_synonyms") or [])
+            if str(s).strip() and str(s).strip().lower() not in _GENERIC]
+    if syns:
+        return list(dict.fromkeys(syns))[:6]
     targets: List[str] = []
     et = (plan.get("enumeration_target") or "").strip()
     if et:
@@ -547,9 +573,13 @@ def _coverage_targets(plan: Dict[str, Any], content_anchors: List[str]) -> List[
 
 
 def _coverage_counts(conn, targets: List[str], scope) -> Dict[str, int]:
-    """True per-collection match count for the target term(s) — used to weight fetch depth
-    toward richer collections (Vassiliev's 70 journalist chunks vs volodarsky's 1) while
-    still covering the long tail."""
+    """Per-collection match count for the target term(s) — the (sqrt-dampened) weighting
+    signal for fetch depth toward richer collections. Wording is stabilised upstream by
+    normalising the target to a canonical synonym set (target_synonyms), so this count is
+    the same regardless of phrasing; the per-collection fetch cap bounds any one collection.
+    (DISTINCT-doc counting was tried but over-rewarded large multi-doc FBI case files that
+    mention the term in passing; entity_mentions person-density would be ideal but is
+    unpopulated for most collections.)"""
     variants: List[str] = []
     for t in targets:
         variants.extend(_enum_variants(t))
@@ -581,48 +611,33 @@ def _coverage_counts(conn, targets: List[str], scope) -> Dict[str, int]:
 
 
 def _weighted_coverage_fetch(rows: List[tuple], counts: Dict[str, int], cap: int, per_col_max: int) -> List[int]:
-    """Allocate `cap` fetch slots across collections proportional to each collection's true
-    match count (richness), with a FLOOR of 1 per collection (breadth/long-tail) and a CAP of
-    per_col_max (so no single collection dominates). Then take that many top-ranked chunks
-    from each collection's swept list."""
+    """Allocate `cap` fetch slots across the TOP-N richest collections, EQUALLY (round-robin).
+
+    Why equal, not term-frequency-weighted: raw term count inverts roster richness — an FBI
+    file ABOUT one journalist ("reporter" on every page) out-counts the Vassiliev notebooks
+    that list dozens of distinct journalist-agents. Without a person-density signal
+    (entity_mentions is unpopulated), equal depth among the richest collections is the robust,
+    wording-invariant choice: every strong source (Vassiliev, Venona, SISS, HUAC, the FBI case
+    files) is read to the same depth, and no single-subject file can dominate the roster.
+    The top-N filter keeps the budget on genuine sources, not a 1-chunk long tail."""
     from collections import OrderedDict
     by_coll: "OrderedDict[str, List[int]]" = OrderedDict()
     for cid, coll in rows:
         by_coll.setdefault(coll or "?", []).append(cid)
-    import math
     present = list(by_coll.keys())
     if not present:
         return []
-    # sqrt-dampened weight: a collection with 10x the term count gets ~3x the slots, not 10x
-    # — so a single-subject file can't dominate, but genuinely rich sources still get depth.
-    def _w(c): return math.sqrt(max(1, counts.get(c, 1)))
-    total = sum(_w(c) for c in present) or 1.0
-    # Proportional allocation with floor 1, cap per_col_max and available chunks.
-    alloc: Dict[str, int] = {}
-    for c in present:
-        want = round(cap * _w(c) / total)
-        alloc[c] = max(1, min(per_col_max, want, len(by_coll[c])))
-    # Trim/grow to hit cap deterministically.
-    def _total(): return sum(alloc.values())
-    # Shrink: take from the collections that currently have the MOST slots (so we don't
-    # starve the rich sources we deliberately weighted up — the earlier bug shrank rich-first).
-    guard = 0
-    while _total() > cap and any(alloc[c] > 1 for c in present) and guard < 100000:
-        c = max(present, key=lambda x: alloc[x])
-        if alloc[c] > 1:
-            alloc[c] -= 1
-        guard += 1
-    # Grow: give spare slots to the highest-weight collections that still have room.
-    order_rich = sorted(present, key=lambda c: -_w(c))
-    i = 0
-    while _total() < cap and any(alloc[c] < min(per_col_max, len(by_coll[c])) for c in present):
-        c = order_rich[i % len(order_rich)]
-        if alloc[c] < min(per_col_max, len(by_coll[c])):
-            alloc[c] += 1
-        i += 1
+    # Keep the N richest collections by true match count (concentrate budget on real sources).
+    present = sorted(present, key=lambda c: -counts.get(c, len(by_coll[c])))[:max(1, COVERAGE_MAX_COLLECTIONS)]
+    kept = OrderedDict((c, by_coll[c][:per_col_max]) for c in present)
+    # Equal round-robin across the kept collections until the cap is hit.
     out: List[int] = []
-    for c in present:
-        out.extend(by_coll[c][:alloc[c]])
+    while len(out) < cap and any(kept.values()):
+        for c in list(kept.keys()):
+            if kept[c]:
+                out.append(kept[c].pop(0))
+                if len(out) >= cap:
+                    break
     return out[:cap]
 
 
