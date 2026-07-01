@@ -810,9 +810,12 @@ def run_v11_query(
     _resume_workspace: when provided (e.g. from /deeper), reuse this workspace instead
     of creating a fresh one. Workspace must have fulltext_chunks, catalog_hits, entities, etc.
     """
-    _v13 = (engine_profile == "v13")
+    # v14 inherits every v13 behaviour and adds coverage-first retrieval for
+    # roster/count/aggregation intents (see v13_planner.prime_workspace).
+    _v13 = engine_profile in ("v13", "v14")
+    _v14 = (engine_profile == "v14")
     if _v13:
-        # V13 always uses the lightweight [MENTION_INDEX] so synthesis can bridge
+        # V13+ always uses the lightweight [MENTION_INDEX] so synthesis can bridge
         # codenames->canonical (Sound->Golos, Harry->Rabinovich) in venona/vassiliev.
         use_lightweight_pem = True
     from openai import OpenAI
@@ -859,6 +862,7 @@ def run_v11_query(
             prime_workspace(
                 conn, workspace, _v13_plan, detected_scope,
                 verbose=verbose, progress_callback=progress_callback,
+                coverage=_v14,
             )
         except Exception as _pe:
             if verbose:
@@ -1251,6 +1255,23 @@ def run_v11_query(
         workspace=workspace,
         investigation_trace=workspace.investigation.trace,
     )
+
+    # V14: for roster/list intents, assemble a corpus-wide roster from the evidence bullets
+    # instead of relying on the truncation-prone full synthesis (which cherry-picks 2-3 names).
+    if _v14 and _v13_plan and (_v13_plan.get("intent") in ("roster", "list", "enumerate")):
+        try:
+            from retrieval.agent.v13_planner import assemble_roster
+            tgt = _v13_plan.get("enumeration_target") or "person"
+            roster_claims = assemble_roster(conn, workspace, tgt, verbose=verbose)
+            if len(roster_claims) >= 3:  # only override when we actually enumerated a roster
+                result.claims = roster_claims
+                summary = f"Identified {len(roster_claims)} {tgt} linked to Soviet intelligence across the corpus."
+                result.narrative = summary
+                if result.synthesis:
+                    result.synthesis.narrative = summary
+        except Exception as _re:
+            if verbose:
+                print(f"  [V14] roster assembly failed (non-fatal): {_re}", file=sys.stderr)
 
     # V13: never let "not retrieved" become a confident "no evidence exists".
     if _v13:

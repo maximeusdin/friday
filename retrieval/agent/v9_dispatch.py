@@ -741,12 +741,13 @@ def _run_new_retrieval(
             )
         else:
             from retrieval.agent.v11_runner import run_v11_query
-            # Engine selection: default v13 (query planning + priming + anti-false-negative).
-            # Fall back to the unchanged v11 engine with FRIDAY_CHAT_ENGINE=v11 (or V13_DISABLE=1).
-            _engine = os.getenv("FRIDAY_CHAT_ENGINE", "v13").strip().lower()
+            # Engine selection: default v14 (v13 + coverage-first retrieval for roster/count).
+            # Roll back with FRIDAY_CHAT_ENGINE=v13 (planning+priming, no coverage) or =v11
+            # (unchanged baseline). V13_DISABLE=1 forces the v11 baseline.
+            _engine = os.getenv("FRIDAY_CHAT_ENGINE", "v14").strip().lower()
             if os.getenv("V13_DISABLE", "0").strip().lower() in ("1", "true", "yes"):
                 _engine = "v11"
-            _profile = "v13" if _engine == "v13" else "v11"
+            _profile = _engine if _engine in ("v11", "v13", "v14") else "v14"
             if verbose:
                 print(f"  [Dispatch] chat engine profile = {_profile}", file=sys.stderr)
             result = run_v11_query(
@@ -860,7 +861,7 @@ def _run_new_retrieval(
     # V13: scrub cosmetic "(unresolved codename)"/"[AMBIGUOUS]" tags that format_answer's
     # ambiguity gate renders (often from duplicate entity rows), which the narrative-level
     # guard can't reach because format_answer regenerates the text from claims + alias map.
-    if _profile == "v13" and answer_text:
+    if _profile in ("v13", "v14") and answer_text:
         try:
             from retrieval.agent.v13_planner import _scrub_codename_noise
             answer_text = _scrub_codename_noise(answer_text)
