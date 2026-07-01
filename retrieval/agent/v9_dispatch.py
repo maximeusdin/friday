@@ -686,6 +686,7 @@ def _run_new_retrieval(
         )
 
     # Run the v9 or v11 query
+    _profile = "v11"  # engine profile; the default branch may promote to "v13"
     try:
         search_result_set_id = (carry_context or {}).get("search_result_set_id")
 
@@ -855,9 +856,20 @@ def _run_new_retrieval(
     # Build citation detail map for frontend PDF viewer linking
     cit_map = result.build_citation_detail_map() if result else {}
 
+    answer_text = result.format_answer() if result else ""
+    # V13: scrub cosmetic "(unresolved codename)"/"[AMBIGUOUS]" tags that format_answer's
+    # ambiguity gate renders (often from duplicate entity rows), which the narrative-level
+    # guard can't reach because format_answer regenerates the text from claims + alias map.
+    if _profile == "v13" and answer_text:
+        try:
+            from retrieval.agent.v13_planner import _scrub_codename_noise
+            answer_text = _scrub_codename_noise(answer_text)
+        except Exception:
+            pass
+
     return DispatchResult(
         intent="new_retrieval",
-        answer=result.format_answer() if result else "",
+        answer=answer_text,
         cited_chunk_ids=_extract_cited_chunk_ids(result),
         confidence="high" if (result.sufficiency and result.sufficiency.sufficient) else "medium",
         run_id=run.run_id,
@@ -1643,10 +1655,17 @@ def dispatch_message(
     carry_context: Optional[Dict[str, Any]] = None,
     max_tool_calls: Optional[int] = None,
     scope: Optional[ScopeFilter] = None,
+    selected_scope: Optional[ScopeFilter] = None,
     verbose: bool = True,
     progress_callback: Optional[Callable] = None,
 ) -> DispatchResult:
     """Main entry point: route a user message and execute the appropriate path.
+
+    Scope precedence for new_retrieval:
+      1. natural-language scope in the query (confirmed with the user)
+      2. selected_scope (the side-panel scope, sent with the query — no persistence race)
+      3. explicit `scope` arg / session scope_json (legacy)
+
 
     Uses same V11 + Think Deeper stack as friday_cli.py:
     - new_retrieval: run_v11_query (unless USE_V9_AGENT=1)
@@ -1761,13 +1780,58 @@ def dispatch_message(
         )
 
     else:
-        # new_retrieval -- resolve scope before execution
-        resolved_scope, run_scope_json = _resolve_scope_for_run(
-            conn, session, user_message, explicit_scope=scope, verbose=verbose,
+        # new_retrieval -- handle natural-language scope + confirmation first.
+        scope_confirmed, confirmed_scope, retrieval_question = _resolve_scope_confirmation(
+            conn, session, user_message, carry_context,
         )
+        if not scope_confirmed:
+            from retrieval.agent.scope_nl import detect_nl_scope
+            nl = detect_nl_scope(conn, user_message, verbose=verbose)
+            if nl.collections:
+                # Ask the user to confirm the scope we parsed from their words.
+                clar = _build_scope_clarification(conn, nl, session, user_message)
+                if progress_callback:
+                    progress_callback("scope_confirm", "completed",
+                                      f"Confirm scope: {', '.join(nl.collections)}", {"collections": nl.collections})
+                result = DispatchResult(
+                    intent="clarify", needs_clarification=True, clarification=clar,
+                    answer="", confidence="medium",
+                )
+                result.router_decision = decision
+                result.elapsed_ms = (time.time() - t0) * 1000
+                return result
+            elif nl.full_archive:
+                # Explicit "full archive" reset — apply directly, no confirmation needed.
+                scope_confirmed, confirmed_scope = True, ScopeFilter()
+
+        if scope_confirmed:
+            resolved_scope = confirmed_scope
+            run_scope_json = {
+                "mode": "custom" if (confirmed_scope.collections or confirmed_scope.document_ids) else "full_archive",
+                "source": "nl_scope_confirmed",
+                "reason": "user confirmed natural-language scope",
+                "expansion": {"policy": "venona_vassiliev_only",
+                              "collections": list(CONCORDANCE_EXPANSION_TARGET_COLLECTIONS),
+                              "triggered": False, "reason": None},
+            }
+        elif selected_scope is not None and not selected_scope.is_empty():
+            # Panel scope sent with the query — authoritative for this run, no persist race.
+            resolved_scope = selected_scope
+            run_scope_json = {
+                "mode": "custom" if (selected_scope.collections or selected_scope.document_ids) else "full_archive",
+                "source": "panel_selected",
+                "reason": "side-panel scope sent with query",
+                "expansion": {"policy": "venona_vassiliev_only",
+                              "collections": list(CONCORDANCE_EXPANSION_TARGET_COLLECTIONS),
+                              "triggered": False, "reason": None},
+            }
+        else:
+            resolved_scope, run_scope_json = _resolve_scope_for_run(
+                conn, session, user_message, explicit_scope=scope, verbose=verbose,
+            )
 
         result = _run_new_retrieval(
-            conn, session_id, user_message,
+            conn, session_id, retrieval_question or user_message,
             max_tool_calls=max_tool_calls,
             scope=resolved_scope,
             run_scope_json=run_scope_json,
@@ -1779,3 +1843,100 @@ def dispatch_message(
     result.router_decision = decision
     result.elapsed_ms = (time.time() - t0) * 1000
     return result
+
+
+# =============================================================================
+# Natural-language scope confirmation
+# =============================================================================
+
+_SCOPE_PLAN_KIND = "scope_confirm"
+
+
+def _build_scope_clarification(conn, nl, session, user_message: str) -> Dict[str, Any]:
+    """Build a single-choice clarification confirming the NL-detected scope."""
+    from retrieval.agent.scope_nl import strip_nl_scope
+    # Human-readable names for the detected collections
+    names = _collection_titles_for(conn, nl.collections)
+    detected_label = ", ".join(names) if names else ", ".join(nl.collections)
+    stripped = strip_nl_scope(user_message, nl.matched_phrases) or user_message
+
+    options = [
+        {"id": "opt_scoped", "label": f"Yes — search only {detected_label}",
+         "value": "collections:" + ",".join(nl.collections),
+         "hint": "Restrict this query to those sources"},
+        {"id": "opt_full", "label": "No — search the full archive",
+         "value": "full_archive", "hint": "Ignore the scope and search everything"},
+    ]
+    # If the panel scope is a meaningful custom scope different from the detection, offer it.
+    panel = session.scope_json if isinstance(session.scope_json, dict) else {}
+    if panel.get("mode") == "custom" and panel.get("included_collection_ids"):
+        panel_filter = session_scope_to_filter(conn, panel)
+        if panel_filter.collections and sorted(panel_filter.collections) != sorted(nl.collections):
+            panel_names = ", ".join(panel_filter.collections)
+            options.append({
+                "id": "opt_panel", "label": f"Use my panel scope ({panel_names})",
+                "value": "collections:" + ",".join(panel_filter.collections),
+                "hint": "Keep the scope selected in the side panel",
+            })
+
+    return {
+        "_kind": _SCOPE_PLAN_KIND,
+        "_stripped_query": stripped,
+        "rationale": "Confirming the search scope parsed from your question.",
+        "questions": [{
+            "id": "scope_confirm",
+            "question": f"It looks like you want to search only **{detected_label}**. Is that right?",
+            "kind": "single_choice",
+            "category": "scope",
+            "options": options,
+            "allow_free_text": False,
+            "why": "Natural-language scope is easy to misread, so I confirm before searching.",
+        }],
+    }
+
+
+def _resolve_scope_confirmation(conn, session, user_message: str, carry_context):
+    """If this call is the user's answer to a scope-confirmation clarification, resolve the
+    chosen scope. Returns (confirmed: bool, scope: Optional[ScopeFilter], retrieval_question).
+    """
+    cc = carry_context or {}
+    plan = cc.get("clarification_plan")
+    answers = cc.get("clarification_answers")
+    if not answers or not isinstance(plan, dict) or plan.get("_kind") != _SCOPE_PLAN_KIND:
+        return False, None, None
+
+    # Map the selected option id -> value
+    selected_value = None
+    opt_by_id = {}
+    for q in plan.get("questions", []):
+        for o in q.get("options", []):
+            opt_by_id[o.get("id")] = o.get("value")
+    for a in answers:
+        for oid in (a.get("option_ids") or []):
+            if oid in opt_by_id:
+                selected_value = opt_by_id[oid]
+                break
+        if selected_value:
+            break
+
+    retrieval_question = plan.get("_stripped_query") or user_message
+    if not selected_value or selected_value == "full_archive":
+        return True, ScopeFilter(), retrieval_question
+    if selected_value.startswith("collections:"):
+        slugs = [s for s in selected_value.split(":", 1)[1].split(",") if s]
+        return True, ScopeFilter(collections=slugs), retrieval_question
+    return True, ScopeFilter(), retrieval_question
+
+
+def _collection_titles_for(conn, slugs: List[str]) -> List[str]:
+    if not slugs:
+        return []
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT slug, title FROM collections WHERE slug = ANY(%s)", (slugs,))
+            m = {r[0]: (r[1] or r[0]) for r in cur.fetchall()}
+        return [m.get(s, s) for s in slugs]
+    except Exception:
+        try: conn.rollback()
+        except Exception: pass
+        return slugs

@@ -40,10 +40,15 @@ RARE_ANCHOR_CUTOFF = int(os.getenv("V13_RARE_CUTOFF", "12"))
 # every one of its hits (e.g. "500-600" -> 1 hit = the exact meetings entry).
 ULTRA_RARE_FETCH = int(os.getenv("V13_ULTRA_RARE_FETCH", "3"))
 # For a targeted lookup, if a user-named entity has <= this many exact hits, sweep ALL of
-# them into the fetch set (the target passage may be the lowest-ranked hit of that entity).
-ENTITY_SWEEP_CAP = int(os.getenv("V13_ENTITY_SWEEP_CAP", "25"))
-# Hard ceiling on chunks auto-fetched during priming (agreement top-K + entity sweep).
+# them into the fetch set (the target passage may be the lowest-ranked hit of that entity,
+# e.g. the Bentley/Waldo deposition is the ~40th of ~50 "Waldo" hits).
+ENTITY_SWEEP_CAP = int(os.getenv("V13_ENTITY_SWEEP_CAP", "55"))
+# Hard ceiling on chunks auto-fetched during priming (agreement top-K only, no sweep).
 MAX_PRIME_FETCH = int(os.getenv("V13_MAX_PRIME_FETCH", "22"))
+# Ceiling when an entity sweep fires (exhaustive fetch of a bounded named entity).
+MAX_EXHAUSTIVE_FETCH = int(os.getenv("V13_MAX_EXHAUSTIVE_FETCH", "50"))
+# Summarizer batch size (fetched chunks are summarized in batches of this many).
+SUMMARY_BATCH = int(os.getenv("V13_SUMMARY_BATCH", "30"))
 # Per-query result cap when priming.
 PRIME_TOP_K = int(os.getenv("V13_PRIME_TOP_K", "50"))
 
@@ -214,6 +219,12 @@ def prime_workspace(
     cols = scope.collections if (scope and scope.collections) else None
     date_from = scope.date_from if scope else None
     date_to = scope.date_to if scope else None
+    # Full-archive hybrid searches (vector over all collections) are the expensive path;
+    # run a leaner plan there (fewer hybrid variants, no second expand hop).
+    lean = not cols
+    max_hybrid = 3 if lean else 8
+    if lean:
+        expand_hop = False
 
     result_sets: List[List[int]] = []
     rare_flags: List[bool] = []
@@ -267,7 +278,7 @@ def prime_workspace(
     queries = list(plan.get("queries", []))
     if content_anchors:
         queries.insert(0, " ".join(content_anchors[:6]))
-    for q in _dedup_preserve(queries):
+    for q in _dedup_preserve(queries)[:max_hybrid]:
         ids = _hybrid(q)
         if ids:
             result_sets.append(ids); rare_flags.append(False); labels.append(f"hy:{q}")
@@ -300,18 +311,30 @@ def prime_workspace(
     for ids, lbl in list(zip(result_sets, labels)):
         if lbl.startswith("lex:") and 0 < len(ids) <= ULTRA_RARE_FETCH:
             sweep_ids.extend(ids)
+    # Entity sweep: fetch ALL hits of the single most DISCRIMINATING user entity (smallest
+    # true corpus count that is still bounded). Sweeping a common entity (e.g. "Bentley",
+    # hundreds of hits) is useless and crowds out the target; sweeping the bounded one
+    # ("Waldo", ~40) guarantees the low-ranked deposition is fetched.
     anchor_low = {str(a).strip().lower() for a in plan.get("anchors", [])}
+    entity_counts: List[tuple] = []
     for ent in plan.get("entities", []):
         ent = str(ent).strip()
         if not ent or len(ent) < 3:
             continue
         term = max((t for t in re.split(r"[,\s]+", ent) if len(t) >= 3), key=len, default=ent)
-        ids = _lexical(term) if term.lower() not in anchor_low else next(
-            (s for s, l in zip(result_sets, labels) if l == f"lex:{term}"), [])
-        if ids and len(ids) <= ENTITY_SWEEP_CAP:
-            result_sets.append(ids); rare_flags.append(len(ids) <= RARE_ANCHOR_CUTOFF)
-            labels.append(f"sweep:{term}")
-            sweep_ids.extend(ids)
+        cnt = _true_lexical_count(conn, term, cols)
+        if 0 < cnt <= ENTITY_SWEEP_CAP:
+            entity_counts.append((cnt, term))
+    if entity_counts:
+        entity_counts.sort()  # smallest (most discriminating) first
+        for _cnt, term in entity_counts[:1]:  # sweep only the most discriminating entity
+            ids = next((s for s, l in zip(result_sets, labels) if l == f"lex:{term}"), None)
+            if ids is None:
+                ids = _lexical(term)
+            if ids:
+                result_sets.append(ids); rare_flags.append(len(ids) <= RARE_ANCHOR_CUTOFF)
+                labels.append(f"sweep:{term}")
+                sweep_ids.extend(ids)
 
     # Optional expand hop: pull distinctive co-entities out of round-1 top chunks and
     # match them exactly. This is what surfaces first-person / co-mention evidence whose
@@ -337,9 +360,15 @@ def prime_workspace(
     merge_catalog_hits(workspace, catalog)
 
     # Auto-fetch into fulltext + summarize -> evidence bullets from turn 0.
-    # Fetch = agreement top-K UNION the entity sweep (dedup, ordered by agreement), capped.
-    fetch_ids = list(dict.fromkeys([*ranked_ids[:K_PRIME_FETCH], *[c for c in ranked_ids if c in set(sweep_ids)]]))
-    fetch_ids = fetch_ids[:MAX_PRIME_FETCH]
+    # When a sweep fired (ultra-rare anchor or bounded discriminating entity), fetch ALL of
+    # those hits FIRST (ordered by agreement), then fill with agreement top-K — so the target
+    # is included even when it's the lowest-ranked hit of that entity. Otherwise just top-K.
+    sweep_set = set(sweep_ids)
+    if sweep_set:
+        swept_ranked = [c for c in ranked_ids if c in sweep_set]
+        fetch_ids = list(dict.fromkeys([*swept_ranked, *ranked_ids[:K_PRIME_FETCH]]))[:MAX_EXHAUSTIVE_FETCH]
+    else:
+        fetch_ids = ranked_ids[:MAX_PRIME_FETCH]
     fetched = fetch_chunks(conn, chunk_ids=fetch_ids, include_neighbors=False)
     if scope and scope.collections:
         sset = {s.lower() for s in scope.collections}
@@ -362,19 +391,25 @@ def prime_workspace(
     if fetched:
         try:
             alias_ctx = build_alias_context_for_summarizer(workspace)
-            ev = summarize_delta_chunks(fetched[:30], workspace.question, alias_context=alias_ctx)
             cdm = build_chunk_doc_map(workspace)
-            merge_evidence_summary_update(workspace, ev, cdm)
-            summarized = len(ev.bullets)
-            for c in fetched:
-                workspace._summarized_chunk_ids.add(c.chunk_id)
-            if progress_callback and ev.bullets:
+            all_bullets = []
+            # Summarize in batches so an exhaustive sweep's lowest-ranked (but on-topic)
+            # chunks are still read by the summarizer.
+            for i in range(0, len(fetched), SUMMARY_BATCH):
+                batch = fetched[i:i + SUMMARY_BATCH]
+                ev = summarize_delta_chunks(batch, workspace.question, alias_context=alias_ctx)
+                merge_evidence_summary_update(workspace, ev, cdm)
+                all_bullets.extend(ev.bullets)
+                for c in batch:
+                    workspace._summarized_chunk_ids.add(c.chunk_id)
+            summarized = len(all_bullets)
+            if progress_callback and all_bullets:
                 progress_callback("evidence_update", "completed",
-                                  f"Primed {len(ev.bullets)} evidence bullets", {
+                                  f"Primed {len(all_bullets)} evidence bullets", {
                                       "bullets": [{"text": b.text, "tags": b.tags,
                                                    "chunk_ids": b.supporting_chunk_ids,
-                                                   "doc_ids": b.doc_ids} for b in ev.bullets],
-                                      "total_bullet_count": len(ev.bullets),
+                                                   "doc_ids": b.doc_ids} for b in all_bullets],
+                                      "total_bullet_count": len(all_bullets),
                                   })
         except Exception as e:
             if verbose:
@@ -433,6 +468,33 @@ def _co_entity_terms(conn, chunk_ids: List[int], cols, exclude: List[str]) -> Li
     return _dedup_preserve(out)
 
 
+def _true_lexical_count(conn, term: str, cols) -> int:
+    """Approximate corpus frequency of a term (scoped), to pick the most discriminating
+    entity to sweep. Uses a scoped ILIKE count — cheap and good enough for ranking."""
+    try:
+        params: List[Any] = [f"%{term}%"]
+        where = "COALESCE(c.clean_text, c.text) ILIKE %s"
+        if cols:
+            where += " AND cm.collection_slug = ANY(%s)"
+            params.append(list(cols))
+        # Bounded count: stop after ENTITY_SWEEP_CAP+1 matches so a common term over the full
+        # archive doesn't trigger a slow full seq-scan (we only need "<= cap or not").
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""SELECT count(*) FROM (
+                        SELECT 1 FROM chunks c
+                        JOIN chunk_metadata cm ON cm.chunk_id = c.id AND cm.pipeline_version = c.pipeline_version
+                        WHERE {where} LIMIT %s
+                    ) t""",
+                tuple(params) + (ENTITY_SWEEP_CAP + 1,),
+            )
+            return int(cur.fetchone()[0])
+    except Exception:
+        try: conn.rollback()
+        except Exception: pass
+        return 10**9  # treat as too-common on error (skip sweep)
+
+
 def _seed_entity_aliases(conn, workspace, entities: List[str], *, verbose: bool = False) -> None:
     """Resolve each query entity to its concordance aliases and merge into the workspace,
     so the codename<->canonical mapping is available to the summarizer and synthesis."""
@@ -458,7 +520,7 @@ def _seed_entity_aliases(conn, workspace, entities: List[str], *, verbose: bool 
                     )
                     GROUP BY e.id, e.canonical_name
                     ORDER BY COALESCE(array_length(array_agg(DISTINCT ea2.alias), 1), 0) DESC
-                    LIMIT 2
+                    LIMIT 1
                 """, {"n": name, "like": f"%{name}%"})
                 rows = cur.fetchall()
         except Exception:
@@ -524,14 +586,48 @@ _NEGATION_RE = re.compile(
 )
 
 
+# Cosmetic annotations the model sometimes appends to an already-bridged name, e.g.
+# "Rabinovich (unresolved codename)" / "Sound [AMBIGUOUS]" — contradictory noise.
+_CODENAME_NOISE_RE = re.compile(
+    r"\s*(?:\((?:un)?resolved[^)]*\bcodename\b[^)]*\)|\(codename[^)]*unresolved[^)]*\)|"
+    r"\((?:un)?resolved(?:\s+codename)?\)|\[AMBIGUOUS\]|\(tentative\))",
+    re.IGNORECASE,
+)
+
+
+def _scrub_codename_noise(text: str) -> str:
+    if not text:
+        return text
+    return _CODENAME_NOISE_RE.sub("", text)
+
+
 def apply_anti_false_negative(result, workspace, *, verbose: bool = False) -> None:
     """Never let 'not retrieved' become a confident 'no evidence exists'.
 
+    - Scrub cosmetic "(unresolved codename)"/"[AMBIGUOUS]" tags the model appends to names
+      it has actually bridged.
     - If the answer asserts non-existence, cap sufficiency and reword to 'not found in what
       I searched' (with the queries actually run), and surface any adjacent evidence bullets.
     - Strip citations from negative claims (a citation must support an affirmative statement).
     """
     synth = getattr(result, "synthesis", None)
+
+    # Scrub cosmetic codename annotations from the narrative + claim texts.
+    if synth is not None and getattr(synth, "narrative", None):
+        synth.narrative = _scrub_codename_noise(synth.narrative)
+    if getattr(result, "narrative", None):
+        try:
+            result.narrative = _scrub_codename_noise(result.narrative)
+        except Exception:
+            pass
+    for c in (getattr(result, "claims", None) or []):
+        inner = getattr(c, "claim", None)
+        if inner is not None and getattr(inner, "text", None):
+            inner.text = _scrub_codename_noise(inner.text)
+        elif getattr(c, "text", None):
+            try: c.text = _scrub_codename_noise(c.text)
+            except Exception: pass
+
     narrative = (getattr(result, "narrative", None) or (synth.narrative if synth else "")) or ""
     is_negative = bool(_NEGATION_RE.search(narrative))
 

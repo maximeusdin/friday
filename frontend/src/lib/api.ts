@@ -9,6 +9,7 @@ import type {
   Plan,
   ResultSetResponse,
   Document,
+  DocumentWitness,
   HealthResponse,
   MetaResponse,
   SessionStateResponse,
@@ -323,6 +324,10 @@ export function getDocumentPdfUrl(id: number): string {
   return `${getRequestBase()}/documents/${id}/pdf`;
 }
 
+export async function getDocumentWitnesses(id: number): Promise<DocumentWitness[]> {
+  return request<DocumentWitness[]>(`/documents/${id}/witnesses`);
+}
+
 export async function deletePendingMessage(sessionId: number): Promise<void> {
   // Uses the direct backend URL (same as streaming) to bypass Next.js proxy
   const directUrl = getDirectBackendUrl();
@@ -632,6 +637,7 @@ export async function sendV9MessageStreaming(
   callbacks: V9StreamingCallbacks,
   signal?: AbortSignal,
   carryContext?: Record<string, unknown>,
+  selectedScope?: UserSelectedScope | null,
 ): Promise<void> {
   const directUrl = getDirectBackendUrl();
 
@@ -643,6 +649,11 @@ export async function sendV9MessageStreaming(
   const body: Record<string, unknown> = { text, action };
   if (carryContext) {
     body.carry_context = carryContext;
+  }
+  // Send the side-panel scope with the query so it's applied to this run without
+  // depending on the session scope having been persisted first (avoids a race).
+  if (selectedScope) {
+    body.selected_scope = selectedScope;
   }
 
   let response: Response;
@@ -762,6 +773,122 @@ async function updateSessionScope(sessionId: number, scope: UserSelectedScope): 
   });
 }
 
+async function updateOutputMode(
+  sessionId: number,
+  outputMode: 'evidence_only' | 'evidence_summary' | 'narrative'
+): Promise<{ ok: boolean; output_mode: string }> {
+  return request<{ ok: boolean; output_mode: string }>(`/sessions/${sessionId}/output-mode`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ output_mode: outputMode }),
+  });
+}
+
+// =============================================================================
+// Search (concordance-style)
+// =============================================================================
+
+export interface SearchCreateRequest {
+  session_id: number;  // Required: search must be part of a session
+  scope?: { mode: string; included_collection_ids?: number[]; included_document_ids?: number[] };
+  query: string;
+  mode?: string;
+  unit?: string;
+  sort?: string;
+  alias_expand?: boolean;
+  fuzzy_progressive?: boolean;  // When mode=fuzzy: run exact first; client calls expand-fuzzy
+}
+
+export interface SearchCreateResponse {
+  result_set_id: string;
+  status: string;
+  fuzzy_pending?: boolean;  // True when exact_complete; client should call expand-fuzzy
+  notice?: string | null;        // e.g. sentence was relaxed to keywords
+  relaxed_query?: string | null; // the keyword query actually run, if relaxed
+}
+
+export interface SearchResultSetResponse {
+  id: string;
+  status: string;
+  total_hits?: number;
+  coverage_json?: {
+    collections?: Array<{ id: number; slug: string; title: string; hits: number }>;
+    total_hits?: number;
+    collections_searched?: number;
+    collections_total?: number;
+    missing_collections?: string[];
+  };
+  is_exhaustive?: boolean;
+  expanded_terms_json?: unknown;
+  query_display?: string;
+  error_message?: string;
+}
+
+export interface SearchPageHitItem {
+  collection: { id: number; slug: string; title: string };
+  document: { id: number; title: string };
+  page: { id: number; seq: number; pdf_page: number };
+  snippet?: string;
+  chunk_id: number;
+  evidence_ref: {
+    document_id: number;
+    pdf_page: number;
+    chunk_id?: number;
+    quote?: string;
+  };
+  viewer_url?: string;
+  asset_url?: string | null;
+}
+
+export interface SearchItemsResponse {
+  items: SearchPageHitItem[];
+  next_cursor?: string | null;
+  total_hits: number;
+}
+
+async function createSearchResultSet(req: SearchCreateRequest): Promise<SearchCreateResponse> {
+  return request<SearchCreateResponse>('/search/result-sets', {
+    method: 'POST',
+    body: JSON.stringify(req),
+  });
+}
+
+async function getSearchResultSet(id: string): Promise<SearchResultSetResponse> {
+  return request<SearchResultSetResponse>(`/search/result-sets/${id}`);
+}
+
+async function expandSearchFuzzy(id: string): Promise<{ status: string; total_hits: number }> {
+  return request<{ status: string; total_hits: number }>(
+    `/search/result-sets/${id}/expand-fuzzy`,
+    { method: 'POST', body: JSON.stringify({}) }
+  );
+}
+
+async function fetchMoreSearchSnippets(
+  id: string,
+  batchSize: number = 100
+): Promise<{ fetched: number }> {
+  return request<{ fetched: number }>(
+    `/search/result-sets/${id}/fetch-more?batch_size=${batchSize}`,
+    { method: 'POST', body: JSON.stringify({}) }
+  );
+}
+
+async function getSearchResultSetItems(
+  id: string,
+  opts?: { cursor?: string; limit?: number }
+): Promise<SearchItemsResponse> {
+  const params = new URLSearchParams();
+  if (opts?.cursor) params.set('cursor', opts.cursor);
+  if (opts?.limit) params.set('limit', String(opts.limit));
+  const q = params.toString() ? `?${params}` : '';
+  return request<SearchItemsResponse>(`/search/result-sets/${id}/items${q}`);
+}
+
+function getSearchResultSetExportUrl(id: string, format: 'csv' | 'json' = 'csv'): string {
+  const base = getRequestBase();
+  return `${base}/search/result-sets/${id}/export?format=${format}`;
+}
 
 // =============================================================================
 // Export
@@ -788,6 +915,7 @@ export const api = {
   getResultSet,
   getDocument,
   getDocumentPdfUrl,
+  getDocumentWitnesses,
   getEvidence,
   deletePendingMessage,
   // V6 Chat
@@ -802,6 +930,14 @@ export const api = {
   getCollectionDocuments,
   getSessionScope,
   updateSessionScope,
+  updateOutputMode,
+  // Search
+  createSearchResultSet,
+  getSearchResultSet,
+  getSearchResultSetItems,
+  getSearchResultSetExportUrl,
+  expandSearchFuzzy,
+  fetchMoreSearchSnippets,
 };
 
 export { ApiError };

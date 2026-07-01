@@ -6,9 +6,10 @@ import { api } from '@/lib/api';
 import type {
   Session, ChatMessage, ChatClaim, ChatMember, V6Stats, EvidenceRef, ChatCitation,
   V9ChatResponse, V9Meta, V9ProgressEvent, V9EvidenceBullet, CitationDetail,
-  ScopeMeta, EscalationOption, UserSelectedScope, CollectionNode,
+  ScopeMeta, EscalationOption, UserSelectedScope, CollectionNode, ClarificationAnswer,
 } from '@/types/api';
 import { scopeFingerprint } from '@/lib/scope';
+import { ClarificationCard } from './ClarificationCard';
 
 const PROGRESS_PHRASES = [
   'Searching archives...',
@@ -88,6 +89,8 @@ function toUserFriendlyProgress(step: V9ProgressEvent, stepIndex?: number): stri
 interface ConversationProps {
   session: Session | null;
   onV9Response?: (response: V9ChatResponse | null) => void;
+  onViewSearchResultSet?: (resultSetId: string) => void;
+  onOpenSearchTab?: () => void;
   onProcessingChange?: (processing: boolean, sessionId?: number) => void;
   onEvidenceClick?: (evidence: EvidenceRef) => void;
   onProgressUpdate?: (steps: V9ProgressEvent[], bullets: V9EvidenceBullet[]) => void;
@@ -108,14 +111,21 @@ interface ConversationProps {
   evidenceBullets?: V9EvidenceBullet[];
   /** Persisted last V9 response (so Think Deeper persists when returning from doc view). */
   lastV9Response?: V9ChatResponse | null;
+  /** Splash "Try asking" card clicked — parent creates a session and queues the question. */
+  onExampleQuestion?: (question: string) => void;
+  /** Question queued by the parent to auto-send once this (new) session is active. */
+  pendingQuestion?: string | null;
+  /** Called after the queued question has been sent, so the parent can clear it. */
+  onPendingQuestionConsumed?: () => void;
 }
 
 export function Conversation({
-  session, onV9Response, onProcessingChange, onEvidenceClick, onProgressUpdate,
+  session, onV9Response, onViewSearchResultSet, onOpenSearchTab, onProcessingChange, onEvidenceClick, onProgressUpdate,
   activeScope, lastUsedScope, collections, hasDraftChanges, onEditScope, onQuerySent, onMakeActiveScope,
   isProcessing = false, processingSessionId = null,
   progressSteps: progressStepsProp, evidenceBullets: evidenceBulletsProp,
   lastV9Response: lastV9ResponseProp,
+  onExampleQuestion, pendingQuestion, onPendingQuestionConsumed,
 }: ConversationProps) {
   const [input, setInput] = useState('');
   const [isSending, setIsSending] = useState(false);
@@ -246,6 +256,7 @@ export function Conversation({
         },
         controller.signal,
         carryContext,
+        activeScope || { mode: 'full_archive', included_collection_ids: [], included_document_ids: [] },
       );
     } catch (err: unknown) {
       if (abortRef.current) return;
@@ -261,6 +272,19 @@ export function Conversation({
       }
       abortControllerRef.current = null;
     }
+  };
+
+  // V12: user answered the follow-up question(s) -> re-run the original query
+  // with the answers + plan carried as context so the agent resolves intent.
+  const submitClarification = (answers: ClarificationAnswer[]) => {
+    if (!displayLastV9?.clarification) return;
+    const lastUserMsg = messages?.filter((m) => m.role === 'user').pop();
+    const queryText = lastUserMsg?.content?.trim();
+    if (!queryText) return;
+    sendV9(queryText, 'default', {
+      clarification_answers: answers,
+      clarification_plan: displayLastV9.clarification,
+    });
   };
 
   const handleStop = () => {
@@ -299,6 +323,15 @@ export function Conversation({
     }
   };
 
+  // Auto-send a question queued from a splash example once the new session is active.
+  useEffect(() => {
+    if (!session || !pendingQuestion) return;
+    const q = pendingQuestion;
+    onPendingQuestionConsumed?.();
+    sendV9(q);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [session?.id, pendingQuestion]);
+
   if (!session) {
     const exampleQuestions = [
       'Who was involved in the Rosenberg case?',
@@ -322,33 +355,17 @@ export function Conversation({
           <h3 className="splash-section-title">Try asking</h3>
           <div className="splash-example-grid">
             {exampleQuestions.map((q, i) => (
-              <div key={i} className="splash-example-card">
+              <button
+                key={i}
+                type="button"
+                className="splash-example-card"
+                onClick={() => onExampleQuestion?.(q)}
+                title="Start a new session with this question"
+              >
                 <span className="splash-example-icon">&#x1F50E;</span>
                 <span className="splash-example-text">{q}</span>
-              </div>
+              </button>
             ))}
-          </div>
-        </div>
-
-        <div className="splash-section splash-features">
-          <h3 className="splash-section-title">What Friday does</h3>
-          <div className="splash-feature-grid">
-            <div className="splash-feature">
-              <span className="splash-feature-icon">&#x1F4DA;</span>
-              <span>Entity-aware search with concordance & alias resolution</span>
-            </div>
-            <div className="splash-feature">
-              <span className="splash-feature-icon">&#x1F4C4;</span>
-              <span>Cited answers with clickable evidence links</span>
-            </div>
-            <div className="splash-feature">
-              <span className="splash-feature-icon">&#x1F4CB;</span>
-              <span>Scope to specific collections or full archive</span>
-            </div>
-            <div className="splash-feature">
-              <span className="splash-feature-icon">&#x1F4AD;</span>
-              <span>Think Deeper to extend an investigation</span>
-            </div>
           </div>
         </div>
 
@@ -357,7 +374,11 @@ export function Conversation({
             <h3 className="splash-section-title">Indexed collections</h3>
             <div className="splash-collections-pills">
               {collections.map((c) => (
-                <span key={c.id} className="splash-collection-pill">
+                <span
+                  key={c.id}
+                  className="splash-collection-pill"
+                  title={c.description || `${c.title || c.slug} — ${c.document_count} document${c.document_count === 1 ? '' : 's'}`}
+                >
                   {c.title || c.slug}
                   {c.document_count != null && (
                     <span className="splash-collection-count">{c.document_count}</span>
@@ -371,23 +392,31 @@ export function Conversation({
     );
   }
 
+  // Hide empty assistant placeholders (e.g. the v12 "clarify" message whose
+  // questions render in the ClarificationCard, not as a chat bubble).
+  const renderMessages = (messages ?? []).filter(
+    (m) => !(m.role === 'assistant' && !(m.content || '').trim())
+  );
+
   return (
     <>
       <div className="pane-content">
         {isLoading ? (
           <div className="loading">Loading conversation...</div>
-        ) : messages && messages.length > 0 ? (
+        ) : renderMessages.length > 0 ? (
           <>
-            {messages.map((message, idx) => (
+            {renderMessages.map((message, idx) => (
               <ChatBubble
                 key={message.id}
                 message={message}
                 onEvidenceClick={onEvidenceClick}
-                v9={idx === messages.length - 1 && message.role === 'assistant' ? lastV9 : null}
+                onViewSearchResultSet={onViewSearchResultSet}
+                onOpenSearchTab={onOpenSearchTab}
+                v9={idx === renderMessages.length - 1 && message.role === 'assistant' ? lastV9 : null}
                 onMakeActiveScope={handleMakeActive}
                 collections={collections}
-                evidenceBullets={idx === messages.length - 1 && message.role === 'assistant' ? displayEvidenceBullets : undefined}
-                isLastAndProcessing={idx === messages.length - 1 && message.role === 'assistant' && showThinkingIndicator}
+                evidenceBullets={idx === renderMessages.length - 1 && message.role === 'assistant' ? displayEvidenceBullets : undefined}
+                isLastAndProcessing={idx === renderMessages.length - 1 && message.role === 'assistant' && showThinkingIndicator}
                 onEscalate={(action, text, carryContext) => {
                   if (action === 'think_deeper') {
                     sendV9(text, 'think_deeper', carryContext);
@@ -410,7 +439,6 @@ export function Conversation({
           const lastStep = displayProgressSteps[displayProgressSteps.length - 1];
           const isSynthesisPhase = lastStep?.step === 'synthesis';
           const barFilledByTime = elapsedSeconds >= 360;
-          const barPercent = isSynthesisPhase ? 100 : Math.min(100, (elapsedSeconds / 360) * 100);
           const statusLabel = isSynthesisPhase
             ? 'Writing answer'
             : barFilledByTime
@@ -429,13 +457,8 @@ export function Conversation({
                   />
                 )}
                 <div className="chat-thinking">
+                  <div className="thinking-spinner" aria-hidden />
                   <span className="thinking-text">{statusLabel}</span>
-                  <div className="thinking-progress-bar" aria-hidden>
-                    <div
-                      className="thinking-progress-fill"
-                      style={{ width: `${barPercent}%` }}
-                    />
-                  </div>
                 </div>
               </div>
             </div>
@@ -448,6 +471,14 @@ export function Conversation({
               Failed to get answer: {sendError}
             </p>
           </div>
+        )}
+
+        {/* V12: follow-up clarification questions before the investigation runs */}
+        {displayLastV9?.needs_clarification && displayLastV9.clarification && !isSending && (
+          <ClarificationCard
+            clarification={displayLastV9.clarification}
+            onSubmit={submitClarification}
+          />
         )}
 
         {/* Think Deeper button — always shown after a retrieval answer (user-initiated only) */}
@@ -582,6 +613,8 @@ function EvidenceBulletsBlock({
 function ChatBubble({
   message,
   onEvidenceClick,
+  onViewSearchResultSet,
+  onOpenSearchTab,
   v9,
   onEscalate,
   onPrefillInput,
@@ -592,6 +625,8 @@ function ChatBubble({
 }: {
   message: ChatMessage;
   onEvidenceClick?: (evidence: EvidenceRef) => void;
+  onViewSearchResultSet?: (resultSetId: string) => void;
+  onOpenSearchTab?: () => void;
   v9?: V9ChatResponse | null;
   onEscalate?: (action: string, text: string, carryContext?: Record<string, unknown>) => void;
   onPrefillInput?: (text: string) => void;
@@ -628,9 +663,15 @@ function ChatBubble({
     escalations: v9.escalations,
     scope_override: v9.scope_override,
     expansion_info: v9.expansion_info,
+    search_result_set_id: v9.search_result_set_id,
+    search_result_preview: v9.search_result_preview,
+    search_result_throttled: v9.search_result_throttled,
   } : message.v9_meta || null;
 
   const suggestedQueries = v9meta?.suggested_queries ?? [];
+  const searchResultSetId = v9meta?.search_result_set_id;
+  const searchResultPreview = v9meta?.search_result_preview;
+  const searchResultThrottled = v9meta?.search_result_throttled;
 
   // Citation map for inline citation linking
   const citationMap = v9meta?.citation_map || {};
@@ -725,6 +766,63 @@ function ChatBubble({
         {/* Scope banner for follow-up answers */}
         {intent === 'follow_up' && scopeMeta && (
           <ScopeBanner scope={scopeMeta} />
+        )}
+
+        {/* Search result card: "View in Search tab" when all-instances returned a result set */}
+        {searchResultSetId && onViewSearchResultSet && (
+          <div className="search-result-card" style={{
+            marginTop: 10, marginBottom: 10, padding: 12, background: 'var(--color-bg-elevated, #f5f5f5)',
+            borderRadius: 8, border: '1px solid var(--color-border, #ddd)',
+          }}>
+            <button
+              type="button"
+              className="btn-primary"
+              style={{ fontSize: 13, padding: '6px 14px' }}
+              onClick={() => onViewSearchResultSet(searchResultSetId)}
+            >
+              View in Search tab
+            </button>
+            {searchResultPreview && searchResultPreview.length > 0 && (
+              <div style={{ marginTop: 10, fontSize: 12, color: 'var(--color-text-secondary, #666)' }}>
+                <div style={{ marginBottom: 4 }}>Preview:</div>
+                <ul style={{ margin: 0, paddingLeft: 18 }}>
+                  {searchResultPreview.slice(0, 5).map((item, i) => (
+                    <li key={i}>
+                      {item.collection?.slug && <span>{item.collection.slug} • </span>}
+                      {item.document?.title && <span>{item.document.title} </span>}
+                      {item.page?.pdf_page && <span>p.{item.page.pdf_page}</span>}
+                      {item.snippet && <span> — {item.snippet.slice(0, 60)}…</span>}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Search throttled: "Run exhaustive search (may be large)" */}
+        {searchResultThrottled && (
+          <div className="search-throttled-card" style={{
+            marginTop: 10, marginBottom: 10, padding: 12, background: 'var(--color-bg-elevated, #f5f5f5)',
+            borderRadius: 8, border: '1px solid var(--color-border, #ddd)',
+          }}>
+            <span style={{ fontSize: 13 }}>{searchResultThrottled.message}</span>
+            <span style={{ marginLeft: 6, color: 'var(--color-text-secondary, #666)' }}>
+              Query: &quot;{searchResultThrottled.query}&quot;
+            </span>
+            {onOpenSearchTab && (
+              <div style={{ marginTop: 8 }}>
+                <button
+                  type="button"
+                  className="btn-secondary"
+                  style={{ fontSize: 12, padding: '4px 10px' }}
+                  onClick={onOpenSearchTab}
+                >
+                  Open Search tab to run
+                </button>
+              </div>
+            )}
+          </div>
         )}
 
         {/* Evidence bullets — prefer persisted (v9_meta), fall back to live stream */}

@@ -1204,6 +1204,7 @@ class V9ChatRequest(BaseModel):
     text: str
     action: Optional[str] = "default"  # "default" | "think_deeper"
     carry_context: Optional[Dict[str, Any]] = None  # forwarded entity/intent context for escalations
+    selected_scope: Optional[Dict[str, Any]] = None  # side-panel scope sent with the query (avoids persist race)
 
 
 class V9RunSummary(BaseModel):
@@ -1298,6 +1299,15 @@ class V9ChatResponse(BaseModel):
     novelty_report: Optional[Dict[str, Any]] = None
     stop_reason: Optional[str] = None
     deep_dive_trace: Optional[List[Dict[str, Any]]] = None
+
+    # Search tab bridge: "all instances" -> auto-run Search
+    search_result_set_id: Optional[str] = None
+    search_result_preview: Optional[List[Dict[str, Any]]] = None  # first page of items
+    search_result_throttled: Optional[Dict[str, Any]] = None  # {query, message} when too broad
+
+    # V12 clarification: when present, the UI shows follow-up questions instead of an answer
+    needs_clarification: bool = False
+    clarification: Optional[Dict[str, Any]] = None
 
     # Timing
     elapsed_ms: float = 0.0
@@ -1533,9 +1543,30 @@ async def v9_message_stream(session_id: int, req: V9ChatRequest, user=Depends(re
     explicit_action = None
     if req.action == "think_deeper":
         explicit_action = "think_deeper"
-    carry_context = req.carry_context
+    carry_context = dict(req.carry_context) if req.carry_context else {}
 
     conn = get_conn()
+
+    # Inject search_result_set_id from last assistant message for follow-ups like "summarize those results"
+    if "search_result_set_id" not in carry_context:
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT metadata FROM research_messages
+                    WHERE session_id = %s AND role = 'assistant'
+                    ORDER BY created_at DESC LIMIT 1
+                    """,
+                    (session_id,),
+                )
+                row = cur.fetchone()
+            if row and row[0]:
+                meta = row[0] if isinstance(row[0], dict) else {}
+                sid = meta.get("search_result_set_id")
+                if sid:
+                    carry_context["search_result_set_id"] = sid
+        except Exception:
+            pass
 
     # Verify session + persist user message (same as sync endpoint)
     try:
@@ -1544,12 +1575,15 @@ async def v9_message_stream(session_id: int, req: V9ChatRequest, user=Depends(re
             if not cur.fetchone():
                 conn.close()
                 raise HTTPException(status_code=404, detail="Session not found")
-            cur.execute(
-                "INSERT INTO research_messages (session_id, role, content) "
-                "VALUES (%s, 'user', %s) RETURNING id",
-                (session_id, text),
-            )
-            user_msg_id = cur.fetchone()[0]
+            if carry_context.get("clarification_answers"):
+                user_msg_id = None  # clarification resume: don't duplicate the question
+            else:
+                cur.execute(
+                    "INSERT INTO research_messages (session_id, role, content) "
+                    "VALUES (%s, 'user', %s) RETURNING id",
+                    (session_id, text),
+                )
+                user_msg_id = cur.fetchone()[0]
             conn.commit()
     except HTTPException:
         raise
@@ -1570,6 +1604,110 @@ async def v9_message_stream(session_id: int, req: V9ChatRequest, user=Depends(re
             "timestamp": time.time(),
         })
 
+    # "All instances" -> auto-run Search (before V9 thread)
+    from retrieval.search_intent import detect_all_instances_intent, is_query_too_broad_for_auto_run
+    is_all_instances, extracted_query = detect_all_instances_intent(text)
+    if is_all_instances and extracted_query:
+        with conn.cursor() as cur:
+            cur.execute("SELECT scope_json FROM research_sessions WHERE id = %s", (session_id,))
+            row = cur.fetchone()
+        scope_json = row[0] if row and row[0] else {"mode": "full_archive"}
+        scope_mode = scope_json.get("mode", "full_archive") if isinstance(scope_json, dict) else "full_archive"
+
+        if is_query_too_broad_for_auto_run(extracted_query, scope_mode):
+            _throttle_result = type("Result", (), {
+                "intent": "new_retrieval",
+                "answer": f'To get **all instances** of "{extracted_query}" across the full archive, use the **Search** tab.',
+                "citation_map": {},
+                "cited_chunk_ids": [],
+                "confidence": "medium",
+                "can_think_deeper": False,
+                "suggestion": "",
+                "search_result_throttled": {"query": extracted_query, "message": "Run exhaustive search (may be large)"},
+                "v9_result": None,
+                "elapsed_ms": 0,
+                "run_id": None,
+                "evidence_set_id": None,
+                "scope_meta": None,
+                "escalations": [],
+                "novelty_report": None,
+            })()
+            progress_queue.put({"type": "done", "result": _throttle_result})
+        else:
+            from retrieval.search_executor import run_search
+            result_set_id = str(__import__("uuid").uuid4())
+            user_sub = user["sub"]
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO search_result_sets
+                    (id, user_sub, session_id, scope_json, query_raw, mode, unit, sort_order, alias_expand, is_exhaustive, status)
+                    VALUES (%s, %s, %s, %s, %s, 'exact', 'page', 'canonical', true, true, 'running')
+                    """,
+                    (result_set_id, user_sub, session_id, json.dumps(scope_json), extracted_query),
+                )
+            conn.commit()
+            run_search(conn, result_set_id, extracted_query, scope_json, alias_expand=True, mode="exact")
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT h.collection_id, h.document_id, h.page_id, h.page_seq, h.pdf_page_number,
+                        h.chunk_id, h.snippet, col.slug, col.title, d.source_name
+                    FROM search_result_page_hits h
+                    JOIN collections col ON col.id = h.collection_id
+                    JOIN documents d ON d.id = h.document_id
+                    WHERE h.result_set_id = %s
+                    ORDER BY h.collection_id, h.document_id, h.page_seq
+                    LIMIT 10
+                    """,
+                    (result_set_id,),
+                )
+                preview = []
+                for r in cur.fetchall():
+                    col_id, doc_id, page_id, page_seq, pdf_page, chunk_id, snippet, col_slug, col_title, doc_title = r
+                    preview.append({
+                        "collection": {"slug": col_slug, "title": col_title},
+                        "document": {"id": doc_id, "title": doc_title},
+                        "page": {"pdf_page": pdf_page or page_seq},
+                        "snippet": snippet,
+                        "evidence_ref": {"document_id": doc_id, "pdf_page": pdf_page or page_seq, "chunk_id": chunk_id},
+                    })
+                cur.execute("SELECT total_hits FROM search_result_sets WHERE id = %s", (result_set_id,))
+                total_hits = (cur.fetchone() or [0])[0]
+            _search_result = type("Result", (), {
+                "intent": "new_retrieval",
+                "answer": f'Found **{total_hits}** instances of "{extracted_query}". **View in Search tab** for the full list.',
+                "citation_map": {},
+                "cited_chunk_ids": [],
+                "confidence": "medium",
+                "can_think_deeper": False,
+                "suggestion": "",
+                "search_result_set_id": result_set_id,
+                "search_result_preview": preview,
+                "v9_result": None,
+                "elapsed_ms": 0,
+                "run_id": None,
+                "evidence_set_id": None,
+                "scope_meta": None,
+                "escalations": [],
+                "novelty_report": None,
+            })()
+            progress_queue.put({"type": "done", "result": _search_result})
+        # Skip V9 thread - we already put result in queue
+        run_v9 = False
+    else:
+        run_v9 = True
+
+    # Convert the side-panel scope (sent with the query) to a ScopeFilter so it is
+    # applied to THIS run without depending on the session scope having been persisted.
+    selected_scope_filter = None
+    if req.selected_scope:
+        try:
+            from retrieval.agent.v9_session import session_scope_to_filter
+            selected_scope_filter = session_scope_to_filter(conn, req.selected_scope)
+        except Exception:
+            selected_scope_filter = None
+
     def run_v9_thread():
         """Run V9 dispatch in a background thread."""
         try:
@@ -1578,6 +1716,7 @@ async def v9_message_stream(session_id: int, req: V9ChatRequest, user=Depends(re
                 conn, session_id, text,
                 explicit_action=explicit_action,
                 carry_context=carry_context,
+                selected_scope=selected_scope_filter,
                 verbose=True,
                 progress_callback=progress_callback,
             )
@@ -1591,9 +1730,10 @@ async def v9_message_stream(session_id: int, req: V9ChatRequest, user=Depends(re
                 "traceback": traceback.format_exc(),
             })
 
-    # Start V9 in background thread
-    v9_thread = threading.Thread(target=run_v9_thread, daemon=True)
-    v9_thread.start()
+    # Start V9 in background thread (unless we already handled "all instances")
+    if run_v9:
+        v9_thread = threading.Thread(target=run_v9_thread, daemon=True)
+        v9_thread.start()
 
     def _safe_float(x, default: float = 0.0) -> float:
         if x is None:
@@ -1635,6 +1775,38 @@ async def v9_message_stream(session_id: int, req: V9ChatRequest, user=Depends(re
                 elif event["type"] == "done":
                     result = event["result"]
 
+                    # --- V12: clarification needed -> emit questions, not an answer ---
+                    if getattr(result, "needs_clarification", False) and getattr(result, "clarification", None):
+                        clar = result.clarification
+                        try:
+                            with conn.cursor() as cur:
+                                cur.execute(
+                                    "INSERT INTO research_messages (session_id, role, content, metadata) "
+                                    "VALUES (%s, 'assistant', %s, %s)",
+                                    (session_id, "", Json({
+                                        "v9": True, "intent": "clarify",
+                                        "needs_clarification": True, "clarification": clar,
+                                        "run_id": getattr(result, "run_id", None),
+                                    })),
+                                )
+                                conn.commit()
+                        except Exception as _ce:
+                            print(f"[V9 Stream] clarify save error: {_ce}", file=sys.stderr)
+                        yield "event: result\ndata: " + json.dumps({
+                            "intent": "clarify", "answer": "",
+                            "needs_clarification": True, "clarification": clar,
+                            "active_run_id": getattr(result, "run_id", None),
+                            "active_run_status": "awaiting_clarification",
+                            # safe defaults so the UI never hits undefined arrays
+                            "cited_chunk_ids": [], "confidence": "medium",
+                            "can_think_deeper": False, "remaining_gaps": [],
+                            "next_best_actions": [], "suggested_queries": [],
+                            "run_history": [], "routing_reasoning": "", "routing_confidence": 0.0,
+                            "citation_map": {}, "suggestion": "",
+                            "elapsed_ms": _safe_float(result.elapsed_ms),
+                        }) + "\n\n"
+                        break
+
                     # Build citation map for storage
                     raw_cit_map = result.citation_map or {}
                     cit_map_for_storage = {
@@ -1657,13 +1829,19 @@ async def v9_message_stream(session_id: int, req: V9ChatRequest, user=Depends(re
                             "suggested_queries": _suggested,
                             "suggestion": result.suggestion,
                             "elapsed_ms": _safe_float(result.elapsed_ms),
-                            "run_id": result.run_id,
-                            "evidence_set_id": result.evidence_set_id,
+                            "run_id": getattr(result, "run_id", None),
+                            "evidence_set_id": getattr(result, "evidence_set_id", None),
                             "citation_map": cit_map_for_storage,
-                            "scope_meta": result.scope_meta.to_dict() if result.scope_meta else None,
-                            "escalations": [e.to_dict() for e in result.escalations] if result.escalations else [],
+                            "scope_meta": result.scope_meta.to_dict() if getattr(result, "scope_meta", None) else None,
+                            "escalations": [e.to_dict() for e in result.escalations] if getattr(result, "escalations", None) else [],
                             "evidence_bullets": accumulated_evidence_bullets,
                         }
+                        if getattr(result, "search_result_set_id", None):
+                            v9_metadata["search_result_set_id"] = result.search_result_set_id
+                        if getattr(result, "search_result_preview", None):
+                            v9_metadata["search_result_preview"] = result.search_result_preview
+                        if getattr(result, "search_result_throttled", None):
+                            v9_metadata["search_result_throttled"] = result.search_result_throttled
                         with conn.cursor() as cur:
                             cur.execute(
                                 "INSERT INTO research_messages (session_id, role, content, metadata) "
@@ -1738,15 +1916,15 @@ async def v9_message_stream(session_id: int, req: V9ChatRequest, user=Depends(re
                         except Exception as _scope_err:
                             print(f"[SSE] Error building scope info: {_scope_err}", file=sys.stderr)
 
-                    routing = result.router_decision
+                    routing = getattr(result, "router_decision", None)
                     response_dict = {
                         "intent": result.intent,
                         "answer": result.answer,
                         "cited_chunk_ids": result.cited_chunk_ids or [],
                         "confidence": result.confidence,
-                        "active_run_id": result.run_id,
-                        "active_run_status": result.run_status,
-                        "active_evidence_set_id": result.evidence_set_id,
+                        "active_run_id": getattr(result, "run_id", None),
+                        "active_run_status": getattr(result, "run_status", "completed"),
+                        "active_evidence_set_id": getattr(result, "evidence_set_id", None),
                         "referenced_run_id": routing.ref_run_id if routing else None,
                         "referenced_evidence_set_id": routing.ref_evidence_set_id if routing else None,
                         "can_think_deeper": result.can_think_deeper,
@@ -1764,6 +1942,12 @@ async def v9_message_stream(session_id: int, req: V9ChatRequest, user=Depends(re
                         "expansion_info": expansion_info_dict,
                         "elapsed_ms": _safe_float(result.elapsed_ms),
                     }
+                    if getattr(result, "search_result_set_id", None):
+                        response_dict["search_result_set_id"] = result.search_result_set_id
+                    if getattr(result, "search_result_preview", None):
+                        response_dict["search_result_preview"] = result.search_result_preview
+                    if getattr(result, "search_result_throttled", None):
+                        response_dict["search_result_throttled"] = result.search_result_throttled
                     yield f"event: result\ndata: {json.dumps(response_dict)}\n\n"
                     break
 
@@ -1801,9 +1985,31 @@ def v9_message(session_id: int, req: V9ChatRequest, user=Depends(require_user)):
     explicit_action = None
     if req.action == "think_deeper":
         explicit_action = "think_deeper"
+    carry_context = dict(req.carry_context) if req.carry_context else {}
 
     conn = get_conn()
     try:
+        # Inject search_result_set_id from last assistant message for follow-ups like "summarize those results"
+        if "search_result_set_id" not in carry_context:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT metadata FROM research_messages
+                        WHERE session_id = %s AND role = 'assistant'
+                        ORDER BY created_at DESC LIMIT 1
+                        """,
+                        (session_id,),
+                    )
+                    row = cur.fetchone()
+                if row and row[0]:
+                    meta = row[0] if isinstance(row[0], dict) else {}
+                    sid = meta.get("search_result_set_id")
+                    if sid:
+                        carry_context["search_result_set_id"] = sid
+            except Exception:
+                pass
+
         # Verify session exists
         with conn.cursor() as cur:
             cur.execute("SELECT id FROM research_sessions WHERE id = %s", (session_id,))
@@ -1811,13 +2017,126 @@ def v9_message(session_id: int, req: V9ChatRequest, user=Depends(require_user)):
                 raise HTTPException(status_code=404, detail="Session not found")
 
             # Persist user message into research_messages so chat history works
-            cur.execute(
-                "INSERT INTO research_messages (session_id, role, content) "
-                "VALUES (%s, 'user', %s) RETURNING id",
-                (session_id, text),
-            )
-            user_msg_id = cur.fetchone()[0]
+            if carry_context.get("clarification_answers"):
+                user_msg_id = None  # clarification resume: don't duplicate the question
+            else:
+                cur.execute(
+                    "INSERT INTO research_messages (session_id, role, content) "
+                    "VALUES (%s, 'user', %s) RETURNING id",
+                    (session_id, text),
+                )
+                user_msg_id = cur.fetchone()[0]
             conn.commit()
+
+        # "All instances" -> auto-run Search (with throttle for broad full-archive queries)
+        from retrieval.search_intent import detect_all_instances_intent, is_query_too_broad_for_auto_run
+        is_all_instances, extracted_query = detect_all_instances_intent(text)
+        if is_all_instances and extracted_query:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT scope_json FROM research_sessions WHERE id = %s",
+                    (session_id,),
+                )
+                row = cur.fetchone()
+            scope_json = row[0] if row and row[0] else {"mode": "full_archive"}
+            scope_mode = scope_json.get("mode", "full_archive") if isinstance(scope_json, dict) else "full_archive"
+
+            if is_query_too_broad_for_auto_run(extracted_query, scope_mode):
+                # Throttle: return prompt to run search manually
+                from retrieval.agent.v9_session import load_recent_runs
+                run_history = []
+                try:
+                    recent = load_recent_runs(conn, session_id, limit=10)
+                    run_history = [
+                        V9RunSummary(run_id=r.run_id, query_index=r.query_index, query_text=r.query_text,
+                        label=r.label, status=r.status, evidence_set_id=r.evidence_set_id,
+                        evidence_summary=r.evidence_summary) for r in recent.runs
+                    ]
+                except Exception:
+                    pass
+                return V9ChatResponse(
+                    intent="new_retrieval",
+                    answer=(
+                        f"To get **all instances** of \"{extracted_query}\" across the full archive, "
+                        "use the **Search** tab for exhaustive concordance-style search. "
+                        "Chat returns top results and is not exhaustive."
+                    ),
+                    search_result_throttled={
+                        "query": extracted_query,
+                        "message": "Run exhaustive search (may be large)",
+                    },
+                    run_history=run_history,
+                )
+
+            # Auto-run Search
+            from retrieval.search_executor import run_search
+            result_set_id = str(__import__("uuid").uuid4())
+            user_sub = user["sub"]
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO search_result_sets
+                    (id, user_sub, session_id, scope_json, query_raw, mode, unit, sort_order, alias_expand, is_exhaustive, status)
+                    VALUES (%s, %s, %s, %s, %s, 'exact', 'page', 'canonical', true, true, 'running')
+                    """,
+                    (result_set_id, user_sub, session_id, json.dumps(scope_json), extracted_query),
+                )
+            conn.commit()
+            run_search(conn, result_set_id, extracted_query, scope_json, alias_expand=True, mode="exact")
+
+            # Fetch first page of items for preview
+            preview = []
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT h.collection_id, h.document_id, h.page_id, h.page_seq, h.pdf_page_number,
+                        h.chunk_id, h.snippet, col.slug, col.title, d.source_name
+                    FROM search_result_page_hits h
+                    JOIN collections col ON col.id = h.collection_id
+                    JOIN documents d ON d.id = h.document_id
+                    WHERE h.result_set_id = %s
+                    ORDER BY h.collection_id, h.document_id, h.page_seq
+                    LIMIT 10
+                    """,
+                    (result_set_id,),
+                )
+                for r in cur.fetchall():
+                    col_id, doc_id, page_id, page_seq, pdf_page, chunk_id, snippet, col_slug, col_title, doc_title = r
+                    preview.append({
+                        "collection": {"slug": col_slug, "title": col_title},
+                        "document": {"id": doc_id, "title": doc_title},
+                        "page": {"pdf_page": pdf_page or page_seq},
+                        "snippet": snippet,
+                        "evidence_ref": {"document_id": doc_id, "pdf_page": pdf_page or page_seq, "chunk_id": chunk_id},
+                    })
+
+            with conn.cursor() as cur:
+                cur.execute("SELECT total_hits FROM search_result_sets WHERE id = %s", (result_set_id,))
+                row = cur.fetchone()
+            total_hits = row[0] if row else 0
+
+            from retrieval.agent.v9_session import load_recent_runs
+            run_history = []
+            try:
+                recent = load_recent_runs(conn, session_id, limit=10)
+                run_history = [
+                    V9RunSummary(run_id=r.run_id, query_index=r.query_index, query_text=r.query_text,
+                    label=r.label, status=r.status, evidence_set_id=r.evidence_set_id,
+                    evidence_summary=r.evidence_summary) for r in recent.runs
+                ]
+            except Exception:
+                pass
+
+            return V9ChatResponse(
+                intent="new_retrieval",
+                answer=(
+                    f"Found **{total_hits}** instances of \"{extracted_query}\". "
+                    "**View in Search tab** for the full list, export, and page-by-page navigation."
+                ),
+                search_result_set_id=result_set_id,
+                search_result_preview=preview,
+                run_history=run_history,
+            )
 
         from retrieval.agent.v9_dispatch import dispatch_message
         from retrieval.agent.v9_session import load_recent_runs
@@ -1825,9 +2144,31 @@ def v9_message(session_id: int, req: V9ChatRequest, user=Depends(require_user)):
         result = dispatch_message(
             conn, session_id, text,
             explicit_action=explicit_action,
-            carry_context=req.carry_context,
+            carry_context=carry_context,
             verbose=True,
         )
+
+        # --- V12: clarification needed -> return questions instead of an answer ---
+        if getattr(result, "needs_clarification", False) and getattr(result, "clarification", None):
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "INSERT INTO research_messages (session_id, role, content, metadata) "
+                        "VALUES (%s, 'assistant', %s, %s)",
+                        (session_id, "", Json({
+                            "v9": True, "intent": "clarify", "needs_clarification": True,
+                            "clarification": result.clarification, "run_id": result.run_id,
+                        })),
+                    )
+                    conn.commit()
+            except Exception as _ce:
+                print(f"[V9] clarify save error: {_ce}", file=sys.stderr)
+            return V9ChatResponse(
+                intent="clarify", answer="", needs_clarification=True,
+                clarification=result.clarification, active_run_id=result.run_id,
+                active_run_status="awaiting_clarification",
+                elapsed_ms=float(result.elapsed_ms or 0.0),
+            )
 
         # Extract sufficiency data if available
         remaining_gaps: List[str] = []
@@ -1898,6 +2239,12 @@ def v9_message(session_id: int, req: V9ChatRequest, user=Depends(require_user)):
                 "scope_meta": result.scope_meta.to_dict() if result.scope_meta else None,
                 "escalations": [e.to_dict() for e in result.escalations] if result.escalations else [],
             }
+            if getattr(result, "search_result_set_id", None):
+                v9_metadata["search_result_set_id"] = result.search_result_set_id
+            if getattr(result, "search_result_preview", None):
+                v9_metadata["search_result_preview"] = result.search_result_preview
+            if getattr(result, "search_result_throttled", None):
+                v9_metadata["search_result_throttled"] = result.search_result_throttled
             with conn.cursor() as cur:
                 cur.execute(
                     "INSERT INTO research_messages (session_id, role, content, metadata) "
