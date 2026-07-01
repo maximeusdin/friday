@@ -105,6 +105,18 @@ class SearchResultSetResponse(BaseModel):
     error_message: Optional[str] = None
 
 
+class SearchResultSetSummary(BaseModel):
+    """Lightweight row for listing a session's saved searches (no page hits)."""
+    id: str
+    created_at: str
+    query_display: Optional[str] = None
+    query_raw: Optional[str] = None
+    mode: str = "exact"
+    status: str = "complete"
+    total_hits: Optional[int] = None
+    is_exhaustive: bool = True
+
+
 class SearchPageHitItem(BaseModel):
     collection: Dict[str, Any]
     document: Dict[str, Any]
@@ -299,6 +311,45 @@ def search_suggest(
         return {
             "suggestions": [{"term": r[0], "ndoc": r[1]} for r in rows],
         }
+    finally:
+        conn.close()
+
+
+@router.get("/result-sets", response_model=List[SearchResultSetSummary])
+def list_search_result_sets(
+    session_id: int = Query(..., description="List saved searches for this session"),
+    user=Depends(require_user),
+):
+    """List a session's saved searches (oldest first), so the Search tab can reload
+    history the same way chat reloads its messages. Ownership is enforced per-session."""
+    assert_session_owned(session_id, user["sub"])
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, created_at, query_display, query_raw, mode, status,
+                       total_hits, is_exhaustive
+                FROM search_result_sets
+                WHERE session_id = %s AND user_sub = %s
+                ORDER BY created_at ASC
+                """,
+                (session_id, user["sub"]),
+            )
+            rows = cur.fetchall()
+        return [
+            SearchResultSetSummary(
+                id=str(r[0]),
+                created_at=r[1].isoformat() if r[1] else "",
+                query_display=r[2],
+                query_raw=r[3],
+                mode=r[4] or "exact",
+                status=r[5] or "complete",
+                total_hits=r[6],
+                is_exhaustive=r[7] if r[7] is not None else True,
+            )
+            for r in rows
+        ]
     finally:
         conn.close()
 

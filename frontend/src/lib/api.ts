@@ -846,6 +846,17 @@ export interface SearchItemsResponse {
   total_hits: number;
 }
 
+export interface SearchResultSetSummary {
+  id: string;
+  created_at: string;
+  query_display?: string;
+  query_raw?: string;
+  mode: string;
+  status: string;
+  total_hits?: number;
+  is_exhaustive?: boolean;
+}
+
 async function createSearchResultSet(req: SearchCreateRequest): Promise<SearchCreateResponse> {
   return request<SearchCreateResponse>('/search/result-sets', {
     method: 'POST',
@@ -855,6 +866,11 @@ async function createSearchResultSet(req: SearchCreateRequest): Promise<SearchCr
 
 async function getSearchResultSet(id: string): Promise<SearchResultSetResponse> {
   return request<SearchResultSetResponse>(`/search/result-sets/${id}`);
+}
+
+/** List a session's saved searches (oldest first) so the Search tab can reload history. */
+async function listSearchResultSets(sessionId: number): Promise<SearchResultSetSummary[]> {
+  return request<SearchResultSetSummary[]>(`/search/result-sets?session_id=${sessionId}`);
 }
 
 async function expandSearchFuzzy(id: string): Promise<{ status: string; total_hits: number }> {
@@ -934,6 +950,7 @@ export const api = {
   // Search
   createSearchResultSet,
   getSearchResultSet,
+  listSearchResultSets,
   getSearchResultSetItems,
   getSearchResultSetExportUrl,
   expandSearchFuzzy,

@@ -3,6 +3,7 @@
 import { useState, useRef, useEffect } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { api } from '@/lib/api';
+import { useChatRun, startRun, stopRun } from '@/lib/chatRunStore';
 import type {
   Session, ChatMessage, ChatClaim, ChatMember, V6Stats, EvidenceRef, ChatCitation,
   V9ChatResponse, V9Meta, V9ProgressEvent, V9EvidenceBullet, CitationDetail,
@@ -88,12 +89,9 @@ function toUserFriendlyProgress(step: V9ProgressEvent, stepIndex?: number): stri
 
 interface ConversationProps {
   session: Session | null;
-  onV9Response?: (response: V9ChatResponse | null) => void;
   onViewSearchResultSet?: (resultSetId: string) => void;
   onOpenSearchTab?: () => void;
-  onProcessingChange?: (processing: boolean, sessionId?: number) => void;
   onEvidenceClick?: (evidence: EvidenceRef) => void;
-  onProgressUpdate?: (steps: V9ProgressEvent[], bullets: V9EvidenceBullet[]) => void;
   /** Ref setter so parent can pre-fill the input (used by escalation "Start new search" action). */
   inputRef?: React.RefObject<HTMLInputElement | null>;
   // Scope bar props
@@ -102,15 +100,7 @@ interface ConversationProps {
   collections?: CollectionNode[];
   hasDraftChanges?: boolean;
   onEditScope?: () => void;
-  onQuerySent?: (scopeSent: UserSelectedScope) => void;
   onMakeActiveScope?: (scope: UserSelectedScope) => void;
-  isProcessing?: boolean;
-  processingSessionId?: number | null;
-  /** Persisted progress/bullets from parent (so dots persist when returning from doc view). */
-  progressSteps?: V9ProgressEvent[];
-  evidenceBullets?: V9EvidenceBullet[];
-  /** Persisted last V9 response (so Think Deeper persists when returning from doc view). */
-  lastV9Response?: V9ChatResponse | null;
   /** Splash "Try asking" card clicked — parent creates a session and queues the question. */
   onExampleQuestion?: (question: string) => void;
   /** Question queued by the parent to auto-send once this (new) session is active. */
@@ -120,50 +110,39 @@ interface ConversationProps {
 }
 
 export function Conversation({
-  session, onV9Response, onViewSearchResultSet, onOpenSearchTab, onProcessingChange, onEvidenceClick, onProgressUpdate,
-  activeScope, lastUsedScope, collections, hasDraftChanges, onEditScope, onQuerySent, onMakeActiveScope,
-  isProcessing = false, processingSessionId = null,
-  progressSteps: progressStepsProp, evidenceBullets: evidenceBulletsProp,
-  lastV9Response: lastV9ResponseProp,
+  session, onViewSearchResultSet, onOpenSearchTab, onEvidenceClick,
+  activeScope, lastUsedScope, collections, hasDraftChanges, onEditScope, onMakeActiveScope,
   onExampleQuestion, pendingQuestion, onPendingQuestionConsumed,
 }: ConversationProps) {
   const [input, setInput] = useState('');
-  const [isSending, setIsSending] = useState(false);
-  const [sendError, setSendError] = useState<string | null>(null);
-  const [lastV9, setLastV9] = useState<V9ChatResponse | null>(null);
-  const [progressSteps, setProgressSteps] = useState<V9ProgressEvent[]>([]);
-  const [evidenceBullets, setEvidenceBullets] = useState<V9EvidenceBullet[]>([]);
-  // Use parent's persisted data when returning from doc view (parent has latest from stream)
-  const displayProgressSteps = (progressStepsProp != null && progressStepsProp.length > 0) ? progressStepsProp : progressSteps;
-  const displayEvidenceBullets = (evidenceBulletsProp != null && evidenceBulletsProp.length > 0) ? evidenceBulletsProp : evidenceBullets;
-  const displayLastV9 = lastV9 ?? lastV9ResponseProp ?? null;
-  const showThinkingIndicator = (isSending || isProcessing) && session?.id === processingSessionId;
-  const messagesEndRef = useRef<HTMLDivElement>(null);
   const queryClient = useQueryClient();
-  const abortControllerRef = useRef<AbortController | null>(null);
-  const abortRef = useRef(false);
+  const messagesEndRef = useRef<HTMLDivElement>(null);
 
-  // 6-minute progress bar: elapsed time while processing, reset when processing starts
-  const processingStartRef = useRef<number | null>(null);
+  // Per-session run state lives in the shared store, so multiple sessions can stream
+  // concurrently and a run keeps going when you switch away. Aliased to the previous
+  // local names so the render logic below is unchanged.
+  const run = useChatRun(session?.id ?? null);
+  const isSending = run.isSending;
+  const sendError = run.sendError;
+  const lastV9 = run.lastV9;
+  const displayProgressSteps = run.progressSteps;
+  const displayEvidenceBullets = run.evidenceBullets;
+  const displayLastV9 = run.lastV9;
+  const showThinkingIndicator = run.isSending;
+
+  // Elapsed-time progress bar: driven by the run's start timestamp from the store.
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
   useEffect(() => {
-    if (showThinkingIndicator) {
-      if (processingStartRef.current === null) {
-        processingStartRef.current = Date.now();
-      }
-      const tick = () => {
-        if (processingStartRef.current) {
-          setElapsedSeconds(Math.floor((Date.now() - processingStartRef.current) / 1000));
-        }
-      };
-      tick();
-      const id = setInterval(tick, 1000);
-      return () => clearInterval(id);
-    } else {
-      processingStartRef.current = null;
+    if (!run.isSending || !run.startedAt) {
       setElapsedSeconds(0);
+      return;
     }
-  }, [showThinkingIndicator]);
+    const start = run.startedAt;
+    const tick = () => setElapsedSeconds(Math.floor((Date.now() - start) / 1000));
+    tick();
+    const id = setInterval(tick, 1000);
+    return () => clearInterval(id);
+  }, [run.isSending, run.startedAt]);
 
   // Toast state for scope actions
   const [toastMessage, setToastMessage] = useState<string | null>(null);
@@ -186,92 +165,24 @@ export function Conversation({
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
-  // Reset V9 state when session changes
-  useEffect(() => {
-    setLastV9(null);
-    onV9Response?.(null);
-  }, [session?.id]);
-
   // ── Submit: send a question via V9 ─────────────────────────────────
-  const handleSubmit = async (e: React.FormEvent) => {
+  const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!session || !input.trim() || isSending) return;
-    await sendV9(input.trim());
+    if (!session || !input.trim() || run.isSending) return;
+    sendV9(input.trim());
   };
 
-  const sendV9 = async (text: string, action: 'default' | 'think_deeper' = 'default', carryContext?: Record<string, unknown>) => {
-    if (!session || isSending) return;
-
-    abortRef.current = false;
-    const controller = new AbortController();
-    abortControllerRef.current = controller;
-
+  // Delegates to the shared run store: the request streams independently of this
+  // component, so it survives session switches and runs alongside other sessions.
+  const sendV9 = (text: string, action: 'default' | 'think_deeper' = 'default', carryContext?: Record<string, unknown>) => {
+    if (!session || run.isSending) return;
     setInput('');
-    setIsSending(true);
-    setSendError(null);
-    setProgressSteps([]);
-    setEvidenceBullets([]);
-    onProcessingChange?.(true, session.id);
-    onV9Response?.(null);
-    onProgressUpdate?.([], []);
-    onQuerySent?.(activeScope || { mode: 'full_archive' });
-
-    // Accumulate in local vars so callbacks have latest state
-    const steps: V9ProgressEvent[] = [];
-    const bullets: V9EvidenceBullet[] = [];
-
-    try {
-      await api.sendV9MessageStreaming(
-        session.id,
-        text,
-        action,
-        {
-        onProgress: (event) => {
-            if (abortRef.current) return;
-            steps.push(event);
-            const copy = [...steps];
-            setProgressSteps(copy);
-            onProgressUpdate?.(copy, bullets);
-          },
-          onEvidenceUpdate: (event) => {
-            if (abortRef.current) return;
-            const newBullets = event.details?.bullets || [];
-            bullets.push(...newBullets);
-            const copy = [...bullets];
-            setEvidenceBullets(copy);
-            onProgressUpdate?.(steps, copy);
-          },
-          onResult: (response) => {
-            if (abortRef.current) return;
-            setLastV9(response);
-            onV9Response?.(response);
-            queryClient.invalidateQueries({ queryKey: ['chatHistory', session.id] });
-          },
-        onError: (error) => {
-            if (abortRef.current) return;
-            setSendError(error);
-            setIsSending(false);
-            onProcessingChange?.(false);
-          },
-        },
-        controller.signal,
-        carryContext,
-        activeScope || { mode: 'full_archive', included_collection_ids: [], included_document_ids: [] },
-      );
-    } catch (err: unknown) {
-      if (abortRef.current) return;
-      let msg = err instanceof Error ? err.message : String(err);
-      if (msg === 'Failed to fetch' || msg === 'network error' || msg.includes('fetch')) {
-        msg = 'Connection was lost — the request may have timed out. Try again.';
-      }
-      setSendError(msg);
-    } finally {
-      if (!abortRef.current) {
-        setIsSending(false);
-        onProcessingChange?.(false);
-      }
-      abortControllerRef.current = null;
-    }
+    startRun(session.id, text, {
+      action,
+      carryContext,
+      scope: activeScope || { mode: 'full_archive', included_collection_ids: [], included_document_ids: [] },
+      queryClient,
+    });
   };
 
   // V12: user answered the follow-up question(s) -> re-run the original query
@@ -288,14 +199,7 @@ export function Conversation({
   };
 
   const handleStop = () => {
-    abortRef.current = true;
-    abortControllerRef.current?.abort();
-    setIsSending(false);
-    setSendError(null);
-    setProgressSteps([]);
-    setEvidenceBullets([]);
-    onProcessingChange?.(false);
-    onProgressUpdate?.([], []);
+    if (session) stopRun(session.id);
   };
 
   const handleMakeActive = (scope: UserSelectedScope) => {
@@ -312,8 +216,8 @@ export function Conversation({
     const lastUserMsg = messages?.filter(m => m.role === 'user').pop();
     let queryText = lastUserMsg?.content?.trim();
     if (!queryText && displayLastV9?.run_history?.length) {
-      const run = displayLastV9.run_history.find((r) => r.run_id === runId);
-      queryText = run?.query_text?.trim();
+      const histRun = displayLastV9.run_history.find((r) => r.run_id === runId);
+      queryText = histRun?.query_text?.trim();
     }
     if (queryText) {
       sendV9(queryText, 'think_deeper', {

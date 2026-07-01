@@ -30,9 +30,15 @@ interface SearchTabProps {
   onSearchRun?: () => void;
   /** Collection nodes for scope display */
   collections?: CollectionNode[];
+  /** Splash example clicked with no session — parent creates a session then queues the query. */
+  onExampleSearch?: (query: string) => void;
+  /** Query queued from a splash example; auto-run once a session is active. */
+  pendingSearchQuery?: string | null;
+  /** Called after the queued query has been consumed. */
+  onPendingSearchConsumed?: () => void;
 }
 
-export function SearchTab({ activeScope, sessionId, onOpenPage, externalResultSetId, onSearchRun, collections = [] }: SearchTabProps) {
+export function SearchTab({ activeScope, sessionId, onOpenPage, externalResultSetId, onSearchRun, collections = [], onExampleSearch, pendingSearchQuery, onPendingSearchConsumed }: SearchTabProps) {
   const [query, setQuery] = useState('');
   const [aliasExpand, setAliasExpand] = useState(true);
   const [fuzzyMode, setFuzzyMode] = useState(false);
@@ -66,12 +72,12 @@ export function SearchTab({ activeScope, sessionId, onOpenPage, externalResultSe
     return collIds.length > 3 ? `${titles.join(', ')} +${collIds.length - 3} more` : titles.join(', ');
   }, [activeScope, collections]);
 
-  const runSearch = useCallback(async () => {
-    if (!query.trim() || !sessionId) return;
+  const runSearchWith = useCallback(async (rawQuery: string) => {
+    const searchQuery = rawQuery.trim();
+    if (!searchQuery || !sessionId) return;
     setError(null);
     setIsSearching(true);
     setIsExpandingFuzzy(false);
-    const searchQuery = query.trim();
     try {
       const req: SearchCreateRequest = {
         session_id: sessionId,
@@ -134,13 +140,60 @@ export function SearchTab({ activeScope, sessionId, onOpenPage, externalResultSe
     } finally {
       setIsSearching(false);
     }
-  }, [query, aliasExpand, fuzzyMode, sessionId, scopeForRequest, onSearchRun]);
+  }, [aliasExpand, fuzzyMode, sessionId, scopeForRequest, onSearchRun]);
 
-  // Clear search state when session changes (search is session-scoped)
+  const runSearch = useCallback(() => { void runSearchWith(query); }, [runSearchWith, query]);
+
+  // Reload the session's saved searches when the session changes (search history is
+  // persisted server-side, so it survives reloads and session switches — like chat).
   useEffect(() => {
-    setSearchHistory([]);
     setError(null);
+    setSearchHistory([]);
+    if (!sessionId) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const summaries = await api.listSearchResultSets(sessionId);
+        if (cancelled || summaries.length === 0) return;
+        // Load each result set's metadata + first page of hits, preserving chronological order.
+        const blocks = await Promise.all(
+          summaries.map(async (s): Promise<SearchResultBlock | null> => {
+            try {
+              const [meta, data] = await Promise.all([
+                api.getSearchResultSet(s.id),
+                api.getSearchResultSetItems(s.id, { limit: INITIAL_LIMIT }),
+              ]);
+              return {
+                resultSetId: s.id,
+                query: s.query_display || s.query_raw || meta.query_display || 'Search',
+                resultSet: meta,
+                items: data.items,
+                totalHits: meta.total_hits ?? s.total_hits ?? 0,
+                nextCursor: data.next_cursor ?? null,
+              };
+            } catch {
+              return null;
+            }
+          })
+        );
+        if (cancelled) return;
+        setSearchHistory(blocks.filter((b): b is SearchResultBlock => b !== null));
+      } catch (e) {
+        if (!cancelled) setError(e instanceof Error ? e.message : 'Failed to load saved searches');
+      }
+    })();
+    return () => { cancelled = true; };
   }, [sessionId]);
+
+  // Auto-run a query queued from a splash example once the new session is active.
+  useEffect(() => {
+    if (!sessionId || !pendingSearchQuery) return;
+    const q = pendingSearchQuery;
+    onPendingSearchConsumed?.();
+    setQuery(q);
+    void runSearchWith(q);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionId, pendingSearchQuery]);
 
   // When externalResultSetId is set (e.g. from Chat "View in Search tab"), load that result set and append
   useEffect(() => {
@@ -240,18 +293,18 @@ export function SearchTab({ activeScope, sessionId, onOpenPage, externalResultSe
         <div className="splash-section splash-examples">
           <h3 className="splash-section-title">Example queries</h3>
           <div className="splash-example-grid">
-            <div className="splash-example-card">
-              <span className="splash-example-icon">&#x1F50E;</span>
-              <span className="splash-example-text">&quot;Harry Dexter White&quot;</span>
-            </div>
-            <div className="splash-example-card">
-              <span className="splash-example-icon">&#x1F50E;</span>
-              <span className="splash-example-text">Rosenberg OR Hiss</span>
-            </div>
-            <div className="splash-example-card">
-              <span className="splash-example-icon">&#x1F50E;</span>
-              <span className="splash-example-text">Soviet AND agent</span>
-            </div>
+            {['"Harry Dexter White"', 'Rosenberg OR Hiss', 'Soviet AND agent'].map((q, i) => (
+              <button
+                key={i}
+                type="button"
+                className="splash-example-card"
+                onClick={() => onExampleSearch?.(q)}
+                title="Start a new session and run this search"
+              >
+                <span className="splash-example-icon">&#x1F50E;</span>
+                <span className="splash-example-text">{q}</span>
+              </button>
+            ))}
           </div>
         </div>
       </div>
