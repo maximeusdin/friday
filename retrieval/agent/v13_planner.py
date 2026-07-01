@@ -826,11 +826,13 @@ def _load_catalog(conn, chunk_ids: List[int]) -> List[CatalogHit]:
 # ---------------------------------------------------------------------------
 
 _NEGATION_RE = re.compile(
-    r"\b(no (?:explicit |direct )?(?:evidence|mention|description|reference|record|indication|"
-    r"data|information|figures?|numbers?)|does not (?:contain|indicate|mention|document|specify|"
-    r"provide)|do not (?:contain|indicate|document|specify)|there(?:'s| is| are)? no|"
-    r"not (?:find|found|contain|mention|documented|specified|available)|reveals? no|"
-    r"could(?:n't| not) find|nothing (?:to|that|was)|no (?:such )?(?:mention|record))",
+    r"\b(no (?:explicit |direct |specific )?(?:evidence|mention|description|reference|record|"
+    r"indication|data|information|figures?|numbers?|detail)|"
+    r"(?:does|do|is|are|were|was) not (?:\w+ly\s+)?(?:contain|indicate|mention|document|specify|"
+    r"provide|detail|name|identif|reveal|appear|found|find)|there(?:'s| is| are)? no|"
+    r"not (?:\w+ly\s+)?(?:find|found|contain|mention|mentioned|documented|detailed|named|"
+    r"specified|available|identified|revealed|provided)|reveals? no|could(?:n't| not) find|"
+    r"nothing (?:to|that|was)|no (?:such )?(?:mention|record))",
     re.IGNORECASE,
 )
 
