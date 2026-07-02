@@ -10,14 +10,17 @@ from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import FileResponse, RedirectResponse
 from pydantic import BaseModel
 
+import psycopg2
+
 from app.services.db import get_conn
 from app.services.evidence import build_evidence_refs_from_chunk
 
 router = APIRouter()
 
-# Configurable PDF root - defaults to data/ in repo root
-PDF_ROOT = Path(os.getenv("PDF_ROOT", Path(__file__).parent.parent.parent.parent / "data"))
-REPO_ROOT = Path(__file__).parent.parent.parent.parent
+# Configurable PDF root - defaults to data/ in repo root; always resolve to absolute
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
+PDF_ROOT = Path(os.getenv("PDF_ROOT", str(_REPO_ROOT / "data"))).resolve()
+REPO_ROOT = _REPO_ROOT
 
 # S3 configuration for production
 # Set S3_PDF_BUCKET to enable S3 mode (e.g., "fridayarchive.org")
@@ -35,6 +38,7 @@ class Document(BaseModel):
     id: int
     collection_id: int
     collection_slug: Optional[str] = None
+    collection_title: Optional[str] = None
     source_name: str
     source_ref: Optional[str] = None
     volume: Optional[str] = None
@@ -84,7 +88,8 @@ def get_document(document_id: int):
                     d.source_ref,
                     d.volume,
                     d.metadata,
-                    d.created_at
+                    d.created_at,
+                    c.title as collection_title
                 FROM documents d
                 JOIN collections c ON c.id = d.collection_id
                 WHERE d.id = %s
@@ -114,6 +119,7 @@ def get_document(document_id: int):
                 id=row[0],
                 collection_id=row[1],
                 collection_slug=collection_slug,
+                collection_title=row[8],
                 source_name=source_name,
                 source_ref=source_ref,
                 volume=row[5],
@@ -122,6 +128,48 @@ def get_document(document_id: int):
                 metadata=metadata,
                 created_at=row[7],
             )
+    finally:
+        conn.close()
+
+
+class Witness(BaseModel):
+    appearance_seq: int
+    witness_name: str
+    start_page: int
+    end_page: int
+    page_count: Optional[int] = None
+    testimony_date: Optional[str] = None
+    examiner: Optional[str] = None
+
+
+@router.get("/documents/{document_id:int}/witnesses", response_model=list[Witness])
+def get_document_witnesses(document_id: int):
+    """Witness index for a transcript document (empty if none / table absent)."""
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            try:
+                cur.execute(
+                    """
+                    SELECT appearance_seq, witness_name, start_page, end_page,
+                           page_count, testimony_date, examiner
+                    FROM document_witnesses
+                    WHERE document_id = %s
+                    ORDER BY appearance_seq
+                    """,
+                    (document_id,),
+                )
+                rows = cur.fetchall()
+            except psycopg2.errors.UndefinedTable:
+                conn.rollback()
+                return []
+        return [
+            Witness(
+                appearance_seq=r[0], witness_name=r[1], start_page=r[2], end_page=r[3],
+                page_count=r[4], testimony_date=r[5], examiner=r[6],
+            )
+            for r in rows
+        ]
     finally:
         conn.close()
 
@@ -201,16 +249,28 @@ def _build_pdf_url_for_client(
     return f"/api/documents/{document_id}/pdf"
 
 
+# Collections whose PDFs live in a pdf/ subfolder (data/raw/{slug}/pdf/*.pdf)
+_COLLECTIONS_WITH_PDF_SUBFOLDER = frozenset({"vassiliev", "silvermaster"})
+
+
+def _fallback_s3_path(collection_slug: str, source_name: str) -> str:
+    """Derive S3 path when source_ref is absent. Mirrors local data/ layout."""
+    if not collection_slug:
+        return f"data/{source_name}"
+    if collection_slug in _COLLECTIONS_WITH_PDF_SUBFOLDER:
+        return f"data/raw/{collection_slug}/pdf/{source_name}"
+    return f"data/raw/{collection_slug}/{source_name}"
+
+
 def _build_s3_url(source_ref: Optional[str], source_name: str, collection_slug: str) -> str:
     """
     Build the S3 URL for a PDF using the path stored in the database.
 
     We use documents.source_ref as the canonical path when present (portable relative
     path like data/raw/venona/Venona London GRU.pdf or data/raw/vassiliev/pdf/...).
-    S3 is assumed to mirror that structure; we only extract the data/... part from
-    source_ref (stripping any machine-specific prefix) and URL-encode for the request.
-    No path rewriting (e.g. no pdf/ insertion or spaces→underscores) so different
-    collection layouts (venona vs vassiliev/pdf/) are supported from the DB.
+    S3 is assumed to mirror the local data/ folder structure.
+    When source_ref is absent or lacks path info, we derive the path; collections
+    in _COLLECTIONS_WITH_PDF_SUBFOLDER use data/raw/{slug}/pdf/{source_name}.
     """
     from urllib.parse import quote
 
@@ -230,9 +290,9 @@ def _build_s3_url(source_ref: Optional[str], source_name: str, collection_slug: 
             elif sr_norm.lower().startswith("raw/"):
                 path = "data/" + sr_norm
             else:
-                path = f"data/raw/{collection_slug}/{source_name}" if collection_slug else f"data/{source_name}"
+                path = _fallback_s3_path(collection_slug, source_name)
     else:
-        path = f"data/raw/{collection_slug}/{source_name}" if collection_slug else f"data/{source_name}"
+        path = _fallback_s3_path(collection_slug, source_name)
 
     path = path.lstrip("/")
     # URL-encode each segment (handles spaces in filenames, e.g. "Venona London GRU.pdf")
@@ -251,61 +311,80 @@ def _build_s3_url(source_ref: Optional[str], source_name: str, collection_slug: 
 
 
 def _resolve_local_pdf_path(source_ref: Optional[str], source_name: str, collection_slug: str) -> Optional[Path]:
-    """Resolve the local filesystem path for a PDF."""
+    """Resolve the local filesystem path for a PDF. Uses source_ref from DB first."""
     pdf_path: Optional[Path] = None
-    
-    # Try source_ref first (absolute or relative)
+
+    def _try(candidate: Path) -> bool:
+        nonlocal pdf_path
+        if candidate.exists():
+            pdf_path = candidate
+            return True
+        return False
+
+    # Try source_ref first (absolute or relative) — use path from database
     if source_ref:
         sr_norm = str(source_ref).replace("\\", "/")
-        sr_path = Path(source_ref)
+        sr_path = Path(sr_norm)
 
         if sr_path.is_absolute():
-            pdf_path = sr_path
+            if sr_path.exists():
+                pdf_path = sr_path
+            else:
+                # Absolute path from different machine (e.g. ingest path); try extracting data/raw/... segment
+                sr_lower = sr_norm.lower()
+                if "/data/raw/" in sr_lower:
+                    idx = sr_lower.find("/data/raw/")
+                    segment = "raw/" + sr_norm[idx + len("/data/raw/"):].lstrip("/")
+                    _try(PDF_ROOT / segment)
+                elif "/raw/" in sr_lower:
+                    idx = sr_lower.find("/raw/")
+                    segment = sr_norm[idx:].lstrip("/")
+                    _try(PDF_ROOT / segment)
         else:
-            # Strip leading "data/" when present
+            # Normalize source_ref: "../data/raw/..." (from ingest cwd) -> "raw/..."
             sr_rel = sr_norm
-            if sr_rel.lower().startswith("data/"):
-                sr_rel = sr_rel[5:]
-
-            # Try relative to PDF_ROOT (data/)
-            candidate = PDF_ROOT / sr_rel
-            if candidate.exists():
-                pdf_path = candidate
-
-            # Try relative to repo root
-            if not pdf_path or not pdf_path.exists():
-                candidate = REPO_ROOT / sr_norm
-                if candidate.exists():
-                    pdf_path = candidate
-
-            # Special-case: some collections store PDFs under an extra "pdf/" folder
-            if (not pdf_path or not pdf_path.exists()) and collection_slug and source_name:
-                needle_prefix = f"raw/{collection_slug}/"
-                if sr_rel.lower().startswith(needle_prefix.lower()) and "/pdf/" not in sr_rel.lower():
-                    sr_rel_pdf = f"raw/{collection_slug}/pdf/{source_name}"
-                    candidate = PDF_ROOT / sr_rel_pdf
-                    if candidate.exists():
-                        pdf_path = candidate
-    
-    # Fallback: try to find by collection/source_name
-    if not pdf_path or not pdf_path.exists():
-        if collection_slug and source_name:
-            for candidate in [
-                PDF_ROOT / "raw" / collection_slug / source_name,
-                PDF_ROOT / "raw" / collection_slug / "pdf" / source_name,
-                PDF_ROOT / "raw" / collection_slug / "PDF" / source_name,
-                PDF_ROOT / "raw" / collection_slug / "pdfs" / source_name,
-            ]:
-                if candidate.exists():
-                    pdf_path = candidate
+            for prefix in ("../data/", "data/"):
+                if sr_rel.lower().startswith(prefix.lower()):
+                    sr_rel = sr_rel[len(prefix):]
                     break
 
+            # Ensure we have raw/ prefix for standard layout (data/raw/collection/...)
+            if sr_rel and not sr_rel.lower().startswith("raw/"):
+                sr_rel = "raw/" + sr_rel.lstrip("/")
+
+            # Try relative to PDF_ROOT (data/)
+            _try(PDF_ROOT / sr_rel)
+
+            # Try relative to repo root (source_ref may be "data/raw/...")
+            if not pdf_path:
+                _try(REPO_ROOT / sr_norm)
+
+            # When source_ref omits "pdf/" but file lives in pdf/ (e.g. vassiliev)
+            if not pdf_path and collection_slug and source_name and "/pdf/" not in sr_rel.lower():
+                sr_rel_pdf = f"raw/{collection_slug}/pdf/{source_name}"
+                _try(PDF_ROOT / sr_rel_pdf)
+
+            # When source_ref path segment differs from collection_slug
+            if not pdf_path and collection_slug and source_name:
+                _try(PDF_ROOT / "raw" / collection_slug / source_name)
+
+    # Fallback: try to find by collection/source_name (including pdf/ subfolder)
+    if not pdf_path and collection_slug and source_name:
+        for candidate in [
+            PDF_ROOT / "raw" / collection_slug / source_name,
+            PDF_ROOT / "raw" / collection_slug / "pdf" / source_name,
+            PDF_ROOT / "raw" / collection_slug / "PDF" / source_name,
+            PDF_ROOT / "raw" / collection_slug / "pdfs" / source_name,
+        ]:
+            if _try(candidate):
+                break
+
     # Final fallback: search by filename anywhere under PDF_ROOT
-    if (not pdf_path or not pdf_path.exists()) and source_name:
+    if not pdf_path and source_name:
         found = _find_pdf_by_filename(PDF_ROOT, source_name)
         if found is not None:
             pdf_path = found
-    
+
     return pdf_path
 
 
@@ -350,7 +429,8 @@ def get_evidence(
                     d.source_ref,
                     d.volume,
                     d.metadata,
-                    d.created_at
+                    d.created_at,
+                    c.title as collection_title
                 FROM documents d
                 JOIN collections c ON c.id = d.collection_id
                 WHERE d.id = %s
@@ -377,6 +457,7 @@ def get_evidence(
                 id=row[0],
                 collection_id=row[1],
                 collection_slug=collection_slug_ev,
+                collection_title=row[8],
                 source_name=source_name_ev,
                 source_ref=source_ref_ev,
                 volume=row[5],

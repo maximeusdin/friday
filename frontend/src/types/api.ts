@@ -72,6 +72,8 @@ export interface Primitive {
 /**
  * A research session container.
  */
+export type OutputMode = 'evidence_only' | 'evidence_summary' | 'narrative';
+
 export interface Session {
   id: number;
   label: string;
@@ -79,6 +81,7 @@ export interface Session {
   message_count?: number;
   last_activity?: string;
   scope_json?: UserSelectedScope;
+  output_mode?: OutputMode;
 }
 
 /**
@@ -126,6 +129,7 @@ export interface Document {
   id: number;
   collection_id: number;
   collection_slug?: string;
+  collection_title?: string;
   source_name: string;
   source_ref?: string;
   volume?: string;
@@ -133,6 +137,16 @@ export interface Document {
   pdf_url?: string;
   metadata?: Record<string, unknown>;
   created_at: string;
+}
+
+export interface DocumentWitness {
+  appearance_seq: number;
+  witness_name: string;
+  start_page: number;
+  end_page: number;
+  page_count?: number;
+  testimony_date?: string;
+  examiner?: string;
 }
 
 // =============================================================================
@@ -295,6 +309,16 @@ export interface V9Meta {
   expansion_info?: ExpansionInfo;
   /** Evidence bullets discovered during investigation (persisted with message). */
   evidence_bullets?: V9EvidenceBullet[];
+  /** Search tab bridge: "all instances" → auto-run Search (persisted with message). */
+  search_result_set_id?: string;
+  search_result_preview?: Array<{
+    collection?: { slug?: string; title?: string };
+    document?: { id?: number; title?: string };
+    page?: { pdf_page?: number };
+    snippet?: string;
+    evidence_ref?: EvidenceRef;
+  }>;
+  search_result_throttled?: { query: string; message: string };
 }
 
 /**
@@ -435,11 +459,43 @@ export interface V9RunSummary {
   evidence_summary?: string;
 }
 
+// ── V12 clarification (follow-up questions before investigation) ──
+export interface ClarificationOption {
+  id: string;
+  label: string;
+  value?: string;
+  entity_ids?: number[];
+  hint?: string;
+}
+export interface ClarificationQuestion {
+  id: string;
+  question: string;
+  kind: 'single_choice' | 'multi_choice' | 'free_text';
+  category?: string;
+  options: ClarificationOption[];
+  allow_free_text?: boolean;
+  why?: string;
+  surface?: string | null;
+}
+export interface ClarificationPlan {
+  questions: ClarificationQuestion[];
+  rationale?: string;
+}
+export interface ClarificationAnswer {
+  question_id: string;
+  option_ids?: string[];
+  free_text?: string;
+}
+
 export interface V9ChatResponse {
-  intent: 'new_retrieval' | 'follow_up' | 'think_deeper';
+  intent: 'new_retrieval' | 'follow_up' | 'think_deeper' | 'clarify';
   answer: string;
   cited_chunk_ids: number[];
   confidence: string;
+
+  /** V12: when true, the UI shows follow-up questions instead of an answer. */
+  needs_clarification?: boolean;
+  clarification?: ClarificationPlan;
 
   active_run_id?: number;
   active_run_status: string;
@@ -476,6 +532,17 @@ export interface V9ChatResponse {
 
   /** Stage 1.5 concordance expansion status. */
   expansion_info?: ExpansionInfo;
+
+  /** Search tab bridge: "all instances" → auto-run Search */
+  search_result_set_id?: string;
+  search_result_preview?: Array<{
+    collection?: { slug?: string; title?: string };
+    document?: { id?: number; title?: string };
+    page?: { pdf_page?: number };
+    snippet?: string;
+    evidence_ref?: EvidenceRef;
+  }>;
+  search_result_throttled?: { query: string; message: string };
 
   elapsed_ms: number;
 }
