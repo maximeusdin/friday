@@ -1251,15 +1251,24 @@ class V9Result:
             pattern = _re.compile(r'\b' + _re.escape(alias) + r'\b', _re.IGNORECASE)
             match = pattern.search(result)
             if match:
-                # Guard: a mixed-case alias that is a person's FIRST name (immediately followed by
-                # a capitalized surname) is part of a real name, not a standalone codename — do not
-                # expand it, or "Jacob Golos" wrongly becomes "Jacob (William Perl) Golos". ALL-CAPS
-                # occurrences are unmistakable codenames and are always expanded.
                 matched_text = match.group()
-                if not matched_text.isupper():
-                    after = result[match.end():match.end() + 30]
-                    if _re.match(r'\s+[A-Z][a-z]', after):
-                        continue
+                # STRICT: only gloss a surface actually used AS A CODENAME — written ALL-CAPS
+                # (MLAD, REST, PAL) or wrapped in quotes ('Liberal', "Sound"). A mixed-case common
+                # word or real name ("May", "New York", "Chambers", "atomic") is NOT a codename here,
+                # and glossing it produces corruption like "May (Pavel Fedosimov) 24, 1924". The
+                # important identifications come from grounded_finalize + the codename key, not this
+                # inline nicety.
+                _q = "\"'“”‘’"
+                _before = result[match.start() - 1] if match.start() > 0 else ""
+                _after_ch = result[match.end()] if match.end() < len(result) else ""
+                _quoted = (_before in _q) and (_after_ch in _q)
+                if not (matched_text.isupper() or _quoted):
+                    continue
+                # CORROBORATION: never assert a real name the retrieved evidence does not mention
+                # (kills junk-concordance glosses like "Chambers (Robert Tselnis)").
+                _surn = [t for t in _re.split(r"[,\s]+", canonical) if len(t) >= 4 and t.isalpha()]
+                if _surn and self._evidence_mentions([_surn[-1]]) == 0:
+                    continue
                 # Don't expand if canonical is already nearby (within 50 chars)
                 start = max(0, match.start() - 50)
                 end = min(len(result), match.end() + 50)
@@ -1428,7 +1437,10 @@ class V9Result:
         # --- Narrative: show when we have grounded content (claims or bullet-derived) ---
         if self.narrative and grounded_claims:
             narrative = self._expand_entity_refs(self.narrative, alias_map)
-            if not all_grounded:
+            # A roster/group/finalize override sets the narrative to an authoritative one-line
+            # summary — never stamp that "draft/unverified" just because some roster rows are weak.
+            _authoritative = getattr(self, "_authoritative_narrative", False)
+            if not all_grounded and not _authoritative:
                 lines.append("--- Narrative (draft/unverified — claims above are the grounded findings) ---")
             else:
                 lines.append("--- Summary ---")

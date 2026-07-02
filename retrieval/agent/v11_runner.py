@@ -1293,6 +1293,7 @@ def run_v11_query(
                     result.narrative = summary
                     try:
                         result.grounded_roster = []
+                        result._authoritative_narrative = True
                     except Exception:
                         pass
                     if result.synthesis:

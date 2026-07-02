@@ -1667,6 +1667,10 @@ def grounded_finalize(conn, result, workspace, plan, question: str, *, verbose: 
     new_narr = (lead + answer).strip()
     result.claims = claims
     result.narrative = new_narr
+    try:
+        result._authoritative_narrative = True  # authoritative answer, not a draft synthesis
+    except Exception:
+        pass
     # Drop the stale synthesis artifact + roster so format_answer can't render a leftover that
     # contradicts the corrected answer (e.g. an old "[HUAC p294]: No direct mention..." evidence
     # line). The verdict + grounded findings are the complete, faithful answer.
