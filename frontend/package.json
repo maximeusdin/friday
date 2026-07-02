@@ -3,6 +3,9 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
+    "copy-pdf-worker": "node -e \"const p=require('path').dirname(require.resolve('react-pdf/package.json'));require('fs').copyFileSync(require.resolve('pdfjs-dist/build/pdf.worker.min.mjs',{paths:[p]}),'public/pdf.worker.min.mjs')\"",
+    "predev": "npm run copy-pdf-worker",
+    "prebuild": "npm run copy-pdf-worker",
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
