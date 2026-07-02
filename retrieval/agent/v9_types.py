@@ -22,6 +22,13 @@ _NON_PERSON_GLOSS_TOKENS = {
     "tube", "corporation", "bank", "project", "operation",
 }
 
+# Explicitly non-person entity types — skipped when glossing identities. Unknown/None types are
+# NOT in this set, so a mislabeled or untyped real person is never wrongly dropped.
+_NON_PERSON_ENTITY_TYPES = {
+    "cover_name", "covername", "codename", "organization", "organisation", "org", "place",
+    "location", "gpe", "operation", "event", "topic", "project", "facility", "vessel",
+}
+
 
 # =============================================================================
 # Bullet ID utilities (canonical, single source of truth)
@@ -1084,10 +1091,12 @@ class V9Result:
         for e in self.workspace.entities:
             if not self._is_valid_entity_for_linking(e.canonical_name):
                 continue
-            # Skip non-person entities and topic/operation cover-words: these are never real
-            # people and glossing them produces garbage like "atomic (Balloon)".
+            # Skip KNOWN non-person entity types and topic/operation cover-words: these are never
+            # real people and glossing them produces garbage like "atomic (Balloon)". Only skip
+            # explicitly-non-person types (unknown/None types are kept, so a mislabeled person is
+            # never wrongly dropped).
             etype = (getattr(e, "entity_type", None) or "").lower()
-            if etype and etype not in ("person", "people"):
+            if etype in _NON_PERSON_ENTITY_TYPES:
                 continue
             if e.canonical_name.lower() in _NON_PERSON_GLOSS_TOKENS:
                 continue

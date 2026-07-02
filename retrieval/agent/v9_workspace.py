@@ -474,13 +474,18 @@ def build_alias_context_for_summarizer(workspace: ResearchWorkspace) -> str:
         "balloon", "ballon", "atomic", "enormous", "enormoz", "uranium", "bomb", "plutonium",
         "tube", "corporation", "bank", "project", "operation",
     }
+    _NON_PERSON_ENTITY_TYPES_WS = {
+        "cover_name", "covername", "codename", "organization", "organisation", "org", "place",
+        "location", "gpe", "operation", "event", "topic", "project", "facility", "vessel",
+    }
 
     def _cover_junk(canonical: str, aliases: List[str], etype: Optional[str] = None) -> bool:
         c = (canonical or "").strip()
         if not c or not any(ch.isalpha() for ch in c):
             return True
-        # Non-person entity types (cover names, orgs, places, operations) don't unify people.
-        if etype and etype.lower() not in ("person", "people"):
+        # KNOWN non-person entity types (cover names, orgs, places, operations) don't unify people.
+        # Unknown/None types are kept so a mislabeled real person is never wrongly dropped.
+        if (etype or "").lower() in _NON_PERSON_ENTITY_TYPES_WS:
             return True
         al = {a.strip().lower() for a in (aliases or [])}
         # Self-referential concordance junk (canonical_name IS one of its own cover names).

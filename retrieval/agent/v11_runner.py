@@ -1277,10 +1277,36 @@ def run_v11_query(
                       "organisations", "operation", "operations"}
     if _v14 and _v13_plan and (_v13_plan.get("intent") in ("roster", "list", "enumerate")):
         tgt = _v13_plan.get("enumeration_target") or "person"
-        if tgt.strip().lower() in _GROUP_TARGETS:
-            if verbose:
-                print(f"  [V14] group-target roster ('{tgt}') -> keep synthesis narrative "
-                      f"(named groups), skip person-roster", file=sys.stderr)
+        # Token-based match so multi-word targets ("espionage networks", "spy rings") also route
+        # to the group enumerator, not just the bare noun.
+        _tgt_is_group = bool({w for w in re.split(r"[^a-z]+", tgt.lower()) if w} & _GROUP_TARGETS)
+        if _tgt_is_group:
+            # A group question ("what networks operated") wants NAMED GROUPS, not individuals —
+            # enumerate the named networks/rings, falling back to the synthesis narrative only if
+            # we can't ground at least two.
+            try:
+                from retrieval.agent.v13_planner import assemble_group_roster
+                group_claims = assemble_group_roster(conn, workspace, question=clean_question, verbose=verbose)
+                if len(group_claims) >= 2:
+                    result.claims = group_claims
+                    summary = f"Identified {len(group_claims)} named Soviet espionage network(s) across the corpus."
+                    result.narrative = summary
+                    try:
+                        result.grounded_roster = []
+                    except Exception:
+                        pass
+                    if result.synthesis:
+                        result.synthesis.narrative = summary
+                        if hasattr(result.synthesis, "artifact"):
+                            try:
+                                result.synthesis.artifact = {}
+                            except Exception:
+                                pass
+                elif verbose:
+                    print(f"  [V14] group-target roster ('{tgt}') -> <2 groups, kept synthesis", file=sys.stderr)
+            except Exception as _ge:
+                if verbose:
+                    print(f"  [V14] group-roster failed (non-fatal): {_ge}", file=sys.stderr)
         else:
             try:
                 from retrieval.agent.v13_planner import assemble_roster

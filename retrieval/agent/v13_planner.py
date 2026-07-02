@@ -1320,6 +1320,105 @@ def assemble_roster(conn, workspace, target: str, *, question: str = "", plan=No
     return out
 
 
+def assemble_group_roster(conn, workspace, *, question: str = "", verbose: bool = False):
+    """Enumerate NAMED espionage networks/groups/rings from the fetched chunks — the right tool
+    for "what networks operated" (a group question), where a person-enumerator wrongly returns a
+    list of individuals. Extracts each distinct named group + its leader/organizer, grounded in a
+    passage that names the group. Deterministic citations; bounded gpt-4.1-mini calls.
+    """
+    from retrieval.agent.v9_types import GroundedClaim, V9Claim
+    from collections import OrderedDict
+    api_key = os.getenv("OPENAI_API_KEY")
+    all_chunks = [c for c in workspace.fulltext_chunks if (c.text or "").strip()]
+    if not all_chunks or not api_key:
+        return []
+    _PER_COLL = int(os.getenv("V14_ROSTER_PER_COLLECTION", "5"))
+    _by: "OrderedDict[str, List]" = OrderedDict()
+    for c in all_chunks:
+        _by.setdefault(c.collection_slug or c.source_label or "?", []).append(c)
+    chunks = []
+    for coll, cs in _by.items():
+        chunks.extend(cs[:_PER_COLL])
+    from openai import OpenAI
+    client = OpenAI(api_key=api_key)
+    entries: Dict[str, Dict[str, Any]] = {}
+    BATCH = 10
+    for i in range(0, len(chunks), BATCH):
+        batch = chunks[i:i + BATCH]
+        doc_text = "\n\n".join(
+            f"[chunk {c.chunk_id} | {(c.source_label or '').replace('_',' ')} {c.page or ''}]\n{(c.text or '')[:900]}"
+            for c in batch
+        )
+        try:
+            r = client.chat.completions.create(
+                model=_ROSTER_MODEL, temperature=0.0, max_completion_tokens=800,
+                response_format={"type": "json_object"},
+                messages=[
+                    {"role": "system", "content": (
+                        "Extract every distinct NAMED Soviet espionage network/ring/group/apparatus "
+                        "the passages describe (e.g. 'the Silvermaster group', 'the Perlo group', "
+                        "'the Ware group', 'the Rosenberg ring', 'the Golos-Bentley apparatus'). "
+                        "For each, give the group's NAME and its LEADER/organizer and the key "
+                        "government agency/domain it penetrated, if the passages state them. Include "
+                        "a group ONLY if the passages actually name it as a distinct network; do NOT "
+                        "invent groups, and do NOT list individual agents who are not themselves a "
+                        "named group. If none, return an empty list. Return JSON "
+                        '{"groups":[{"name":"","leader":"","note":""}]}.')},
+                    {"role": "user", "content": doc_text},
+                ],
+            )
+            groups = json.loads(r.choices[0].message.content or "{}").get("groups", [])
+        except Exception as e:
+            if verbose:
+                print(f"  [V14] group-roster batch failed: {e}", file=sys.stderr)
+            continue
+        for g in groups:
+            name = (g.get("name") or "").strip()
+            leader = (g.get("leader") or "").strip()
+            note = (g.get("note") or "").strip()
+            if not name or len(name) < 4:
+                continue
+            key = re.sub(r"\b(the|group|ring|network|apparatus|of)\b", "", name.lower()).strip()
+            key = re.sub(r"\s+", " ", key) or name.lower()
+            e = entries.setdefault(key, {"name": name, "leader": leader, "note": note, "cids": []})
+            if leader and not e["leader"]:
+                e["leader"] = leader
+            if note and not e["note"]:
+                e["note"] = note
+            # Cite chunks that mention the group's distinctive token (leader surname or group word).
+            needles = []
+            lead_surname = ""
+            if leader:
+                toks = [t for t in re.split(r"[,\s]+", leader) if len(t) >= 4 and t.isalpha()]
+                lead_surname = toks[-1] if toks else ""
+            for t in re.split(r"[,\s]+", name):
+                if len(t) >= 5 and t.lower() not in ("group", "ring", "network", "apparatus"):
+                    needles.append(t)
+            if lead_surname:
+                needles.append(lead_surname)
+            for c in batch:
+                txt = (c.text or "").lower()
+                if any(n.lower() in txt for n in needles):
+                    if c.chunk_id not in e["cids"]:
+                        e["cids"].append(c.chunk_id)
+    out = []
+    for e in entries.values():
+        cids = e["cids"][:3]
+        label = e["name"]
+        detail = "; ".join([p for p in (
+            (f"led by {e['leader']}" if e["leader"] else ""), e["note"]) if p])
+        text = f"{label} — {detail}" if detail else label
+        out.append(GroundedClaim(
+            claim=V9Claim(text=text[:200], confidence="medium", requires_citation=True),
+            status="grounded" if cids else "weak", citation_chunk_ids=cids,
+        ))
+    out.sort(key=lambda gc: 0 if gc.citation_chunk_ids else 1)
+    if verbose:
+        print(f"  [V14] group-roster assembled: {len(out)} networks "
+              f"({sum(1 for gc in out if gc.citation_chunk_ids)} cited)", file=sys.stderr)
+    return out
+
+
 _FINALIZE_MODEL = os.getenv("V14_FINALIZE_MODEL", "gpt-4.1-mini-2025-04-14")
 _YESNO_RE = re.compile(r"^\s*(did|does|do|was|were|is|are|has|have|had|can|could|would|should|will)\b", re.IGNORECASE)
 
