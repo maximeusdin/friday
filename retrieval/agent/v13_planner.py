@@ -73,6 +73,41 @@ COVERAGE_MAX_COLLECTIONS = int(os.getenv("V14_COVERAGE_MAX_COLLECTIONS", "12"))
 # lesson) — count is served better by v13's multi-anchor intersection.
 _COVERAGE_INTENTS = {"roster", "list", "enumerate"}
 
+# Generic espionage/category nouns that are NOT a distinctive scope (used to tell an OPEN roster
+# — "which journalists were spies" — from a SCOPED one — "the Silvermaster ring", "ENORMOZ
+# traffic"). A scope anchor is a distinctive proper noun beyond these + the enumeration target.
+_ROSTER_GENERIC_WORDS = {
+    "soviet", "agent", "agents", "spy", "spies", "espionage", "traffic", "source", "sources",
+    "asset", "assets", "contact", "contacts", "operative", "operatives", "member", "members",
+    "network", "networks", "ring", "rings", "group", "groups", "cell", "apparatus", "people",
+    "person", "intelligence", "communist", "american", "russian", "recruited", "named",
+    "journalist", "journalists", "engineer", "engineers", "scientist", "scientists",
+    "official", "officials", "diplomat", "diplomats", "employee", "employees",
+}
+
+
+def _roster_scope_anchors(plan) -> List[str]:
+    """Distinctive proper-noun anchors that SCOPE a roster to a specific ring/operation/traffic
+    (e.g. "Silvermaster", "ENORMOZ", "Perlo") — as opposed to an OPEN roster whose only anchor is
+    a generic category. Returns [] for open rosters (keep corpus-wide breadth), non-empty for
+    scoped rosters (focus retrieval on the scope). Generalizable: any specific named subject.
+    """
+    if not plan:
+        return []
+    tgt = (plan.get("enumeration_target") or "").strip().lower()
+    syns = {str(s).strip().lower() for s in (plan.get("target_synonyms") or [])}
+    out = []
+    for a in (plan.get("anchors") or []):
+        a = str(a).strip()
+        al = a.lower()
+        if len(a) < 4 or al in _FRAMING or al in _ROSTER_GENERIC_WORDS or al == tgt or al in syns:
+            continue
+        # proper-noun-like: has an uppercase letter (ENORMOZ, Silvermaster) — a real named scope
+        if any(ch.isupper() for ch in a):
+            out.append(a)
+    return out
+
+
 _PLANNER_SYS = (
     "You convert a researcher's natural-language question about a historical intelligence "
     "archive (Venona, Vassiliev notebooks, FBI files) into a RETRIEVAL PLAN. The archive is "
@@ -265,9 +300,17 @@ def prime_workspace(
     # Coverage-first mode: only for roster/count/aggregation intents (breadth is the goal
     # there). The expand hop is redundant with coverage, so drop it to control cost.
     intent = (plan.get("intent") or "lookup").lower()
-    coverage_mode = coverage and intent in _COVERAGE_INTENTS
+    # Coverage-first (corpus-wide spread) is right for an OPEN roster ("which journalists were
+    # spies") but WRONG for a SCOPED one ("ENORMOZ traffic", "Silvermaster ring"): spreading
+    # across every collection dilutes the scope with unrelated agents. For scoped rosters, fall
+    # back to focused anchor retrieval so the evidence stays on-scope.
+    _scope_anchors = _roster_scope_anchors(plan)
+    coverage_mode = coverage and intent in _COVERAGE_INTENTS and not _scope_anchors
     if coverage_mode:
         expand_hop = False
+    if _scope_anchors and verbose and intent in _COVERAGE_INTENTS:
+        print(f"  [V14] scoped roster (anchors={_scope_anchors}) -> focused retrieval, "
+              f"coverage disabled", file=sys.stderr)
 
     result_sets: List[List[int]] = []
     rare_flags: List[bool] = []
@@ -452,6 +495,14 @@ def prime_workspace(
     except Exception as e:
         if verbose:
             print(f"  [V13] prime entity extraction failed: {e}", file=sys.stderr)
+
+    # Bridge codenames that appear in the primed evidence to their real people (unambiguous
+    # only) so the summarizer/synthesis names them, not just the post-hoc finalize.
+    try:
+        _seed_codenames_from_evidence(conn, workspace, fetched, plan, verbose=verbose)
+    except Exception as e:
+        if verbose:
+            print(f"  [V13] prime codename seeding failed: {e}", file=sys.stderr)
 
     summarized = 0
     if fetched:
@@ -787,6 +838,54 @@ def _seed_entity_aliases(conn, workspace, entities: List[str], *, verbose: bool 
         print(f"  [V13] seeded {seeded} entity alias record(s) for {names}", file=sys.stderr)
 
 
+def _seed_codenames_from_evidence(conn, workspace, fetched, plan, *, verbose: bool = False) -> None:
+    """Bridge codenames PRESENT in the primed evidence to their real people and merge them into
+    the workspace, so the main summarizer/synthesis (not just the post-hoc finalize) names the
+    real person. Only UNAMBIGUOUS resolutions are seeded (after corroboration-narrowing), so an
+    ambiguous codename (Liberal -> two people) is left for the finalize step to disambiguate.
+    Generalizable: any codename the archive concordance resolves and the evidence corroborates.
+    """
+    from retrieval.agent.v9_workspace import merge_entities
+    try:
+        codenames = resolve_codenames_in_evidence(
+            conn, fetched, query_terms=(plan.get("entities") or []) + (plan.get("anchors") or []))
+    except Exception:
+        return
+    unambig = {s: c[0] for s, c in codenames.items() if len(c) == 1}
+    if not unambig:
+        return
+    seeded = 0
+    for surface, canonical in list(unambig.items())[:12]:
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT e.id, e.canonical_name,
+                           array_agg(DISTINCT ea.alias) FILTER (WHERE ea.alias IS NOT NULL)
+                    FROM entities e
+                    LEFT JOIN entity_aliases ea ON ea.entity_id = e.id
+                    WHERE e.canonical_name = %s AND e.entity_type = 'person'
+                    GROUP BY e.id, e.canonical_name
+                    ORDER BY COALESCE(array_length(array_agg(DISTINCT ea.alias), 1), 0) DESC
+                    LIMIT 1
+                """, (canonical,))
+                row = cur.fetchone()
+        except Exception:
+            try: conn.rollback()
+            except Exception: pass
+            continue
+        if not row:
+            continue
+        eid, canon, aliases = row
+        al = [a for a in (aliases or []) if a and len(a) >= 2]
+        if surface not in al:
+            al = [surface] + al
+        merge_entities(workspace, [WorkspaceEntity(entity_id=eid, canonical_name=canon, aliases=al[:24])])
+        seeded += 1
+    if verbose and seeded:
+        print(f"  [V13] seeded {seeded} evidence codename bridge(s): "
+              + ", ".join(f"{s}->{c}" for s, c in list(unambig.items())[:6]), file=sys.stderr)
+
+
 def _load_catalog(conn, chunk_ids: List[int]) -> List[CatalogHit]:
     if not chunk_ids:
         return []
@@ -947,7 +1046,8 @@ def apply_anti_false_negative(result, workspace, *, verbose: bool = False) -> No
 _ROSTER_MODEL = os.getenv("V14_ROSTER_MODEL", "gpt-4.1-mini-2025-04-14")
 
 
-def assemble_roster(conn, workspace, target: str, *, verbose: bool = False):
+def assemble_roster(conn, workspace, target: str, *, question: str = "", plan=None,
+                    verbose: bool = False):
     """Enumerate distinct target-people (e.g. journalists) from the corpus-wide FETCHED
     CHUNKS into roster entries with citations.
 
@@ -956,6 +1056,12 @@ def assemble_roster(conn, workspace, target: str, *, verbose: bool = False):
     across the whole fetched set. Citations are attributed deterministically (a chunk cites
     an entry only if its text actually contains the name/codename). Bounded to a few
     gpt-4.1-mini calls; only runs for roster intent, where breadth is the whole point.
+
+    When the question names a SPECIFIC scope (a ring/operation/traffic, e.g. "Silvermaster
+    ring", "ENORMOZ traffic"), the roster is constrained to people the passages connect to
+    that scope — so a scoped roster ("who was in the Silvermaster ring") does not over-broaden
+    into every Soviet agent in the corpus. Open rosters ("which journalists were spies") keep
+    full breadth.
     """
     from retrieval.agent.v9_types import GroundedClaim, V9Claim
     from retrieval.agent.v9_workspace import build_alias_context_for_summarizer
@@ -975,7 +1081,55 @@ def assemble_roster(conn, workspace, target: str, *, verbose: bool = False):
     for coll, cs in _by.items():
         chunks.extend(cs[:_ROSTER_PER_COLL])
     tgt = (target or "person").strip() or "person"
+    # Scope anchors: distinctive tokens in the question (ENORMOZ, Silvermaster, a ring/operation)
+    # that are NOT the generic target noun. When present, this is a SCOPED roster — prioritise the
+    # chunks that actually mention the scope and tell the model to keep only people tied to it, so
+    # a scoped roster ("Silvermaster ring", "ENORMOZ traffic") does not over-broaden corpus-wide.
+    scope_anchors = []
+    for a in ((plan or {}).get("anchors") or []):
+        a = str(a).strip()
+        al = a.lower()
+        if (len(a) >= 4 and al not in _FRAMING and al != tgt.lower()
+                and al not in {"soviet", "agent", "agents", "spy", "espionage", "traffic"}):
+            scope_anchors.append(a)
+    if scope_anchors:
+        _sa = [s.lower() for s in scope_anchors]
+        _hit = [c for c in chunks if any(s in (c.text or "").lower() for s in _sa)]
+        # Only treat as scoped if the scope actually appears in the evidence (else keep breadth).
+        if len(_hit) >= 3:
+            _miss = [c for c in chunks if c not in _hit]
+            chunks = _hit + _miss  # scope-matching chunks read first; rest retained for context
     alias_ctx = build_alias_context_for_summarizer(workspace)
+    # Codename key from the roster evidence so CHARLES->Fuchs, MLAD->Hall, etc. resolve to real
+    # people. Generalizable — the same concordance bridge used by grounded_finalize.
+    try:
+        codekey = _codename_key_text(resolve_codenames_in_evidence(conn, chunks))
+    except Exception:
+        codekey = ""
+    # A GENERIC espionage target ("agent", "source", "spy", "member", "person") means "enumerate
+    # every Soviet-linked person"; a SPECIFIC role ("journalist", "engineer", "scientist") also
+    # requires the person to hold that role. This replaces the old journalist-hardcoded prompt so
+    # the roster works for any category (atomic agents, engineers, diplomats, ...).
+    _GENERIC_TGT = {"person", "people", "agent", "agents", "source", "sources", "spy", "spies",
+                    "asset", "assets", "contact", "contacts", "operative", "operatives",
+                    "member", "members", "figure", "figures", "individual", "individuals",
+                    "soviet agent", "soviet agents", "soviet spy", "soviet source"}
+    tgt_generic = tgt.lower() in _GENERIC_TGT
+    if tgt_generic:
+        role_rule = ("Extract every distinct person the passages describe as a Soviet spy, agent, "
+                     "source, contact, operative, or intelligence asset.")
+    else:
+        role_rule = (f"Extract every distinct person the passages describe as a {tgt} AND as a "
+                     f"Soviet spy, agent, source, contact, or asset. Only include people the text "
+                     f"actually presents as a {tgt}.")
+    # Scoped roster: require each person to be tied to the specific subject of the question, so a
+    # named-ring/operation roster stays focused (drops corpus-wide Soviet agents unrelated to it).
+    if scope_anchors and _hit and len(_hit) >= 3:
+        scope_desc = question.strip() or (", ".join(scope_anchors))
+        role_rule += (f" IMPORTANT SCOPE: include ONLY people the passages specifically connect to "
+                      f"the subject of this question — \"{scope_desc}\". A person merely described "
+                      f"as a Soviet agent elsewhere, with no tie to this specific "
+                      f"{'/'.join(scope_anchors[:3])}, must be EXCLUDED.")
     from openai import OpenAI
     client = OpenAI(api_key=api_key)
 
@@ -993,12 +1147,13 @@ def assemble_roster(conn, workspace, target: str, *, verbose: bool = False):
                 response_format={"type": "json_object"},
                 messages=[
                     {"role": "system", "content": (
-                        f"Extract every distinct person who is a {tgt} (journalist/correspondent/"
-                        f"editor/reporter/press figure) AND is described as a Soviet spy, agent, "
-                        f"source, contact, or intelligence asset. Convert codenames to real names "
-                        f"using the identity key when possible. Only include people the text actually "
-                        f"describes as a {tgt}. Do NOT invent. If none, return an empty list.\n"
-                        f"{alias_ctx}\n"
+                        f"{role_rule} Convert codenames to real names using the CODENAME KEY and "
+                        f"identity key; keep the codename in the 'codename' field. If a person "
+                        f"appears only under a codename absent from the key, keep the codename as "
+                        f"the name (do not invent a real name). Do NOT invent people. If none, "
+                        f"return an empty list.\n"
+                        + (codekey + "\n" if codekey else "")
+                        + f"{alias_ctx}\n"
                         f'Return JSON {{"people":[{{"real_name":"","codename":"","role":""}}]}}.')},
                     {"role": "user", "content": doc_text},
                 ],
@@ -1090,6 +1245,99 @@ def _excerpt(text: str, needles: List[str], width: int = 1100) -> str:
     return t[start:start + width].strip()
 
 
+def resolve_codenames_in_evidence(conn, chunks, query_terms=None, *, cap: int = 30):
+    """Resolve codename surfaces PRESENT in the retrieved evidence against entity_aliases.
+
+    Returns {surface: [canonical_names]} — the codename->real-person key that synthesis needs.
+    Deterministic (DB lookup), generalizable (any codename in the evidence). Only considers
+    codename-like surfaces (ALL-CAPS tokens, quoted names) plus the query's own terms, so
+    ordinary words that happen to be aliases don't get resolved. Ambiguous codenames (e.g.
+    "Liberal" -> Rosenberg AND Frank Palmer) return all candidates so synthesis can disambiguate
+    instead of committing to the first hit.
+    """
+    surfaces = set()
+    for t in (query_terms or []):
+        t = str(t).strip()
+        if 2 < len(t) < 30:
+            surfaces.add(t)
+    for c in chunks:
+        txt = c.text or ""
+        # quoted proper names ("Liberal", "Sound") and ALL-CAPS codenames (CHARLES, ENORMOZ)
+        for m in re.findall(r'[""“]([A-Z][A-Za-z\'\-\. ]{2,22})[""”]', txt):
+            surfaces.add(m.strip())
+        for m in re.findall(r'\b([A-Z][A-Z\'\-]{2,15})\b', txt):
+            surfaces.add(m.strip())
+    surfaces = {s for s in surfaces if 2 < len(s) < 30}
+    if not surfaces:
+        return {}
+    norms = list({s.lower() for s in surfaces})
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT lower(ea.alias) AS a, e.canonical_name
+                FROM entity_aliases ea
+                JOIN entities e ON e.id = ea.entity_id
+                WHERE lower(ea.alias) = ANY(%s)
+                  AND COALESCE(ea.is_matchable, true)
+                  AND e.entity_type = 'person'
+                  AND length(e.canonical_name) BETWEEN 3 AND 45
+                  AND e.canonical_name !~ '[0-9;]'
+            """, (norms,))
+            rows = cur.fetchall()
+    except Exception:
+        try: conn.rollback()
+        except Exception: pass
+        return {}
+    # surface(lower) -> ordered distinct canonical names (skip self-referential canon==surface)
+    by_surface: Dict[str, List[str]] = {}
+    surf_display = {s.lower(): s for s in surfaces}
+    for a, canon in rows:
+        canon = (canon or "").strip()
+        if not canon or canon.lower() == a:
+            continue
+        by_surface.setdefault(a, [])
+        if canon not in by_surface[a]:
+            by_surface[a].append(canon)
+    # Corroboration-based disambiguation: when one codename maps to several people, prefer the
+    # candidate(s) whose surname is actually attested in the retrieved evidence. This resolves
+    # noisy multi-mappings deterministically (e.g. "Liberal" -> Rosenberg/Palmer/"Man Behind":
+    # only Rosenberg's surname appears in the pulled chunks) without guessing. Generalizable —
+    # a candidate that no passage corroborates is dropped in favour of one that is.
+    blob = " ".join((c.text or "") for c in chunks).lower()
+    def _surname(name: str) -> str:
+        toks = [t for t in re.split(r"[,\s]+", name) if len(t) >= 4 and t.isalpha()]
+        return (toks[-1] if toks else "").lower()
+    out = {}
+    for a, canons in by_surface.items():
+        if len(canons) > 1:
+            attested = [c for c in canons if _surname(c) and _surname(c) in blob]
+            if attested:
+                canons = attested  # narrow to candidates the evidence actually supports
+        if canons:
+            out[surf_display.get(a, a)] = canons[:4]
+    # prefer codenames that actually appear in the evidence text (cap)
+    return dict(list(out.items())[:cap])
+
+
+def _codename_key_text(codenames: Dict[str, List[str]]) -> str:
+    """Render the codename->canonical key for the synthesis prompt, flagging ambiguity."""
+    if not codenames:
+        return ""
+    lines = []
+    for surf, canons in codenames.items():
+        # collapse duplicate-name entities (Jacob Golos x3) to distinct names
+        seen, distinct = set(), []
+        for c in canons:
+            key = c.lower().replace(",", "").replace(" ", "")
+            if key not in seen:
+                seen.add(key); distinct.append(c)
+        if len(distinct) == 1:
+            lines.append(f"  {surf} = {distinct[0]}")
+        else:
+            lines.append(f"  {surf} = {' OR '.join(distinct)}  [AMBIGUOUS — disambiguate by date/context, do not guess]")
+    return "CODENAME KEY (from the archive concordance — use these to name real people; a codename may refer to different people in different years):\n" + "\n".join(lines)
+
+
 def grounded_finalize(conn, result, workspace, plan, question: str, *, verbose: bool = False) -> bool:
     """Answer-faithfulness pass (v14): read the ACTUAL answer-bearing passages and answer the
     question directly and faithfully — fixing (a) needles the main synthesis had but omitted,
@@ -1111,12 +1359,20 @@ def grounded_finalize(conn, result, workspace, plan, question: str, *, verbose: 
         lbl = f"{src} {c.page or ''}".strip()
         label[c.chunk_id] = lbl
         passages.append(f"[chunk {c.chunk_id} | {lbl}]\n{_excerpt(c.text, needles)}")
+    # Resolve codenames present in the evidence (+ the query's own terms) so the model can
+    # name real people instead of restating codenames or guessing.
+    codenames = resolve_codenames_in_evidence(
+        conn, chunks, query_terms=(plan.get("entities") or []) + (plan.get("anchors") or []))
+    codekey = _codename_key_text(codenames)
+    if verbose and codenames:
+        print(f"  [V14] grounded_finalize codename key: "
+              + "; ".join(f"{k}={'/'.join(v)}" for k, v in list(codenames.items())[:8]), file=sys.stderr)
     is_yesno = bool(_YESNO_RE.match(question or ""))
     try:
         from openai import OpenAI
         client = OpenAI(api_key=api_key)
         r = client.chat.completions.create(
-            model=_FINALIZE_MODEL, temperature=0.0, max_completion_tokens=900,
+            model=_FINALIZE_MODEL, temperature=0.0, max_completion_tokens=1000,
             response_format={"type": "json_object"},
             messages=[
                 {"role": "system", "content": (
@@ -1127,11 +1383,31 @@ def grounded_finalize(conn, result, workspace, plan, question: str, *, verbose: 
                     "(3) A failed/unsuccessful action still counts: 'a search that found nothing' "
                     "still means a search WAS conducted; 'they looked but didn't find him' = yes, "
                     "they looked. (4) Assert ONLY what a passage supports and cite the [chunk N] "
-                    "id(s). (5) If the passages genuinely don't address the question, say so and "
-                    'set verdict "insufficient". Do not invent. Return JSON '
+                    "id(s). (5) USE THE CODENAME KEY (it is AUTHORITATIVE — it comes from the "
+                    "archive's own concordance): when a passage refers to a person by a "
+                    "codename, name the real person from the key. If the key gives exactly ONE "
+                    "real name for the codename the question asks about, STATE that identification "
+                    "as your answer even when that real name does not appear verbatim in the "
+                    "passages — cite the passage(s) that use the codename. When a codename is marked "
+                    "AMBIGUOUS, actively DISAMBIGUATE: take the concrete profile in the passages "
+                    "(birth year, recruitment date, recruiter, tradecraft, the agents they "
+                    "handled) and pick the ONE key candidate that profile matches — for this "
+                    "matching step ONLY you may use well-known historical facts about the "
+                    "candidates (e.g. which of them was the radar/atomic spy, which was a "
+                    "journalist), then briefly state the basis. Do NOT add other outside facts to "
+                    "the answer, and do NOT invent a name for a codename absent from the key. "
+                    "Report the ambiguity unresolved only if the passages truly do not "
+                    "distinguish the candidates; do NOT answer 'insufficient' merely because the "
+                    "key lists more than one name. (6) VERDICT: for a yes/no question use yes/no/"
+                    "partly. For a 'who/which/identify' question use \"yes\" when the passages or "
+                    "the key let you name/answer it, \"partly\" if only partially; reserve "
+                    '"insufficient" for when neither passages nor key support ANY answer. '
+                    "Do not invent. Return JSON "
                     '{"verdict":"yes|no|partly|insufficient","answer":"1-3 sentences","findings":'
                     '[{"text":"one fact","chunk_ids":[N]}]}.')},
-                {"role": "user", "content": f"Question: {question}\n\nPassages:\n" + "\n\n".join(passages)},
+                {"role": "user", "content":
+                    (codekey + "\n\n" if codekey else "") +
+                    f"Question: {question}\n\nPassages:\n" + "\n\n".join(passages)},
             ],
         )
         data = json.loads(r.choices[0].message.content or "{}")

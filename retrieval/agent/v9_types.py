@@ -1224,6 +1224,15 @@ class V9Result:
             pattern = _re.compile(r'\b' + _re.escape(alias) + r'\b', _re.IGNORECASE)
             match = pattern.search(result)
             if match:
+                # Guard: a mixed-case alias that is a person's FIRST name (immediately followed by
+                # a capitalized surname) is part of a real name, not a standalone codename — do not
+                # expand it, or "Jacob Golos" wrongly becomes "Jacob (William Perl) Golos". ALL-CAPS
+                # occurrences are unmistakable codenames and are always expanded.
+                matched_text = match.group()
+                if not matched_text.isupper():
+                    after = result[match.end():match.end() + 30]
+                    if _re.match(r'\s+[A-Z][a-z]', after):
+                        continue
                 # Don't expand if canonical is already nearby (within 50 chars)
                 start = max(0, match.start() - 50)
                 end = min(len(result), match.end() + 50)

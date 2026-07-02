@@ -1269,20 +1269,32 @@ def run_v11_query(
 
     # V14: for roster/list intents, assemble a corpus-wide roster from the evidence bullets
     # instead of relying on the truncation-prone full synthesis (which cherry-picks 2-3 names).
+    # EXCEPT when the target is a GROUP (network/ring/apparatus): the person-enumerator is the
+    # wrong tool — the question wants named groups, which the synthesis narrative supplies — so
+    # leave the synthesis in place rather than replacing it with a list of individuals.
+    _GROUP_TARGETS = {"network", "networks", "ring", "rings", "group", "groups", "apparatus",
+                      "cell", "cells", "organization", "organizations", "organisation",
+                      "organisations", "operation", "operations"}
     if _v14 and _v13_plan and (_v13_plan.get("intent") in ("roster", "list", "enumerate")):
-        try:
-            from retrieval.agent.v13_planner import assemble_roster
-            tgt = _v13_plan.get("enumeration_target") or "person"
-            roster_claims = assemble_roster(conn, workspace, tgt, verbose=verbose)
-            if len(roster_claims) >= 3:  # only override when we actually enumerated a roster
-                result.claims = roster_claims
-                summary = f"Identified {len(roster_claims)} {tgt} linked to Soviet intelligence across the corpus."
-                result.narrative = summary
-                if result.synthesis:
-                    result.synthesis.narrative = summary
-        except Exception as _re:
+        tgt = _v13_plan.get("enumeration_target") or "person"
+        if tgt.strip().lower() in _GROUP_TARGETS:
             if verbose:
-                print(f"  [V14] roster assembly failed (non-fatal): {_re}", file=sys.stderr)
+                print(f"  [V14] group-target roster ('{tgt}') -> keep synthesis narrative "
+                      f"(named groups), skip person-roster", file=sys.stderr)
+        else:
+            try:
+                from retrieval.agent.v13_planner import assemble_roster
+                roster_claims = assemble_roster(conn, workspace, tgt, question=clean_question,
+                                                plan=_v13_plan, verbose=verbose)
+                if len(roster_claims) >= 3:  # only override when we actually enumerated a roster
+                    result.claims = roster_claims
+                    summary = f"Identified {len(roster_claims)} {tgt} linked to Soviet intelligence across the corpus."
+                    result.narrative = summary
+                    if result.synthesis:
+                        result.synthesis.narrative = summary
+            except Exception as _re:
+                if verbose:
+                    print(f"  [V14] roster assembly failed (non-fatal): {_re}", file=sys.stderr)
 
     # V13: never let "not retrieved" become a confident "no evidence exists".
     if _v13:
