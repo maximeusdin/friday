@@ -1290,8 +1290,20 @@ def run_v11_query(
                     result.claims = roster_claims
                     summary = f"Identified {len(roster_claims)} {tgt} linked to Soviet intelligence across the corpus."
                     result.narrative = summary
+                    # Drop the stale synthesis artifact/roster so format_answer doesn't render a
+                    # leftover "Members identified"/"Timeline" block (with the officers/codenames the
+                    # grounded roster just filtered out) alongside the clean roster.
+                    try:
+                        result.grounded_roster = []
+                    except Exception:
+                        pass
                     if result.synthesis:
                         result.synthesis.narrative = summary
+                        if hasattr(result.synthesis, "artifact"):
+                            try:
+                                result.synthesis.artifact = {}
+                            except Exception:
+                                pass
             except Exception as _re:
                 if verbose:
                     print(f"  [V14] roster assembly failed (non-fatal): {_re}", file=sys.stderr)

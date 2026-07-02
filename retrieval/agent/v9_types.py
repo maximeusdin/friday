@@ -14,6 +14,15 @@ from dataclasses import dataclass, field
 from typing import List, Dict, Any, Optional, Set
 
 
+# Topic/operation cover-words that are never real people. They get mis-linked to common nouns in
+# the concordance (e.g. an entity 'Balloon' with alias 'Atomic') and, if used to gloss output,
+# produce garbage like "atomic (Balloon)". Never expand these as identities.
+_NON_PERSON_GLOSS_TOKENS = {
+    "balloon", "ballon", "atomic", "enormous", "enormoz", "uranium", "bomb", "plutonium",
+    "tube", "corporation", "bank", "project", "operation",
+}
+
+
 # =============================================================================
 # Bullet ID utilities (canonical, single source of truth)
 # =============================================================================
@@ -1075,6 +1084,13 @@ class V9Result:
         for e in self.workspace.entities:
             if not self._is_valid_entity_for_linking(e.canonical_name):
                 continue
+            # Skip non-person entities and topic/operation cover-words: these are never real
+            # people and glossing them produces garbage like "atomic (Balloon)".
+            etype = (getattr(e, "entity_type", None) or "").lower()
+            if etype and etype not in ("person", "people"):
+                continue
+            if e.canonical_name.lower() in _NON_PERSON_GLOSS_TOKENS:
+                continue
             valid_entities.append(e)
             canonical_names_lower.add(e.canonical_name.lower())
 
@@ -1090,6 +1106,8 @@ class V9Result:
                 key = alias.lower()
                 if key == target.lower():
                     continue  # skip self-mapping
+                if key in _NON_PERSON_GLOSS_TOKENS:
+                    continue  # never gloss a common topic/cover word ("Atomic" -> "Balloon")
                 claims.setdefault(key, []).append((target, alias, e))
 
         # ------------------------------------------------------------------

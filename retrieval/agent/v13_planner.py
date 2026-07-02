@@ -1212,6 +1212,21 @@ def assemble_roster(conn, workspace, target: str, *, question: str = "", plan=No
         role_rule = (f"Extract every distinct person the passages describe as a {tgt} AND as a "
                      f"Soviet spy, agent, source, contact, or asset. Only include people the text "
                      f"actually presents as a {tgt}.")
+    # GROUNDING RULES (all rosters): keep the list to the recruited network, faithful to the
+    # passages — this is what fixes the "handlers/targets miscast as agents" and "asserts people
+    # from background knowledge" failures. Generalizable across any roster category.
+    grounding_rules = (
+        " GROUNDING RULES: (a) KEEP anyone the passages show ACTING AS AN AGENT — recruited as a "
+        "source/member, or who PROVIDED, PASSED, PHOTOGRAPHED, STOLE, or supplied material/"
+        "information. EXCLUDE people described SOLELY as their Soviet handlers/case officers/"
+        "rezidents/intelligence-officer staff who only RAN, SUPERVISED, or RECEIVED from others "
+        "(e.g. NKVD/GRU officers, station chiefs, the Moscow Center), UNLESS the question asks for "
+        "handlers/officers. When in doubt (a person both provided material AND ran others), KEEP "
+        "them. (b) EXCLUDE people only TARGETED, approached, proposed, or cultivated for "
+        "recruitment whom the passages do NOT confirm actually became agents/sources. (c) Every "
+        "person must be supported by a passage tying them to Soviet intelligence; do NOT add "
+        "well-known figures from your own background knowledge.")
+    role_rule += grounding_rules
     # Scoped roster: require each person to be tied to the specific subject of the question, so a
     # named-ring/operation roster stays focused (drops corpus-wide Soviet agents unrelated to it).
     if scope_anchors and _hit and len(_hit) >= 3:
@@ -1219,7 +1234,10 @@ def assemble_roster(conn, workspace, target: str, *, question: str = "", plan=No
         role_rule += (f" IMPORTANT SCOPE: include ONLY people the passages specifically connect to "
                       f"the subject of this question — \"{scope_desc}\". A person merely described "
                       f"as a Soviet agent elsewhere, with no tie to this specific "
-                      f"{'/'.join(scope_anchors[:3])}, must be EXCLUDED.")
+                      f"{'/'.join(scope_anchors[:3])}, must be EXCLUDED. If a passage places a "
+                      f"person in a DIFFERENT named ring/group/network (e.g. the Ware group, the "
+                      f"Silvermaster group, the Rosenberg ring) than the one asked about, EXCLUDE "
+                      f"them — do NOT merge separate rings together.")
     from openai import OpenAI
     client = OpenAI(api_key=api_key)
 
@@ -1267,8 +1285,16 @@ def assemble_roster(conn, workspace, target: str, *, question: str = "", plan=No
                 e["code"] = code
             if role and not e["role"]:
                 e["role"] = role
-            # Deterministic citation: cite batch chunks whose text mentions the name/codename.
+            # Deterministic citation: cite batch chunks whose text mentions the name/codename OR
+            # the person's surname (so a true member the passage cites by surname/codename is not
+            # demoted to "Unverified" while a full-name distractor is asserted — the NT4 inversion).
             needles = [n for n in (name, code) if n and len(n) >= 3]
+            surname = ""
+            if name:
+                toks = [t for t in re.split(r"[,\s]+", name) if len(t) >= 4 and t.isalpha()]
+                surname = toks[-1] if toks else ""
+            if surname and surname.lower() not in {n.lower() for n in needles}:
+                needles.append(surname)
             for c in batch:
                 txt = (c.text or "").lower()
                 if any(n.lower() in txt for n in needles):
