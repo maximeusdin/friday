@@ -349,6 +349,15 @@ def prime_workspace(
                               "anchors": plan.get("anchors"),
                           })
 
+    # Resolve codenames NAMED IN THE QUERY to their real person and inject the real name into the
+    # plan, so retrieval reaches the right person's collection (not a same-codename decoy). Must
+    # run BEFORE query construction + alias seeding so both pick up the resolved names.
+    try:
+        _resolve_query_codenames(conn, plan, workspace.question, verbose=verbose)
+    except Exception as _ce:
+        if verbose:
+            print(f"  [V13] query codename resolution failed: {_ce}", file=sys.stderr)
+
     # Seed the query entities' codenames/aliases so the summarizer + synthesis can bridge
     # canonical<->codename (Golos<->Sound, Rabinovich<->Harry) when the evidence text only
     # uses the codename. Without this the model reads "500-600 meetings with Sound" and
@@ -793,6 +802,87 @@ def _true_lexical_count(conn, term: str, cols) -> int:
         try: conn.rollback()
         except Exception: pass
         return 10**9  # treat as too-common on error (skip sweep)
+
+
+_CODENAME_CUE_RE = re.compile(
+    r"(?:codenamed?|cover[- ]?name|cover|alias(?:es)?|called|known as)\s+"
+    r"['\"“]?([A-Z][A-Za-z'’\-]{2,20})", re.IGNORECASE)
+
+
+def _resolve_query_codenames(conn, plan, question: str, *, verbose: bool = False) -> Dict[str, str]:
+    """Resolve codenames NAMED IN THE QUERY to their real person via the concordance, and inject
+    the real name into the retrieval plan (entities + a query) so retrieval reaches the RIGHT
+    person's collection instead of tunneling onto a decoy.
+
+    This fixes the "confident wrong entity" trap for codename lookups (e.g. "who was codenamed
+    'Liberal'"): without the real name in the retrieval, the loop may reach only a same-codename
+    decoy (the 1930s journalist 'Liberal' = Frank Palmer) and never the dominant referent (Julius
+    Rosenberg). We pick the DOMINANT referent (the person for whom this codename is one of the
+    richest-attested aliases) — the sensible default for "who was codename X". The evidence-time
+    resolver + grounded_finalize still disambiguate by profile as a safety net.
+    """
+    # Candidate codename surfaces: cue-marked ('codenamed X', "cover name X"), quoted names, and
+    # ALL-CAPS / single-Capitalized plan entities+anchors. Require a CUE or quotes or ALL-CAPS so
+    # ordinary words aren't resolved.
+    surfaces = set()
+    q = question or ""
+    for m in _CODENAME_CUE_RE.finditer(q):
+        surfaces.add(m.group(1).strip())
+    for m in re.findall(r"['\"“]([A-Z][A-Za-z'’\-]{2,20})['\"”]", q):
+        surfaces.add(m.strip())
+    for a in (plan.get("entities") or []) + (plan.get("anchors") or []):
+        a = str(a).strip()
+        if a.isupper() and 2 < len(a) < 20 and a.isalpha():
+            surfaces.add(a)
+    surfaces = {s for s in surfaces if 2 < len(s) < 22 and s.lower() not in _FRAMING}
+    if not surfaces:
+        return {}
+    resolved: Dict[str, str] = {}
+    for surface in list(surfaces)[:3]:
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT e.canonical_name, count(DISTINCT ea2.alias) AS naliases
+                    FROM entity_aliases ea
+                    JOIN entities e ON e.id = ea.entity_id
+                    LEFT JOIN entity_aliases ea2 ON ea2.entity_id = e.id
+                    WHERE lower(ea.alias) = lower(%s)
+                      AND COALESCE(ea.is_matchable, true)
+                      AND e.entity_type = 'person'
+                      AND length(e.canonical_name) BETWEEN 3 AND 45
+                      AND e.canonical_name !~ '[0-9;]'
+                    GROUP BY e.id, e.canonical_name
+                    ORDER BY naliases DESC
+                    LIMIT 2
+                """, (surface,))
+                rows = cur.fetchall()
+        except Exception:
+            try: conn.rollback()
+            except Exception: pass
+            continue
+        # Need a real codename bearer (>=2 aliases) and skip self-referential (canonical==surface).
+        cands = [(c, n) for c, n in rows if c and c.lower() != surface.lower() and n >= 2]
+        if not cands:
+            continue
+        canon = cands[0][0]
+        resolved[surface] = canon
+    if not resolved:
+        return {}
+    # Inject: add each resolved real name to entities + a codename+realname query so retrieval
+    # reaches that person's material.
+    ents = list(plan.get("entities") or [])
+    qs = list(plan.get("queries") or [])
+    for surface, canon in resolved.items():
+        if canon not in ents:
+            ents.append(canon)
+        surname = canon.split(",")[0].split()[-1] if canon else canon
+        qs.insert(0, f"{surname} {surface}")
+    plan["entities"] = ents
+    plan["queries"] = qs
+    if verbose:
+        print(f"  [V13] query codename(s) resolved -> "
+              + ", ".join(f"{s}={c}" for s, c in resolved.items()), file=sys.stderr)
+    return resolved
 
 
 def _seed_entity_aliases(conn, workspace, entities: List[str], *, verbose: bool = False) -> None:
