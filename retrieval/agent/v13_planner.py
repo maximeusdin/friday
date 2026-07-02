@@ -1049,6 +1049,150 @@ def assemble_roster(conn, workspace, target: str, *, verbose: bool = False):
     return out
 
 
+_FINALIZE_MODEL = os.getenv("V14_FINALIZE_MODEL", "gpt-4.1-mini-2025-04-14")
+_YESNO_RE = re.compile(r"^\s*(did|does|do|was|were|is|are|has|have|had|can|could|would|should|will)\b", re.IGNORECASE)
+
+
+def _answer_bearing_chunks(workspace, plan) -> List:
+    """Fetched chunks whose text actually contains a query entity/anchor — the passages most
+    likely to hold the answer. Ranked by how many distinct anchors they match."""
+    needles = []
+    for e in (plan.get("entities") or []):
+        for tok in re.split(r"[,\s]+", str(e)):
+            if len(tok) >= 4 and tok.lower() not in _FRAMING:
+                needles.append(tok.lower())
+    for a in (plan.get("anchors") or []):
+        a = str(a).strip()
+        if a and len(a) >= 4 and a.lower() not in _FRAMING:
+            needles.append(a.lower())
+    needles = list(dict.fromkeys(needles))
+    if not needles:
+        return []
+    scored = []
+    for c in workspace.fulltext_chunks:
+        txt = (c.text or "").lower()
+        hits = sum(1 for n in needles if n in txt)
+        if hits:
+            scored.append((hits, c))
+    scored.sort(key=lambda x: -x[0])
+    return [c for _, c in scored[:8]]
+
+
+def _excerpt(text: str, needles: List[str], width: int = 1100) -> str:
+    """Window of `text` centred a little before the first needle (so the sentence AFTER the
+    name — often the answer — is included), else the head of the chunk."""
+    t = text or ""
+    if len(t) <= width:
+        return t.strip()
+    low = t.lower()
+    pos = min([low.find(n) for n in needles if n in low] or [0])
+    start = max(0, pos - 250)
+    return t[start:start + width].strip()
+
+
+def grounded_finalize(conn, result, workspace, plan, question: str, *, verbose: bool = False) -> bool:
+    """Answer-faithfulness pass (v14): read the ACTUAL answer-bearing passages and answer the
+    question directly and faithfully — fixing (a) needles the main synthesis had but omitted,
+    and (b) self-contradictions where the answer negates its own evidence ("a search was
+    conducted" -> "no evidence of searches"). Returns True if it replaced the answer.
+    """
+    from retrieval.agent.v9_types import GroundedClaim, V9Claim
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return False
+    chunks = _answer_bearing_chunks(workspace, plan)
+    if not chunks:
+        return False
+    needles = [str(x).lower() for x in ((plan.get("entities") or []) + (plan.get("anchors") or []))]
+    label = {}
+    passages = []
+    for c in chunks:
+        src = (c.source_label or c.collection_slug or "").replace("_", " ").title()
+        lbl = f"{src} {c.page or ''}".strip()
+        label[c.chunk_id] = lbl
+        passages.append(f"[chunk {c.chunk_id} | {lbl}]\n{_excerpt(c.text, needles)}")
+    is_yesno = bool(_YESNO_RE.match(question or ""))
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=api_key)
+        r = client.chat.completions.create(
+            model=_FINALIZE_MODEL, temperature=0.0, max_completion_tokens=900,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": (
+                    "Answer the question STRICTLY from the passages. Rules: "
+                    "(1) Lead with a direct verdict when the question is yes/no. "
+                    "(2) Answer the question AS ASKED — never narrow it with qualifiers it did "
+                    "not contain (e.g. 'immediately', 'active', 'direct evidence of'). "
+                    "(3) A failed/unsuccessful action still counts: 'a search that found nothing' "
+                    "still means a search WAS conducted; 'they looked but didn't find him' = yes, "
+                    "they looked. (4) Assert ONLY what a passage supports and cite the [chunk N] "
+                    "id(s). (5) If the passages genuinely don't address the question, say so and "
+                    'set verdict "insufficient". Do not invent. Return JSON '
+                    '{"verdict":"yes|no|partly|insufficient","answer":"1-3 sentences","findings":'
+                    '[{"text":"one fact","chunk_ids":[N]}]}.')},
+                {"role": "user", "content": f"Question: {question}\n\nPassages:\n" + "\n\n".join(passages)},
+            ],
+        )
+        data = json.loads(r.choices[0].message.content or "{}")
+    except Exception as e:
+        if verbose:
+            print(f"  [V14] grounded_finalize failed: {e}", file=sys.stderr)
+        return False
+
+    verdict = (data.get("verdict") or "").strip().lower()
+    answer = (data.get("answer") or "").strip()
+    valid_ids = {c.chunk_id for c in chunks}
+    claims = []
+    for f in (data.get("findings") or [])[:12]:
+        txt = (f.get("text") or "").strip()
+        if not txt:
+            continue
+        cids = [n for n in (f.get("chunk_ids") or []) if isinstance(n, int) and n in valid_ids][:3]
+        claims.append(GroundedClaim(
+            claim=V9Claim(text=txt[:220], confidence="medium", requires_citation=True),
+            status="grounded" if cids else "weak", citation_chunk_ids=cids,
+        ))
+    # Replace policy: an AFFIRMATIVE verdict must be backed by a cited finding (trustworthy
+    # correction); a NEGATIVE verdict replaces with a clean "No" and its findings carry no
+    # citations (a citation must support an affirmative statement, not a non-mention).
+    if verdict == "insufficient":
+        if verbose:
+            print("  [V14] grounded_finalize: insufficient — kept main answer", file=sys.stderr)
+        return False
+    if verdict in ("yes", "partly") and not any(c.citation_chunk_ids for c in claims):
+        if verbose:
+            print("  [V14] grounded_finalize: affirmative but uncited — kept main answer", file=sys.stderr)
+        return False
+    for c in claims:
+        ctext = getattr(c.claim, "text", "") or ""
+        if _NEGATION_RE.search(ctext) or ctext.lower().lstrip().startswith(("no ", "there is no", "there are no")):
+            c.citation_chunk_ids = []
+            c.status = "weak"
+
+    lead = ""
+    if is_yesno and verdict in ("yes", "no", "partly"):
+        lead = {"yes": "Yes. ", "no": "No. ", "partly": "Partly. "}[verdict]
+    new_narr = (lead + answer).strip()
+    result.claims = claims
+    result.narrative = new_narr
+    # Drop the stale synthesis artifact + roster so format_answer can't render a leftover that
+    # contradicts the corrected answer (e.g. an old "[HUAC p294]: No direct mention..." evidence
+    # line). The verdict + grounded findings are the complete, faithful answer.
+    result.grounded_roster = []
+    if getattr(result, "synthesis", None):
+        result.synthesis.narrative = new_narr
+        for _attr in ("artifact",):
+            if hasattr(result.synthesis, _attr):
+                try:
+                    setattr(result.synthesis, _attr, {})
+                except Exception:
+                    pass
+    if verbose:
+        print(f"  [V14] grounded_finalize: verdict={verdict}, {len(claims)} findings -> replaced answer", file=sys.stderr)
+    return True
+
+
 def run_v13_query(conn, question: str, **kwargs):
     """Convenience wrapper: V11 loop with the V13 profile enabled."""
     from retrieval.agent.v11_runner import run_v11_query

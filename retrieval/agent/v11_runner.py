@@ -1256,6 +1256,17 @@ def run_v11_query(
         investigation_trace=workspace.investigation.trace,
     )
 
+    # V14: answer-faithfulness pass for specific-answer questions — read the actual
+    # answer-bearing passages and answer directly (fixes needles the synthesis omitted and
+    # self-contradictions where the answer negates its own evidence). Skips roster (own path).
+    if _v14 and _v13_plan and _v13_plan.get("intent") not in ("roster", "list", "enumerate"):
+        try:
+            from retrieval.agent.v13_planner import grounded_finalize
+            grounded_finalize(conn, result, workspace, _v13_plan, clean_question, verbose=verbose)
+        except Exception as _fe:
+            if verbose:
+                print(f"  [V14] grounded_finalize failed (non-fatal): {_fe}", file=sys.stderr)
+
     # V14: for roster/list intents, assemble a corpus-wide roster from the evidence bullets
     # instead of relying on the truncation-prone full synthesis (which cherry-picks 2-3 names).
     if _v14 and _v13_plan and (_v13_plan.get("intent") in ("roster", "list", "enumerate")):
