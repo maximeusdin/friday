@@ -690,8 +690,19 @@ def _run_new_retrieval(
     try:
         search_result_set_id = (carry_context or {}).get("search_result_set_id")
 
-        # --- V12 clarification round-trip (optional, in front of V11) ---
-        use_v12 = os.getenv("USE_V12_AGENT", "0").strip().lower() in ("1", "true", "yes")
+        # Chat engine profile (default v14 = v13 planning/priming + coverage-first roster).
+        # Roll back with FRIDAY_CHAT_ENGINE=v13 / v11, or V13_DISABLE=1. Computed here so the
+        # V12 clarifier path below runs the SAME profile as the direct path.
+        _engine = os.getenv("FRIDAY_CHAT_ENGINE", "v14").strip().lower()
+        if os.getenv("V13_DISABLE", "0").strip().lower() in ("1", "true", "yes"):
+            _engine = "v11"
+        _profile = _engine if _engine in ("v11", "v13", "v14") else "v14"
+
+        # --- V12 clarification round-trip (ambiguous-content follow-ups in front of the engine) ---
+        # Default ON: when a cover name in the query maps to >1 real person ("Jurist" = White or
+        # Hiss; "Liberal" = Rosenberg or ...), ask the user which they mean, then run the SAME
+        # engine profile below on the resolved question. Disable with USE_V12_AGENT=0.
+        use_v12 = os.getenv("USE_V12_AGENT", "1").strip().lower() in ("1", "true", "yes")
         if use_v12 and not use_v9_fallback:
             from retrieval.agent.v12_runner import run_v12_query, V12ClarificationPending
             from retrieval.agent.v12_clarifier import ClarificationPlan, ClarificationAnswer
@@ -701,13 +712,17 @@ def _run_new_retrieval(
                 answers = ([ClarificationAnswer.from_dict(a) for a in cc["clarification_answers"]]
                            if cc.get("clarification_answers") is not None else None)
                 plan = ClarificationPlan.from_dict(cc["clarification_plan"]) if cc.get("clarification_plan") else None
+                # Deterministic cover-name ambiguity ("ambiguous content") is ALWAYS on; the
+                # broader LLM intent-questions layer is opt-in (V12_INTENT_LLM=1) so we don't add
+                # an LLM call + over-ask on every query.
                 v12 = run_v12_query(
                     conn, question,
                     clarification_answers=answers, clarification_plan=plan,
-                    use_llm=os.getenv("V12_DISABLE_LLM", "0").strip().lower() not in ("1", "true", "yes"),
+                    use_llm=os.getenv("V12_INTENT_LLM", "0").strip().lower() in ("1", "true", "yes"),
                     max_tool_calls=max_tool_calls, scope=scope, verbose=verbose,
                     progress_callback=progress_callback,
                     use_lightweight_pem=os.getenv("V11_USE_LIGHTWEIGHT_PEM", "0").strip().lower() in ("1", "true", "yes"),
+                    engine_profile=_profile,
                 )
             except Exception as _v12e:
                 # Fail open: a clarifier error must never break chat -> recover the
@@ -721,6 +736,7 @@ def _run_new_retrieval(
                     conn, question, max_tool_calls=max_tool_calls, scope=scope, verbose=verbose,
                     progress_callback=progress_callback,
                     use_lightweight_pem=os.getenv("V11_USE_LIGHTWEIGHT_PEM", "0").strip().lower() in ("1", "true", "yes"),
+                    engine_profile=_profile,
                 )
             if isinstance(v12, V12ClarificationPending):
                 update_run_status(conn, run.run_id, "paused")  # 'paused' is a valid v9_runs.status
@@ -741,13 +757,6 @@ def _run_new_retrieval(
             )
         else:
             from retrieval.agent.v11_runner import run_v11_query
-            # Engine selection: default v14 (v13 + coverage-first retrieval for roster/count).
-            # Roll back with FRIDAY_CHAT_ENGINE=v13 (planning+priming, no coverage) or =v11
-            # (unchanged baseline). V13_DISABLE=1 forces the v11 baseline.
-            _engine = os.getenv("FRIDAY_CHAT_ENGINE", "v14").strip().lower()
-            if os.getenv("V13_DISABLE", "0").strip().lower() in ("1", "true", "yes"):
-                _engine = "v11"
-            _profile = _engine if _engine in ("v11", "v13", "v14") else "v14"
             if verbose:
                 print(f"  [Dispatch] chat engine profile = {_profile}", file=sys.stderr)
             result = run_v11_query(
