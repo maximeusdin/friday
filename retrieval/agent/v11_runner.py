@@ -1319,9 +1319,11 @@ def run_v11_query(
                     result.narrative = summary
                     # Drop the stale synthesis artifact/roster so format_answer doesn't render a
                     # leftover "Members identified"/"Timeline" block (with the officers/codenames the
-                    # grounded roster just filtered out) alongside the clean roster.
+                    # grounded roster just filtered out) alongside the clean roster. Mark the
+                    # summary authoritative so it isn't stamped "draft/unverified".
                     try:
                         result.grounded_roster = []
+                        result._authoritative_narrative = True
                     except Exception:
                         pass
                     if result.synthesis:
