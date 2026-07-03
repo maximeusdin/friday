@@ -99,11 +99,22 @@ def _roster_scope_anchors(plan) -> List[str]:
     out = []
     for a in (plan.get("anchors") or []):
         a = str(a).strip()
-        al = a.lower()
-        if len(a) < 4 or al in _FRAMING or al in _ROSTER_GENERIC_WORDS or al == tgt or al in syns:
+        if len(a) < 4 or a.lower() in _FRAMING:
             continue
-        # proper-noun-like: has an uppercase letter (ENORMOZ, Silvermaster) — a real named scope
-        if any(ch.isupper() for ch in a):
+        # An anchor scopes the roster only if it contains a DISTINCTIVE proper noun — a
+        # capitalized word that is NOT a generic espionage/category word. Check each WORD, so a
+        # generic phrase like "Soviet spies" ("soviet"+"spies", both generic) is NOT mistaken for
+        # a scope (which would wrongly disable coverage-first breadth on an OPEN roster).
+        distinctive = [
+            w for w in re.split(r"[\s/]+", a) if w
+            and any(ch.isupper() for ch in w)
+            and w.lower() not in _ROSTER_GENERIC_WORDS
+            and w.lower() not in _FRAMING
+            and w.lower() != tgt
+            and w.lower() not in syns
+            and len(w) >= 3
+        ]
+        if distinctive:
             out.append(a)
     return out
 
