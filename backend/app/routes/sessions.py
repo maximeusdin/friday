@@ -1,11 +1,13 @@
 """
 Session and Message endpoints
 """
-from typing import List, Optional
+import re
+from typing import List, Optional, Set
 from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from psycopg2.extras import Json
+from psycopg2.errors import UniqueViolation
 
 from app.routes.auth_cognito import require_user
 from app.services.db import get_conn, get_dsn
@@ -31,6 +33,7 @@ class Session(BaseModel):
     message_count: Optional[int] = None
     last_activity: Optional[datetime] = None
     scope_json: Optional[dict] = None
+    output_mode: Optional[str] = "evidence_only"  # evidence_only | evidence_summary | narrative
 
 
 class Message(BaseModel):
@@ -82,9 +85,27 @@ class SessionState(BaseModel):
 # Endpoints
 # =============================================================================
 
+def _next_free_label(label: str, existing: Set[str]) -> str:
+    """Return `label` if unused, else the next available "<base> (N)" (N from 1).
+
+    A trailing " (N)" on the requested label is treated as the base, so re-creating
+    "Report (1)" when "Report" and "Report (1)" exist yields "Report (2)" (not
+    "Report (1) (1)"). Mirrors the familiar Finder/Explorer duplicate-naming behavior.
+    """
+    if label not in existing:
+        return label
+    m = re.match(r"^(.*?)\s*\((\d+)\)$", label)
+    base = (m.group(1).strip() if m else label) or label
+    n = 1
+    while f"{base} ({n})" in existing:
+        n += 1
+    return f"{base} ({n})"
+
+
 @router.post("", response_model=Session)
 def create_session(req: CreateSessionRequest, user=Depends(require_user)):
-    """Create a new research session."""
+    """Create a new research session. If the name is already taken by this user,
+    auto-increment a " (N)" suffix instead of failing."""
     label = req.label.strip()
     if not label:
         raise HTTPException(status_code=400, detail="Label cannot be empty")
@@ -93,19 +114,32 @@ def create_session(req: CreateSessionRequest, user=Depends(require_user)):
     try:
         with conn.cursor() as cur:
             cur.execute(
-                """
-                INSERT INTO research_sessions (label, user_sub)
-                VALUES (%s, %s)
-                RETURNING id, label, created_at
-                """,
-                (label, sub),
+                "SELECT label FROM research_sessions WHERE user_sub = %s", (sub,)
             )
-            row = cur.fetchone()
-            conn.commit()
-            return Session(
-                id=row[0],
-                label=row[1],
-                created_at=row[2],
+            existing = {r[0] for r in cur.fetchall()}
+            candidate = _next_free_label(label, existing)
+            # Retry loop guards against a race on the unique (label, user_sub) index:
+            # if a concurrent insert grabs our candidate, add it to `existing` and pick
+            # the next free suffix.
+            for _ in range(50):
+                try:
+                    cur.execute(
+                        """
+                        INSERT INTO research_sessions (label, user_sub)
+                        VALUES (%s, %s)
+                        RETURNING id, label, created_at
+                        """,
+                        (candidate, sub),
+                    )
+                    row = cur.fetchone()
+                    conn.commit()
+                    return Session(id=row[0], label=row[1], created_at=row[2])
+                except UniqueViolation:
+                    conn.rollback()
+                    existing.add(candidate)
+                    candidate = _next_free_label(label, existing)
+            raise HTTPException(
+                status_code=500, detail="Could not allocate a unique session name"
             )
     finally:
         conn.close()
@@ -162,8 +196,27 @@ def get_session(session_id: int, user=Depends(require_user)):
     try:
         cols = get_table_columns(get_dsn(), "research_sessions")
         has_scope = has_column(cols, "scope_json")
+        has_output_mode = has_column(cols, "output_mode")
         with conn.cursor() as cur:
-            if has_scope:
+            if has_scope and has_output_mode:
+                cur.execute(
+                    """
+                    SELECT 
+                        s.id,
+                        s.label,
+                        s.created_at,
+                        COUNT(m.id) AS message_count,
+                        MAX(m.created_at) AS last_activity,
+                        s.scope_json,
+                        s.output_mode
+                    FROM research_sessions s
+                    LEFT JOIN research_messages m ON m.session_id = s.id
+                    WHERE s.id = %s AND s.user_sub = %s
+                    GROUP BY s.id, s.scope_json, s.output_mode
+                    """,
+                    (session_id, user["sub"]),
+                )
+            elif has_scope:
                 cur.execute(
                     """
                     SELECT 
@@ -208,6 +261,7 @@ def get_session(session_id: int, user=Depends(require_user)):
                     scope = {"mode": "full_archive"}
             elif scope is None:
                 scope = {"mode": "full_archive"}
+            output_mode = row[6] if has_scope and has_output_mode and len(row) > 6 else "evidence_only"
             return Session(
                 id=row[0],
                 label=row[1],
@@ -215,6 +269,7 @@ def get_session(session_id: int, user=Depends(require_user)):
                 message_count=row[3],
                 last_activity=row[4],
                 scope_json=scope,
+                output_mode=output_mode,
             )
     finally:
         conn.close()
@@ -268,6 +323,11 @@ def delete_session(session_id: int, user=Depends(require_user)):
             # 8. Delete messages and plans
             cur.execute("DELETE FROM research_messages WHERE session_id = %s", (session_id,))
             cur.execute("DELETE FROM research_plans WHERE session_id = %s", (session_id,))
+            # 8b. Delete search result sets (and their page hits via CASCADE) for this session
+            cur.execute(
+                "DELETE FROM search_result_sets WHERE session_id = %s",
+                (session_id,),
+            )
             # 9. Delete the session
             cur.execute(
                 "DELETE FROM research_sessions WHERE id = %s AND user_sub = %s",
@@ -331,6 +391,33 @@ def update_session_scope(session_id: int, req: UpdateScopeRequest, user=Depends(
                 )
                 conn.commit()
         return {"ok": True, "scope_json": scope_json}
+    finally:
+        conn.close()
+
+
+class UpdateOutputModeRequest(BaseModel):
+    output_mode: str  # evidence_only | evidence_summary | narrative
+
+
+@router.patch("/{session_id}/output-mode")
+def update_output_mode(session_id: int, req: UpdateOutputModeRequest, user=Depends(require_user)):
+    """Update session output mode preference (evidence_only, evidence_summary, narrative)."""
+    if req.output_mode not in ("evidence_only", "evidence_summary", "narrative"):
+        raise HTTPException(status_code=400, detail="output_mode must be evidence_only, evidence_summary, or narrative")
+    assert_session_owned(session_id, user["sub"])
+    conn = get_conn()
+    try:
+        cols = get_table_columns(get_dsn(), "research_sessions")
+        if not has_column(cols, "output_mode"):
+            return {"ok": True, "output_mode": req.output_mode}
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE research_sessions SET output_mode = %s, updated_at = now() "
+                "WHERE id = %s AND user_sub = %s",
+                (req.output_mode, session_id, user["sub"]),
+            )
+            conn.commit()
+        return {"ok": True, "output_mode": req.output_mode}
     finally:
         conn.close()
 
