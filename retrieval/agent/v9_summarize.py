@@ -261,7 +261,7 @@ def summarize_delta_chunks(
             {"role": "system", "content": _SUMMARIZER_PROMPT},
             {"role": "user", "content": user_msg},
         ],
-        temperature=float(os.getenv("V9_SUMMARIZER_TEMPERATURE", "0")),
+        temperature=float(os.getenv("V9_SUMMARIZER_TEMPERATURE", "0.1")),
         max_completion_tokens=max_completion_tokens,
         response_format=_SUMMARIZER_RESPONSE_FORMAT,
     )

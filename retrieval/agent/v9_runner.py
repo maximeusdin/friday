@@ -2341,9 +2341,11 @@ def _call_with_retry(
         try:
             kwargs: Dict[str, Any] = {
                 "model": model,
-                # Deterministic tool selection reduces run-to-run retrieval variance (the same
-                # query fetching different chunks each run). Was 0.2; default 0 now, tunable.
-                "temperature": float(os.getenv("V9_AGENT_TEMPERATURE", "0")),
+                # Temperature 0 was tried to cut run-to-run variance but the 18-probe re-grade
+                # showed it INCREASED tunneling (greedy locks the agent into narrow single-
+                # collection retrieval) and net-worsened the grades — so default stays 0.2.
+                # Tunable via V9_AGENT_TEMPERATURE for controlled experiments.
+                "temperature": float(os.getenv("V9_AGENT_TEMPERATURE", "0.2")),
                 "max_completion_tokens": completion_tokens,
                 "response_format": V9_RESPONSE_FORMAT,
             }
@@ -2397,7 +2399,7 @@ def _run_auditor(
         resp = client.chat.completions.create(
             model=model,
             messages=[{"role": "user", "content": prompt}],
-            temperature=float(os.getenv("V9_AGENT_TEMPERATURE", "0")),
+            temperature=float(os.getenv("V9_AGENT_TEMPERATURE", "0.2")),
             max_completion_tokens=300,
         )
         content = resp.choices[0].message.content or ""
