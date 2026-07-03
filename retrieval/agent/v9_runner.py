@@ -2341,8 +2341,9 @@ def _call_with_retry(
         try:
             kwargs: Dict[str, Any] = {
                 "model": model,
-                "messages": messages,
-                "temperature": 0.2,
+                # Deterministic tool selection reduces run-to-run retrieval variance (the same
+                # query fetching different chunks each run). Was 0.2; default 0 now, tunable.
+                "temperature": float(os.getenv("V9_AGENT_TEMPERATURE", "0")),
                 "max_completion_tokens": completion_tokens,
                 "response_format": V9_RESPONSE_FORMAT,
             }
@@ -2396,7 +2397,7 @@ def _run_auditor(
         resp = client.chat.completions.create(
             model=model,
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.1,
+            temperature=float(os.getenv("V9_AGENT_TEMPERATURE", "0")),
             max_completion_tokens=300,
         )
         content = resp.choices[0].message.content or ""

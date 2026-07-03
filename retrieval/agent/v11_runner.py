@@ -751,7 +751,7 @@ Rules:
                 {"role": "system", "content": "Output JSON only. suggested_query must be a single research question."},
                 {"role": "user", "content": prompt},
             ],
-            temperature=0.1,
+            temperature=float(os.getenv("V9_AGENT_TEMPERATURE", "0")),
             max_completion_tokens=150,
             response_format=_SUGGEST_QUERY_RESPONSE_FORMAT,
         )
