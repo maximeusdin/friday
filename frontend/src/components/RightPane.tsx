@@ -19,6 +19,8 @@ interface RightPaneProps {
   onDraftDirtyChange: (dirty: boolean) => void;
   activeScopeRevision: number;
   collections: CollectionNode[];
+  /** Collapse the scope pane to a thin rail (optional) */
+  onCollapse?: () => void;
 }
 
 export function RightPane({
@@ -29,6 +31,7 @@ export function RightPane({
   onDraftDirtyChange,
   activeScopeRevision,
   collections,
+  onCollapse,
 }: RightPaneProps) {
   const effectiveActive: UserSelectedScope = activeScope ?? { mode: 'full_archive' };
 
@@ -87,7 +90,19 @@ export function RightPane({
 
   return (
     <>
-      <div className="pane-header">Scope</div>
+      <div className="pane-header">
+        <span>Scope</span>
+        {onCollapse && (
+          <button
+            className="scope-collapse-btn"
+            onClick={onCollapse}
+            title="Hide scope panel"
+            aria-label="Hide scope panel"
+          >
+            Hide&nbsp;›
+          </button>
+        )}
+      </div>
       <div className="pane-content" style={{ display: 'flex', flexDirection: 'column', overflow: 'hidden', padding: 0, alignItems: 'stretch' }}>
         {/* Rebase banner (active scope changed while draft is dirty) */}
             {activeChanged && dirty && (
@@ -519,12 +534,20 @@ function ScopePanel({
                             disabled={!isCustom}
                             style={{ cursor: isCustom ? 'pointer' : 'default', margin: 0, flexShrink: 0 }}
                           />
-                          <span style={{
-                            flex: 1, overflow: 'hidden', textOverflow: 'ellipsis',
-                            whiteSpace: 'nowrap', minWidth: 0, color: '#212529',
-                          }} title={doc.source_name || doc.source_ref || `Document #${doc.id}`}>
+                          <a
+                            href={api.getDocumentPdfUrl(doc.id)}
+                            target="_blank"
+                            rel="noreferrer"
+                            onClick={(e) => e.stopPropagation()}
+                            style={{
+                              flex: 1, overflow: 'hidden', textOverflow: 'ellipsis',
+                              whiteSpace: 'nowrap', minWidth: 0, color: '#0d6efd',
+                              textDecoration: 'underline', cursor: 'pointer',
+                            }}
+                            title={`Open PDF: ${doc.source_name || doc.source_ref || `Document #${doc.id}`}`}
+                          >
                             {doc.source_name || doc.source_ref || `Document #${doc.id}`}
-                          </span>
+                          </a>
                         </div>
                       ))
                     ) : (
