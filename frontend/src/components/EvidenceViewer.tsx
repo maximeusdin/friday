@@ -8,11 +8,13 @@ import 'react-pdf/dist/Page/AnnotationLayer.css';
 import { api } from '@/lib/api';
 import type { EvidenceRef } from '@/types/api';
 
-// Wire up the PDF.js worker. We serve it as a static asset from /public rather
-// than routing it through webpack: the worker ships as ESM (.mjs) and the bundler's
-// minifier chokes on it ("import/export outside module code"). The copy in /public
-// is kept in sync with the installed pdfjs-dist by the predev/prebuild npm scripts.
-pdfjs.GlobalWorkerOptions.workerSrc = '/pdf.worker.min.mjs';
+// Wire up the PDF.js worker. `pdfjs.version` is the EXACT pdfjs-dist version react-pdf uses
+// (its own bundled copy), so pinning the worker to that version can never drift from the API —
+// this is what previously broke ("API version 4.8.69 does not match Worker version 4.10.38"),
+// because a build-time copy of a different top-level pdfjs-dist got served from /public and
+// browser-cached. Loading the version-matched worker guarantees they agree on every deploy.
+pdfjs.GlobalWorkerOptions.workerSrc =
+  `https://unpkg.com/pdfjs-dist@${pdfjs.version}/build/pdf.worker.min.mjs`;
 
 const ZOOM_LEVELS = [50, 75, 100, 125, 150, 200];
 
