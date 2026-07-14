@@ -27,7 +27,7 @@ def _resolve_page_ids(conn, page_ids: List[int]) -> Dict[int, int]:
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT id, pdf_page_number FROM pages WHERE id = ANY(%s)",
+                "SELECT id, COALESCE(pdf_page_number, page_seq) FROM pages WHERE id = ANY(%s)",
                 (unique_ids,),
             )
             return {r[0]: r[1] for r in cur.fetchall() if r[1] is not None}
@@ -40,7 +40,9 @@ def _page_ref(page_id, page_map: Dict[int, int] = None) -> Optional[str]:
         return None
     if page_map and page_id in page_map:
         return f"p{page_map[page_id]}"
-    return f"p{page_id}"
+    # NEVER fall back to the raw page_id: it is a global DB key, not a page number, and using it
+    # produces broken viewer links (e.g. "Page 3846 / 139"). Omit the page instead.
+    return None
 
 
 def _load_catalog(conn, chunk_ids: List[int], scores: Dict[int, float]) -> List[CatalogHit]:
@@ -57,7 +59,7 @@ def _load_catalog(conn, chunk_ids: List[int], scores: Dict[int, float]) -> List[
             SELECT c.id,
                    LEFT(COALESCE(c.clean_text, c.text), 300),
                    cm.document_id,
-                   COALESCE(p.pdf_page_number, cm.first_page_id) AS page_num,
+                   COALESCE(p.pdf_page_number, p.page_seq) AS page_num,
                    cm.collection_slug
             FROM chunks c
             LEFT JOIN chunk_metadata cm ON cm.chunk_id = c.id
