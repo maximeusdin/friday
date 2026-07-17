@@ -473,14 +473,7 @@ def _execute_tool(
                             f"Discovered {len(ev_update.bullets)} new evidence bullets",
                             {
                                 "bullets": [
-                                    {
-                                        "text": b.text,
-                                        "tags": b.tags,
-                                        "chunk_ids": b.supporting_chunk_ids,
-                                        "doc_ids": b.doc_ids,
-                                        "pages": [chunk_to_page.get(cid) for cid in b.supporting_chunk_ids],
-                                        "source_names": [doc_names.get(did, "") for did in (b.doc_ids or [])],
-                                    }
+                                    _bullet_payload(conn, b, chunk_to_page, doc_names)
                                     for b in ev_update.bullets
                                 ],
                                 "open_questions": ev_update.open_questions,
@@ -560,14 +553,7 @@ def _execute_tool(
                             f"Discovered {len(ev_update.bullets)} new evidence bullets",
                             {
                                 "bullets": [
-                                    {
-                                        "text": b.text,
-                                        "tags": b.tags,
-                                        "chunk_ids": b.supporting_chunk_ids,
-                                        "doc_ids": b.doc_ids,
-                                        "pages": [chunk_to_page.get(cid) for cid in b.supporting_chunk_ids],
-                                        "source_names": [doc_names.get(did, "") for did in (b.doc_ids or [])],
-                                    }
+                                    _bullet_payload(conn, b, chunk_to_page, doc_names)
                                     for b in ev_update.bullets
                                 ],
                                 "open_questions": ev_update.open_questions,
@@ -591,6 +577,69 @@ def _execute_tool(
         return {"error": f"Unknown tool: {name}"}, f"error: unknown tool {name}"
     except Exception as e:
         return {"error": str(e), "tool": name}, f"error: {str(e)[:80]}"
+
+
+def _lookup_quote_page(conn, chunk_id: int, quote: str) -> Optional[int]:
+    """Find which of a chunk's PDF pages contains the quote, by matching the quote
+    against each page's raw_text (chunk_pages char offsets are unpopulated, so text
+    matching is the reliable mapping). Chunks span 1-6 pages, so this is cheap.
+    Returns None when the quote can't be placed (viewer falls back to first page)."""
+    from retrieval.agent.v9_summarize import _norm_with_map
+    q_norm, _ = _norm_with_map(quote or "")
+    if len(q_norm) < 15:
+        return None
+    q_tokens = set(q_norm.split(" "))
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT p.pdf_page_number, p.raw_text
+                FROM chunk_pages cp JOIN pages p ON p.id = cp.page_id
+                WHERE cp.chunk_id = %s
+                ORDER BY cp.span_order
+                """,
+                (chunk_id,),
+            )
+            rows = cur.fetchall()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return None
+    if len(rows) == 1:
+        return int(rows[0][0]) if rows[0][0] is not None else None
+    best_page, best_score = None, 0.0
+    for pdf_page, raw_text in rows:
+        if pdf_page is None or not raw_text:
+            continue
+        p_norm, _ = _norm_with_map(raw_text)
+        if q_norm in p_norm:
+            return int(pdf_page)
+        p_tokens = set(p_norm.split(" "))
+        score = len(q_tokens & p_tokens) / max(len(q_tokens), 1)
+        if score > best_score:
+            best_page, best_score = int(pdf_page), score
+    return best_page if best_score >= 0.6 else None
+
+
+def _bullet_payload(conn, b, chunk_to_page: Dict[int, Optional[int]],
+                    doc_names: Dict[int, str]) -> Dict[str, Any]:
+    """Serialize an EvidenceBullet for the evidence_update SSE payload, including the
+    verbatim support quote + its exact PDF page (for on-page highlighting)."""
+    payload: Dict[str, Any] = {
+        "text": b.text,
+        "tags": b.tags,
+        "chunk_ids": b.supporting_chunk_ids,
+        "doc_ids": b.doc_ids,
+        "pages": [chunk_to_page.get(cid) for cid in b.supporting_chunk_ids],
+        "source_names": [doc_names.get(did, "") for did in (b.doc_ids or [])],
+    }
+    if getattr(b, "support_quote", "") and getattr(b, "quote_chunk_id", None):
+        payload["quote"] = b.support_quote
+        payload["quote_chunk_id"] = b.quote_chunk_id
+        payload["quote_page"] = _lookup_quote_page(conn, b.quote_chunk_id, b.support_quote)
+    return payload
 
 
 def _get_doc_source_names(conn, doc_ids: List[int]) -> Dict[int, str]:

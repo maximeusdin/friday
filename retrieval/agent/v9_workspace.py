@@ -1025,6 +1025,10 @@ def merge_evidence_summary_update(
             merged_chunks = sorted(set(existing.supporting_chunk_ids) | set(bullet.supporting_chunk_ids))
             existing.supporting_chunk_ids = merged_chunks
             existing.tags = list(set(existing.tags) | set(bullet.tags))[:3]
+            # Keep the first validated support quote; adopt the new one if we had none
+            if not existing.support_quote and bullet.support_quote:
+                existing.support_quote = bullet.support_quote
+                existing.quote_chunk_id = bullet.quote_chunk_id
             existing.doc_ids = sorted(set(
                 chunk_doc_map[cid]
                 for cid in existing.supporting_chunk_ids

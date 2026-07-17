@@ -20,6 +20,8 @@ export interface EvidenceRef {
     end: number;
   };
   quote?: string;
+  /** Page the quote actually sits on when it differs from pdf_page (multi-page chunks). */
+  quote_page?: number;
   why?: string;
 }
 
@@ -574,6 +576,11 @@ export interface V9EvidenceBullet {
   pages?: number[];
   /** Document source names (one per doc_id) for display. */
   source_names?: string[];
+  /** Verbatim supporting passage (validated server-side) for on-page highlighting. */
+  quote?: string;
+  quote_chunk_id?: number;
+  /** PDF page the quote sits on (exact, from the chunk→page span table). */
+  quote_page?: number | null;
 }
 
 /**

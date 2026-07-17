@@ -349,6 +349,10 @@ class EvidenceBullet:
     linked_entity_ids: List[int] = field(default_factory=list)  # system-derived at merge
     pinned: bool = False
     pin_reason: str = ""
+    # Verbatim passage from quote_chunk_id's text supporting this bullet (validated
+    # server-side against the chunk text — empty when no verbatim span could be anchored).
+    support_quote: str = ""
+    quote_chunk_id: Optional[int] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -361,6 +365,8 @@ class EvidenceBullet:
             "linked_entity_ids": self.linked_entity_ids,
             "pinned": self.pinned,
             "pin_reason": self.pin_reason,
+            "support_quote": self.support_quote,
+            "quote_chunk_id": self.quote_chunk_id,
         }
 
     @classmethod
@@ -375,6 +381,8 @@ class EvidenceBullet:
             linked_entity_ids=d.get("linked_entity_ids", []),
             pinned=d.get("pinned", False),
             pin_reason=d.get("pin_reason", ""),
+            support_quote=d.get("support_quote", ""),
+            quote_chunk_id=d.get("quote_chunk_id"),
         )
 
 

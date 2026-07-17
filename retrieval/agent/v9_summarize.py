@@ -13,7 +13,7 @@ import os
 import sys
 import uuid
 from datetime import datetime, timezone
-from typing import List, Set
+from typing import Dict, List, Optional, Set
 
 from retrieval.agent.v9_types import (
     EvidenceBullet,
@@ -47,8 +47,9 @@ _SUMMARIZER_SCHEMA = {
                             "type": "array",
                             "items": {"type": "string"},
                         },
+                        "support_quote": {"type": "string"},
                     },
-                    "required": ["text", "supporting_chunk_ids", "tags"],
+                    "required": ["text", "supporting_chunk_ids", "tags", "support_quote"],
                     "additionalProperties": False,
                 },
             },
@@ -88,6 +89,12 @@ Given the research question and a set of document chunks, produce:
   Each bullet MUST have at least one supporting_chunk_id from the provided chunks.
   Tags (max 3 per bullet): short category labels like "identity", "alias", "roster",
   "timeline", "contradiction", "warning", "codename", etc.
+  support_quote: the EXACT passage from the chunk that supports the bullet, COPIED
+  VERBATIM character-for-character from the chunk text above (including OCR errors —
+  do NOT fix spelling or punctuation). 1-2 sentences, under 350 characters, from the
+  bullet's FIRST supporting chunk. This anchors an on-page highlight, so it must be a
+  literal substring of the chunk text. Empty string only if no single passage supports
+  the bullet.
 - open_questions (max 4): unanswered questions raised by these chunks.
 - leads (max 6): promising follow-up searches or chunk_ids to investigate.
 - warnings (max 3): contradictions, OCR errors, or reliability concerns.
@@ -120,9 +127,109 @@ def _coerce_int(val) -> int:
     raise ValueError(f"Cannot coerce {val!r} to int")
 
 
+# --- support_quote validation (verbatim-or-repair; never store a fabricated quote) ---
+
+_MAX_QUOTE_LEN = 400
+_QUOTE_TRANS = str.maketrans({"‘": "'", "’": "'", "‚": "'", "“": '"', "”": '"', "„": '"',
+                              "–": "-", "—": "-", "−": "-"})
+
+
+def _norm_with_map(src: str):
+    """Lowercase / unify quotes+dashes / collapse whitespace, keeping an index map
+    back into the original string so validated windows can be recovered verbatim."""
+    norm_chars: List[str] = []
+    idx_map: List[int] = []
+    last_space = True
+    for i, ch in enumerate(src):
+        ch = ch.translate(_QUOTE_TRANS)
+        if ch == "­":  # soft hyphen
+            continue
+        if ch.isspace():
+            if last_space:
+                continue
+            norm_chars.append(" ")
+            idx_map.append(i)
+            last_space = True
+            continue
+        norm_chars.append(ch.lower())
+        idx_map.append(i)
+        last_space = False
+    if norm_chars and norm_chars[-1] == " ":
+        norm_chars.pop()
+        idx_map.pop()
+    return "".join(norm_chars), idx_map
+
+
+def _validate_or_repair_quote(quote: str, chunk_texts: List[tuple]) -> tuple:
+    """Return (verbatim_quote_from_chunk, chunk_id) or ("", None).
+
+    Tier 1: normalized substring of a supporting chunk -> recover the chunk's own
+    original text for that window (so the stored quote is verbatim source text even
+    if the model normalized punctuation).
+    Tier 2: fuzzy token-window alignment (SequenceMatcher-free rolling overlap);
+    accept the best window at >= 0.75 and store the CHUNK's text for it.
+    Otherwise: no quote (highlighting falls back to page-level).
+    """
+    q = (quote or "").strip()[:_MAX_QUOTE_LEN]
+    if len(q) < 15:
+        return "", None
+    q_norm, _ = _norm_with_map(q)
+    q_tokens = q_norm.split(" ")
+    if len(q_tokens) < 3:
+        return "", None
+    q_freq: Dict[str, int] = {}
+    for t in q_tokens:
+        q_freq[t] = q_freq.get(t, 0) + 1
+
+    for chunk_id, text in chunk_texts:
+        if not text:
+            continue
+        c_norm, c_map = _norm_with_map(text)
+        # Tier 1: exact after normalization
+        pos = c_norm.find(q_norm)
+        if pos != -1:
+            start, end = c_map[pos], c_map[pos + len(q_norm) - 1] + 1
+            return text[start:end][:_MAX_QUOTE_LEN], chunk_id
+
+        # Tier 2: best token window by multiset overlap
+        tokens = []
+        off = 0
+        for tok in c_norm.split(" "):
+            tokens.append((tok, off))
+            off += len(tok) + 1
+        w = len(q_tokens)
+        if w > len(tokens):
+            continue
+        freq: Dict[str, int] = {}
+        overlap = 0
+        best = (-1.0, 0, 0)  # score, tok_start, tok_end
+        for i, (tok, _o) in enumerate(tokens):
+            c = freq.get(tok, 0) + 1
+            freq[tok] = c
+            if c <= q_freq.get(tok, 0):
+                overlap += 1
+            if i >= w:
+                old = tokens[i - w][0]
+                oc = freq[old]
+                if oc <= q_freq.get(old, 0):
+                    overlap -= 1
+                freq[old] = oc - 1
+            if i >= w - 1:
+                score = overlap / w
+                if score > best[0]:
+                    best = (score, i - w + 1, i)
+        if best[0] >= 0.75:
+            s_norm = tokens[best[1]][1]
+            e_norm = tokens[best[2]][1] + len(tokens[best[2]][0])
+            start, end = c_map[s_norm], c_map[e_norm - 1] + 1
+            return text[start:end][:_MAX_QUOTE_LEN], chunk_id
+    return "", None
+
+
 def _normalize_summary(
     raw: dict,
     provided_chunk_ids: Set[int],
+    chunk_text_map: Optional[Dict[int, str]] = None,
 ) -> dict:
     """Apply hard caps, type-coerce chunk_ids, validate against provided set."""
     raw_bullet_count = len(raw.get("bullets") or [])
@@ -159,11 +266,23 @@ def _normalize_summary(
             dropped_reasons.append("empty_bullet_id")
             continue
 
+        # Validate the support quote against the supporting chunks' own text.
+        # Stored quotes are ALWAYS verbatim chunk text (validated or realigned) —
+        # a paraphrase the aligner can't place is dropped, never stored.
+        support_quote, quote_chunk_id = "", None
+        if chunk_text_map:
+            support_quote, quote_chunk_id = _validate_or_repair_quote(
+                b.get("support_quote") or "",
+                [(cid, chunk_text_map.get(cid, "")) for cid in valid_ids],
+            )
+
         clean_bullets.append({
             "bullet_id": bid,
             "text": text,
             "supporting_chunk_ids": valid_ids,
             "tags": tags,
+            "support_quote": support_quote,
+            "quote_chunk_id": quote_chunk_id,
         })
 
     if dropped_reasons:
@@ -194,7 +313,7 @@ def summarize_delta_chunks(
     *,
     alias_context: str = "",
     model: str = "gpt-4.1-mini-2025-04-14",
-    max_completion_tokens: int = 800,
+    max_completion_tokens: int = 1400,  # room for verbatim support_quotes (6 × ~350 chars)
 ) -> EvidenceSummaryUpdate:
     """Summarize newly-fetched chunks into an EvidenceSummaryUpdate.
 
@@ -289,7 +408,10 @@ def summarize_delta_chunks(
         )
         raw = {}
 
-    normalized = _normalize_summary(raw, provided_chunk_ids)
+    normalized = _normalize_summary(
+        raw, provided_chunk_ids,
+        chunk_text_map={c.chunk_id: c.text for c in chunks},
+    )
 
     now = datetime.now(timezone.utc).isoformat()
     update_id = str(uuid.uuid4())
@@ -300,6 +422,8 @@ def summarize_delta_chunks(
             text=b["text"],
             supporting_chunk_ids=b["supporting_chunk_ids"],
             tags=b["tags"],
+            support_quote=b.get("support_quote", ""),
+            quote_chunk_id=b.get("quote_chunk_id"),
             # created_at, doc_ids, pinned, pin_reason set at merge time
         )
         for b in normalized["bullets"]

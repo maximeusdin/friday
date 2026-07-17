@@ -482,8 +482,11 @@ function EvidenceBulletsBlock({
                   type="button"
                   onClick={() => onEvidenceClick({
                     document_id: bullet.doc_ids[0],
-                    pdf_page: bullet.pages?.[0] ?? 1,
-                    chunk_id: bullet.chunk_ids[0],
+                    // Open the quote's exact page when known (multi-page chunks)
+                    pdf_page: bullet.quote_page ?? bullet.pages?.[0] ?? 1,
+                    chunk_id: bullet.quote_chunk_id ?? bullet.chunk_ids[0],
+                    quote: bullet.quote,
+                    quote_page: bullet.quote_page ?? undefined,
                   })}
                 >
                   {bullet.source_names?.[0] || 'View document'}

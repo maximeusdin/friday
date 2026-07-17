@@ -141,6 +141,15 @@ _PLANNER_SYS = (
     'set. Reporters, newspapermen, correspondents, pressmen -> ["journalist","reporter",'
     '"correspondent","newspaperman","editor","press"]. Scientists/physicists -> ["scientist",'
     '"physicist"]. Engineers -> ["engineer"]. Return [] for lookup/compare/timeline.\n'
+    '  "records_queries": 1-2 rewrites of the question into DOCUMENT-SEEKING form: what the '
+    "archive's own records about the event would be titled or say. The archive describes events "
+    "in bureaucratic record language, not the asker's words. Swap event verbs for the archival "
+    "vocabulary the records themselves use (recruited -> initial contact, developed, cooperation, "
+    'informant; defected -> statement, deposition, interview; spied -> espionage activities, '
+    "contacts), and add likely record-type nouns (memorandum, report, letter, teletype, interview). "
+    'Example: "When did the FBI recruit X as an informer?" -> ["X initial contact cooperation '
+    'informant memorandum", "X developed informant report"]. Keep every entity name. Return [] '
+    "if the question ALREADY asks for documents/records/files/reports.\n"
     "Names may appear in the text only as codenames; still emit the canonical names the user gave."
 )
 
@@ -152,7 +161,8 @@ def plan_query(question: str, *, model: str = _PLANNER_MODEL, verbose: bool = Fa
     Capitalized proper-noun runs) so we never depend solely on the model for anchors.
     """
     plan: Dict[str, Any] = {"intent": "lookup", "entities": [], "anchors": [], "queries": [],
-                            "enumeration_target": "", "target_synonyms": []}
+                            "enumeration_target": "", "target_synonyms": [],
+                            "records_queries": []}
 
     api_key = os.getenv("OPENAI_API_KEY")
     if api_key:
@@ -162,7 +172,7 @@ def plan_query(question: str, *, model: str = _PLANNER_MODEL, verbose: bool = Fa
             resp = client.chat.completions.create(
                 model=model,
                 temperature=0.0,
-                max_completion_tokens=300,
+                max_completion_tokens=400,
                 response_format={"type": "json_object"},
                 messages=[
                     {"role": "system", "content": _PLANNER_SYS},
@@ -189,10 +199,20 @@ def plan_query(question: str, *, model: str = _PLANNER_MODEL, verbose: bool = Fa
     plan["queries"] = _dedup_preserve(queries)[:4]
     plan["entities"] = _dedup_preserve(plan.get("entities") or [])[:12]
 
+    # Records-oriented rewrite (evidence-seeking reframe). Off when the question is
+    # already document-seeking (belt to the planner-prompt suspenders), or via env.
+    rq = [q for q in (plan.get("records_queries") or []) if q and str(q).strip()]
+    if os.getenv("FRIDAY_RECORDS_REWRITE", "1") != "1":
+        rq = []
+    elif re.search(r"\b(documents?|records?|files?|reports?|memos?|memoranda)\b", question, re.I):
+        rq = []
+    plan["records_queries"] = _dedup_preserve(rq)[:2]
+
     if verbose:
         print(
             f"  [V13] plan intent={plan['intent']} entities={plan['entities']} "
-            f"anchors={plan['anchors']} queries={plan['queries']}",
+            f"anchors={plan['anchors']} queries={plan['queries']} "
+            f"records_queries={plan['records_queries']}",
             file=sys.stderr,
         )
     return plan
@@ -388,6 +408,14 @@ def prime_workspace(
         ids = _hybrid(q)
         if ids:
             result_sets.append(ids); rare_flags.append(False); labels.append(f"hy:{q}")
+
+    # Records-oriented rewrites: retrieval in the archive's own record language
+    # ("initial contact / cooperation / memorandum" instead of "recruit"). Primed as their
+    # own sets so they can surface documents the direct phrasing can't reach.
+    for q in list(plan.get("records_queries") or [])[:2]:
+        ids = _hybrid(str(q))
+        if ids:
+            result_sets.append(ids); rare_flags.append(False); labels.append(f"rq:{q}")
     for a in plan.get("anchors", []):
         ids = _lexical(str(a))
         if ids:

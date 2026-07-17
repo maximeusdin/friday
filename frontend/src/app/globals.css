@@ -1057,6 +1057,21 @@ textarea:focus {
 }
 
 /* Search highlights painted via the CSS Custom Highlight API over the text layer */
+::highlight(pdf-evidence) {
+  background-color: rgba(255, 170, 0, 0.45);
+  color: inherit;
+}
+
+.quote-hl-badge {
+  display: inline-block;
+  margin-left: 10px;
+  font-size: 11px;
+}
+
+.quote-hl-exact { color: #b26a00; }
+.quote-hl-fuzzy { color: #b26a00; }
+.quote-hl-none { color: var(--color-text-muted); }
+
 ::highlight(pdf-find) {
   background: rgba(255, 213, 0, 0.45);
 }

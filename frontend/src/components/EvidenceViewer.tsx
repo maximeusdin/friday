@@ -50,6 +50,114 @@ function locate(nodes: TextNodeEntry[], offset: number): { node: Text; off: numb
   return { node: last.node, off: last.node.nodeValue?.length ?? 0 };
 }
 
+// ---------------------------------------------------------------------------
+// Evidence-quote matching (semantic-search support quotes → text-layer ranges)
+// ---------------------------------------------------------------------------
+
+/** Normalize text for OCR-tolerant matching while keeping a map back to the
+ * original string indices, so matched spans can become DOM Ranges. */
+function normalizeWithMap(src: string): { norm: string; map: number[] } {
+  let norm = '';
+  const map: number[] = [];
+  let lastWasSpace = true; // leading whitespace is dropped
+  for (let i = 0; i < src.length; i++) {
+    let ch = src[i];
+    if (ch === '­') continue; // soft hyphen
+    if (/[‘’‚′']/.test(ch)) ch = "'";
+    else if (/[“”„″"]/.test(ch)) ch = '"';
+    else if (/[–—−-]/.test(ch)) ch = '-';
+    if (/\s/.test(ch)) {
+      if (lastWasSpace) continue;
+      norm += ' ';
+      map.push(i);
+      lastWasSpace = true;
+      continue;
+    }
+    norm += ch.toLowerCase();
+    map.push(i);
+    lastWasSpace = false;
+  }
+  // trim trailing space
+  if (norm.endsWith(' ')) {
+    norm = norm.slice(0, -1);
+    map.pop();
+  }
+  return { norm, map };
+}
+
+/** Plain normalization (no index map) for the quote side. */
+function normalizePlain(src: string): string {
+  return normalizeWithMap(src).norm;
+}
+
+interface QuoteMatch {
+  start: number; // original-string start index (inclusive)
+  end: number;   // original-string end index (exclusive)
+  tier: 'exact' | 'fuzzy';
+}
+
+/**
+ * Locate a (possibly OCR-divergent) verbatim quote inside a page's text.
+ * Tier 1: normalized exact substring.
+ * Tier 2: fuzzy token window — best window of ~quote length by token-overlap
+ *         score, accepted only above a strict threshold so we never paint a
+ *         wrong highlight.
+ */
+function matchQuoteInText(pageText: string, quote: string): QuoteMatch | null {
+  const { norm, map } = normalizeWithMap(pageText);
+  const q = normalizePlain(quote);
+  if (!q || q.length < 8 || !norm) return null;
+
+  // Tier 1 — exact (normalized)
+  const idx = norm.indexOf(q);
+  if (idx !== -1) {
+    return { start: map[idx], end: map[idx + q.length - 1] + 1, tier: 'exact' };
+  }
+
+  // Tier 2 — token window. Tokenize with offsets into `norm`.
+  const tokens: { t: string; s: number; e: number }[] = [];
+  const re = /[^ ]+/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(norm)) !== null) tokens.push({ t: m[0], s: m.index, e: m.index + m[0].length });
+  const qTokens = q.split(' ').filter(Boolean);
+  if (qTokens.length < 3 || tokens.length < 3) return null;
+
+  const qFreq = new Map<string, number>();
+  for (const t of qTokens) qFreq.set(t, (qFreq.get(t) ?? 0) + 1);
+
+  let best: { score: number; s: number; e: number } | null = null;
+  const win = qTokens.length;
+  const widths = [win, Math.max(3, Math.round(win * 0.8)), Math.round(win * 1.2)];
+  for (const w of widths) {
+    if (w > tokens.length) continue;
+    // rolling multiset-overlap over windows of width w
+    const freq = new Map<string, number>();
+    let overlap = 0;
+    for (let i = 0; i < tokens.length; i++) {
+      const t = tokens[i].t;
+      const c = (freq.get(t) ?? 0) + 1;
+      freq.set(t, c);
+      if (c <= (qFreq.get(t) ?? 0)) overlap++;
+      if (i >= w) {
+        const old = tokens[i - w].t;
+        const oc = freq.get(old)!;
+        if (oc <= (qFreq.get(old) ?? 0)) overlap--;
+        freq.set(old, oc - 1);
+      }
+      if (i >= w - 1) {
+        const score = overlap / Math.max(w, qTokens.length);
+        if (!best || score > best.score) {
+          best = { score, s: tokens[i - w + 1].s, e: tokens[i].e };
+        }
+      }
+    }
+  }
+  if (best && best.score >= 0.6) {
+    return { start: map[best.s], end: map[best.e - 1] + 1, tier: 'fuzzy' };
+  }
+  return null;
+}
+
 export function EvidenceViewer({ evidence, onClose, backLabel = 'Back to Chat' }: EvidenceViewerProps) {
   const [currentPage, setCurrentPage] = useState(1);
   const [numPages, setNumPages] = useState<number | null>(null);
@@ -63,6 +171,11 @@ export function EvidenceViewer({ evidence, onClose, backLabel = 'Back to Chat' }
   const [matches, setMatches] = useState<{ page: number }[]>([]);
   const [activeMatchIdx, setActiveMatchIdx] = useState(-1);
   const [searching, setSearching] = useState(false);
+
+  // --- Evidence-quote highlight state ---
+  // 'exact' | 'fuzzy': painted on the page; 'none': quote couldn't be located
+  // (approximate-location fallback); null: no quote or not on the quote's page yet.
+  const [quoteTier, setQuoteTier] = useState<'exact' | 'fuzzy' | 'none' | null>(null);
 
   const pdfRef = useRef<Awaited<ReturnType<typeof pdfjs.getDocument>['promise']> | null>(null);
   const textCache = useRef<Map<number, string>>(new Map());
@@ -226,10 +339,61 @@ export function EvidenceViewer({ evidence, onClose, backLabel = 'Back to Chat' }
     }
   }, [query, activeMatchIdx, matches, currentPage]);
 
+  // --- Paint the evidence-quote highlight (amber) on the quote's page ---
+  const applyEvidenceHighlight = useCallback(() => {
+    if (!HIGHLIGHT_SUPPORTED) return;
+    const css = CSS as unknown as { highlights: Map<string, unknown> };
+    css.highlights.delete('pdf-evidence');
+    const quote = evidence?.quote;
+    if (!quote || quote.trim().length < 8) {
+      setQuoteTier(null);
+      return;
+    }
+    const quotePage = evidence?.quote_page ?? evidence?.pdf_page;
+    if (currentPage !== quotePage) return; // keep tier state; just don't paint here
+
+    const layer = pageWrapRef.current?.querySelector('.react-pdf__Page__textContent');
+    if (!layer) return;
+    const walker = window.document.createTreeWalker(layer, NodeFilter.SHOW_TEXT);
+    const nodes: TextNodeEntry[] = [];
+    let full = '';
+    for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+      const text = n as Text;
+      nodes.push({ node: text, start: full.length });
+      full += text.nodeValue ?? '';
+    }
+    if (!nodes.length) {
+      setQuoteTier('none');
+      return;
+    }
+
+    const match = matchQuoteInText(full, quote);
+    if (!match) {
+      setQuoteTier('none');
+      return;
+    }
+    const a = locate(nodes, match.start);
+    const b = locate(nodes, match.end);
+    const r = window.document.createRange();
+    r.setStart(a.node, a.off);
+    r.setEnd(b.node, b.off);
+    const HL = (window as unknown as { Highlight: new (...r: Range[]) => unknown }).Highlight;
+    css.highlights.set('pdf-evidence', new HL(r));
+    setQuoteTier(match.tier);
+    // Bring the evidence into view (center) once painted.
+    r.startContainer.parentElement?.scrollIntoView({ block: 'center', inline: 'nearest' });
+  }, [evidence?.quote, evidence?.quote_page, evidence?.pdf_page, currentPage]);
+
   // Re-paint when match selection or page changes (text layer may already be rendered)
   useEffect(() => {
     applyHighlights();
-  }, [applyHighlights]);
+    applyEvidenceHighlight();
+  }, [applyHighlights, applyEvidenceHighlight]);
+
+  // Reset quote tier when the evidence target changes
+  useEffect(() => {
+    setQuoteTier(null);
+  }, [evidence?.document_id, evidence?.quote]);
 
   // Clear highlights on unmount / document change
   useEffect(() => () => CSS_clearHighlights(), [evidence?.document_id]);
@@ -509,6 +673,13 @@ export function EvidenceViewer({ evidence, onClose, backLabel = 'Back to Chat' }
           }}
         >
           &ldquo;{evidence.quote}&rdquo;
+          {quoteTier && (
+            <span className={`quote-hl-badge quote-hl-${quoteTier}`} style={{ fontStyle: 'normal' }}>
+              {quoteTier === 'exact' && '● highlighted on page'}
+              {quoteTier === 'fuzzy' && '● highlighted (approximate match)'}
+              {quoteTier === 'none' && '≈ approximate location — exact text could not be pinpointed on this page'}
+            </span>
+          )}
           {evidence.why && <div className="text-sm text-muted mt-sm">Relevance: {evidence.why}</div>}
         </div>
       )}
@@ -561,7 +732,10 @@ export function EvidenceViewer({ evidence, onClose, backLabel = 'Back to Chat' }
                 scale={zoom / 100}
                 renderAnnotationLayer
                 renderTextLayer
-                onRenderTextLayerSuccess={applyHighlights}
+                onRenderTextLayerSuccess={() => {
+                  applyHighlights();
+                  applyEvidenceHighlight();
+                }}
                 loading={<div className="loading">Rendering page…</div>}
               />
             </Document>
@@ -578,4 +752,5 @@ function CSS_clearHighlights() {
   const css = CSS as unknown as { highlights: Map<string, unknown> };
   css.highlights.delete('pdf-find');
   css.highlights.delete('pdf-find-active');
+  css.highlights.delete('pdf-evidence');
 }
