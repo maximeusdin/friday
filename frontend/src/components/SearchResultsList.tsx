@@ -9,6 +9,8 @@ interface SearchResultsListProps {
   onOpenPage: (evidence: EvidenceRef, resultSetId: string) => void;
   resultSetId: string;
   isLoading?: boolean;
+  /** When provided, each row shows a remove (✕) control. */
+  onRemoveItem?: (item: SearchPageHitItem) => void;
 }
 
 export function SearchResultsList({
@@ -17,6 +19,7 @@ export function SearchResultsList({
   onOpenPage,
   resultSetId,
   isLoading,
+  onRemoveItem,
 }: SearchResultsListProps) {
   if (isLoading) {
     return (
@@ -72,6 +75,20 @@ export function SearchResultsList({
             </button>
             <span className="search-result-meta">
               <span className="search-result-page">p. {item.page.pdf_page}</span>
+              {onRemoveItem && (
+                <button
+                  type="button"
+                  className="search-result-remove"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onRemoveItem(item);
+                  }}
+                  title="Remove this result from the search"
+                  aria-label={`Remove result ${idx + 1}`}
+                >
+                  ✕
+                </button>
+              )}
             </span>
           </div>
           {item.snippet ? (

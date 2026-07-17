@@ -873,6 +873,23 @@ async function listSearchResultSets(sessionId: number): Promise<SearchResultSetS
   return request<SearchResultSetSummary[]>(`/search/result-sets?session_id=${sessionId}`);
 }
 
+/** Delete a saved search (its tab and all its hits). */
+async function deleteSearchResultSet(id: string): Promise<{ ok: boolean }> {
+  return request<{ ok: boolean }>(`/search/result-sets/${id}`, { method: 'DELETE' });
+}
+
+/** Remove a single page hit from a saved search (persists server-side). */
+async function deleteSearchResultItem(
+  resultSetId: string,
+  documentId: number,
+  pageId: number
+): Promise<{ deleted: number }> {
+  return request<{ deleted: number }>(
+    `/search/result-sets/${resultSetId}/items?document_id=${documentId}&page_id=${pageId}`,
+    { method: 'DELETE' }
+  );
+}
+
 async function expandSearchFuzzy(id: string): Promise<{ status: string; total_hits: number }> {
   return request<{ status: string; total_hits: number }>(
     `/search/result-sets/${id}/expand-fuzzy`,
@@ -951,6 +968,8 @@ export const api = {
   createSearchResultSet,
   getSearchResultSet,
   listSearchResultSets,
+  deleteSearchResultSet,
+  deleteSearchResultItem,
   getSearchResultSetItems,
   getSearchResultSetExportUrl,
   expandSearchFuzzy,

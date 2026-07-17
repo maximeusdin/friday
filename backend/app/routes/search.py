@@ -354,6 +354,59 @@ def list_search_result_sets(
         conn.close()
 
 
+@router.delete("/result-sets/{result_set_id}")
+def delete_search_result_set(
+    result_set_id: str,
+    user=Depends(require_user),
+):
+    """Delete a saved search (and its page hits via ON DELETE CASCADE)."""
+    conn = get_conn()
+    try:
+        _assert_search_result_set_owned(conn, result_set_id, user["sub"])
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM search_result_sets WHERE id = %s", (result_set_id,))
+        conn.commit()
+        return {"ok": True}
+    finally:
+        conn.close()
+
+
+@router.delete("/result-sets/{result_set_id}/items")
+def delete_search_result_item(
+    result_set_id: str,
+    document_id: int = Query(...),
+    page_id: int = Query(...),
+    user=Depends(require_user),
+):
+    """Remove a single page hit from a saved search (persists across reloads),
+    keeping total_hits in sync so numbering and "Showing X of Y" stay correct."""
+    conn = get_conn()
+    try:
+        _assert_search_result_set_owned(conn, result_set_id, user["sub"])
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                DELETE FROM search_result_page_hits
+                WHERE result_set_id = %s AND document_id = %s AND page_id = %s
+                """,
+                (result_set_id, document_id, page_id),
+            )
+            deleted = cur.rowcount
+            if deleted:
+                cur.execute(
+                    """
+                    UPDATE search_result_sets
+                    SET total_hits = GREATEST(COALESCE(total_hits, 0) - %s, 0)
+                    WHERE id = %s
+                    """,
+                    (deleted, result_set_id),
+                )
+        conn.commit()
+        return {"deleted": deleted}
+    finally:
+        conn.close()
+
+
 @router.get("/result-sets/{result_set_id}", response_model=SearchResultSetResponse)
 def get_search_result_set(
     result_set_id: str,

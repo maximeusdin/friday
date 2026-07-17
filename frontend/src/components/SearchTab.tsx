@@ -45,6 +45,7 @@ export function SearchTab({ activeScope, sessionId, onOpenPage, externalResultSe
   const [isSearching, setIsSearching] = useState(false);
   const [isExpandingFuzzy, setIsExpandingFuzzy] = useState(false);
   const [searchHistory, setSearchHistory] = useState<SearchResultBlock[]>([]);
+  const [activeResultSetId, setActiveResultSetId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [showInstructions, setShowInstructions] = useState(true);
 
@@ -103,6 +104,7 @@ export function SearchTab({ activeScope, sessionId, onOpenPage, externalResultSe
         notice: res.notice ?? null,
       };
       setSearchHistory((prev) => [...prev, block]);
+      setActiveResultSetId(res.result_set_id);
       setIsSearching(false);
 
       // Progressive fuzzy: expand in background, then refetch and update block
@@ -149,6 +151,7 @@ export function SearchTab({ activeScope, sessionId, onOpenPage, externalResultSe
   useEffect(() => {
     setError(null);
     setSearchHistory([]);
+    setActiveResultSetId(null);
     if (!sessionId) return;
     let cancelled = false;
     (async () => {
@@ -177,7 +180,10 @@ export function SearchTab({ activeScope, sessionId, onOpenPage, externalResultSe
           })
         );
         if (cancelled) return;
-        setSearchHistory(blocks.filter((b): b is SearchResultBlock => b !== null));
+        const loaded = blocks.filter((b): b is SearchResultBlock => b !== null);
+        setSearchHistory(loaded);
+        // Most recent search is the active tab on reload
+        if (loaded.length > 0) setActiveResultSetId(loaded[loaded.length - 1].resultSetId);
       } catch (e) {
         if (!cancelled) setError(e instanceof Error ? e.message : 'Failed to load saved searches');
       }
@@ -217,6 +223,7 @@ export function SearchTab({ activeScope, sessionId, onOpenPage, externalResultSe
           if (prev.some((b) => b.resultSetId === externalResultSetId)) return prev;
           return [...prev, block];
         });
+        setActiveResultSetId(externalResultSetId);
         setError(null);
       } catch (e) {
         if (!cancelled) setError(e instanceof Error ? e.message : 'Failed to load search results');
@@ -276,6 +283,51 @@ export function SearchTab({ activeScope, sessionId, onOpenPage, externalResultSe
 
   const handleExport = useCallback((resultSetId: string) => {
     window.open(api.getSearchResultSetExportUrl(resultSetId, 'csv'), '_blank');
+  }, []);
+
+  // Close a search tab (deletes the saved search server-side)
+  const handleCloseTab = useCallback(async (resultSetId: string) => {
+    const block = searchHistory.find((b) => b.resultSetId === resultSetId);
+    if (!window.confirm(`Delete the search "${block?.query ?? ''}" and its results?`)) return;
+    try {
+      await api.deleteSearchResultSet(resultSetId);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Failed to delete search');
+      return;
+    }
+    setSearchHistory((prev) => {
+      const idx = prev.findIndex((b) => b.resultSetId === resultSetId);
+      const next = prev.filter((b) => b.resultSetId !== resultSetId);
+      setActiveResultSetId((cur) => {
+        if (cur !== resultSetId) return cur;
+        if (next.length === 0) return null;
+        // Activate the neighbor to the left (or the new first tab)
+        return next[Math.max(0, idx - 1)].resultSetId;
+      });
+      return next;
+    });
+  }, [searchHistory]);
+
+  // Remove a single hit from a search's results (persists server-side; renumbers)
+  const handleRemoveItem = useCallback(async (resultSetId: string, item: SearchPageHitItem) => {
+    try {
+      await api.deleteSearchResultItem(resultSetId, item.document.id, item.page.id);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Failed to remove result');
+      return;
+    }
+    setSearchHistory((prev) => {
+      const idx = prev.findIndex((b) => b.resultSetId === resultSetId);
+      if (idx < 0) return prev;
+      const b = prev[idx];
+      const next = [...prev];
+      next[idx] = {
+        ...b,
+        items: b.items.filter((it) => !(it.document.id === item.document.id && it.page.id === item.page.id)),
+        totalHits: Math.max(0, b.totalHits - 1),
+      };
+      return next;
+    });
   }, []);
 
   // Require session (like Chat)
@@ -414,8 +466,40 @@ export function SearchTab({ activeScope, sessionId, onOpenPage, externalResultSe
         <div className="search-error">{error}</div>
       )}
 
+      {/* Search tabs — one per search in this session; wraps to multiple rows so full names stay visible */}
+      {searchHistory.length > 0 && (
+        <div className="search-tabs" role="tablist" aria-label="Searches in this session">
+          {searchHistory.map((block) => (
+            <div
+              key={block.resultSetId}
+              className={`search-tab-chip${block.resultSetId === activeResultSetId ? ' search-tab-chip-active' : ''}`}
+            >
+              <button
+                type="button"
+                role="tab"
+                aria-selected={block.resultSetId === activeResultSetId}
+                className="search-tab-chip-label"
+                onClick={() => setActiveResultSetId(block.resultSetId)}
+                title={`${block.query} — ${block.totalHits} hits`}
+              >
+                {block.query}
+              </button>
+              <button
+                type="button"
+                className="search-tab-chip-close"
+                onClick={() => handleCloseTab(block.resultSetId)}
+                title="Delete this search"
+                aria-label={`Delete search: ${block.query}`}
+              >
+                ✕
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+
       <div className="search-results-container">
-        {searchHistory.map((block) => (
+        {searchHistory.filter((block) => block.resultSetId === activeResultSetId).map((block) => (
           <div key={block.resultSetId} className="search-result-block">
             {block.notice && (
               <div className="search-notice" style={{
@@ -474,6 +558,7 @@ export function SearchTab({ activeScope, sessionId, onOpenPage, externalResultSe
               onOpenPage={onOpenPage}
               resultSetId={block.resultSetId}
               isLoading={false}
+              onRemoveItem={(item) => handleRemoveItem(block.resultSetId, item)}
             />
             {block.totalHits > block.items.length && block.nextCursor != null && (
               <button
