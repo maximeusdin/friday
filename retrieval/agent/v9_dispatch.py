@@ -1367,14 +1367,20 @@ def _run_think_deeper(
                             for b in ev_update.bullets:
                                 cids = b.supporting_chunk_ids or []
                                 b_doc_ids = sorted(set(chunk_doc_map[cid] for cid in cids if cid in chunk_doc_map))
-                                bullet_payloads.append({
+                                payload = {
                                     "text": b.text,
                                     "tags": b.tags,
                                     "chunk_ids": cids,
                                     "doc_ids": b_doc_ids,
                                     "pages": [_parse_page(chunk_to_page.get(cid)) for cid in cids],
                                     "source_names": [doc_names.get(did, "") for did in b_doc_ids],
-                                })
+                                }
+                                if getattr(b, "support_quote", "") and getattr(b, "quote_chunk_id", None):
+                                    from retrieval.agent.v11_runner import _lookup_quote_page
+                                    payload["quote"] = b.support_quote
+                                    payload["quote_chunk_id"] = b.quote_chunk_id
+                                    payload["quote_page"] = _lookup_quote_page(conn, b.quote_chunk_id, b.support_quote)
+                                bullet_payloads.append(payload)
                             progress_callback("evidence_update", "completed",
                                 f"Discovered {len(ev_update.bullets)} evidence bullets from Think Deeper",
                                 {
