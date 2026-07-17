@@ -956,6 +956,7 @@ def run_v11_query(
 
     tool_calls_executed = 0
     model_turns = 0
+    finalize_retries = 0  # bounded pushback on rejected finalizations (anti-give-up)
     done = False
     synthesis: Optional[V9Synthesis] = None
     prev_counts = _snapshot_counts(workspace)
@@ -1248,6 +1249,23 @@ def run_v11_query(
         if not valid and issues:
             if verbose:
                 print(f"  [V11] Finalization validation: {issues}", file=sys.stderr)
+            # Act on the verdict (previously log-only): push the model back into the
+            # loop with the concrete issues, bounded to 2 retries so a stubborn model
+            # can't ping-pong. This is the anti-give-up mechanism — a "couldn't find
+            # it" final with unused budget gets sent back to search, not shipped.
+            if finalize_retries < 2:
+                finalize_retries += 1
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "Your finalization was rejected: " + " | ".join(issues[:3]) +
+                        " Address these now — continue investigating with tools if needed, "
+                        "then finalize."
+                    ),
+                })
+                synthesis = None
+                prev_counts = _snapshot_counts(workspace)
+                continue
         done = True
         prev_counts = _snapshot_counts(workspace)
 

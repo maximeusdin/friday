@@ -211,6 +211,21 @@ def plan_query(question: str, *, model: str = _PLANNER_MODEL, verbose: bool = Fa
         rq = []
     elif re.search(r"\b(documents?|records?|files?|reports?|memos?|memoranda)\b", question, re.I):
         rq = []
+    else:
+        # Entity-anchor requirement: a records rewrite must carry at least one entity
+        # name from the plan — an entity-less reframe is generic vocabulary soup that
+        # dilutes evidence (the failure the count-gate caught, generalized).
+        ent_tokens = {
+            t.lower()
+            for e in (plan.get("entities") or [])
+            for t in re.split(r"[\s,./]+", str(e))
+            if len(t) >= 3 and t.lower() not in _FRAMING
+        }
+        if ent_tokens:
+            rq = [q for q in rq
+                  if any(t in str(q).lower() for t in ent_tokens)]
+        else:
+            rq = []
     plan["records_queries"] = _dedup_preserve(rq)[:2]
 
     if verbose:

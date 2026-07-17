@@ -2239,6 +2239,26 @@ def _validate_finalization(
                 "Each member must cite at least one chunk that supports their identification."
             ]
 
+    # --- Layer C3: anti-give-up — an "insufficient, couldn't find it" final with most of
+    # the tool budget unused is a premature surrender, not an answer. Push the model back
+    # into the search loop with concrete reformulation guidance (the record-language
+    # rewrite that recovers vocabulary-mismatch failures like the Morris Childs case).
+    if (synthesis.sufficiency
+            and not synthesis.sufficiency.sufficient
+            and tool_calls_executed < max_tool_calls - 4):
+        _has_grounded = any(
+            c.citation_chunk_ids or (c.evidence and any(e.chunk_id for e in c.evidence))
+            for c in synthesis.claims
+        )
+        if not _has_grounded:
+            return False, [
+                "You reported insufficient evidence with NO grounded claims, but most of the "
+                "tool budget remains — do not give up yet. Reformulate in the archive's own "
+                "record language (add words like memorandum, report, teletype, statement, "
+                "'initial contact', informant, plus the key names), run search + search_lexical "
+                "on the rarest name, THEN finalize with whatever you find."
+            ]
+
     # --- Layer D: summary-derived claim check (evidence memory grounding nudge) ---
     if workspace and workspace._bullet_index and budget_left:
         # Build map of which claims are already grounded by citation_chunk_ids or evidence

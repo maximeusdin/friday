@@ -1454,7 +1454,11 @@ class V9Result:
                 lines.append("--- Summary ---")
             lines.append(narrative)
         elif not grounded_claims and self.narrative:
-            lines.append("--- No grounded summary available — no claims with valid citations ---")
+            # Never render an empty result when a narrative exists — show it clearly
+            # labeled instead. An honest unverified summary beats a blank screen
+            # (the old banner-only path read as "no answer at all").
+            lines.append("--- Summary (unverified — no claims passed citation checks) ---")
+            lines.append(self._expand_entity_refs(self.narrative, alias_map))
 
         # --- Roster: grounded/weak only — entries must have valid support_chunk_ids ---
         grounded_roster = [gr for gr in self.grounded_roster if gr.status in ("grounded", "weak")]
