@@ -367,6 +367,7 @@ def get_phrase_positions_on_demand(
     conn,
     case_sensitive: bool = False,
     context_chars: int = 50,
+    text: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
     Tier 3: Compute phrase positions on-demand when UI requests.
@@ -380,6 +381,7 @@ def get_phrase_positions_on_demand(
         conn: Database connection
         case_sensitive: Whether matching is case-sensitive (default False)
         context_chars: Characters of context around match (default 50, max 200)
+        text: If provided, skip DB fetch (for batch operations)
         
     Returns:
         List of match details with positions and context
@@ -390,18 +392,20 @@ def get_phrase_positions_on_demand(
     # Cap context_chars for safety
     context_chars = min(context_chars, 200)
     
-    # Load chunk text (single chunk only - Tier 3 rule)
-    with conn.cursor() as cur:
-        cur.execute("""
-            SELECT COALESCE(clean_text, text) as content
-            FROM chunks
-            WHERE id = %(chunk_id)s
-        """, {"chunk_id": chunk_id})
-        result = cur.fetchone()
-        if not result:
-            return []
-        
-        text = result[0] or ""
+    # Use provided text or load from DB
+    if text is None:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT COALESCE(clean_text, text) as content
+                FROM chunks
+                WHERE id = %(chunk_id)s
+            """, {"chunk_id": chunk_id})
+            result = cur.fetchone()
+            if not result:
+                return []
+            text = result[0] or ""
+    else:
+        text = text or ""
     
     matches = []
     

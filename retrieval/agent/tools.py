@@ -14,11 +14,12 @@ TOOL CATEGORIES:
    - lexical_search: Terms must appear in chunk (good for specific names/phrases)
    - lexical_exact: Exact substring match (good for codenames, exact phrases)
 
-2. ENTITY TOOLS (use entity_mentions index):
-   - entity_lookup: Find entity ID by name
+2. ENTITY TOOLS (use entity_mentions + PEM for resolution):
+   - entity_lookup: Find entity ID by name (PEM-only resolution)
    - entity_surfaces: Get all surface forms (names, aliases) for an entity
    - entity_mentions: Find all chunks mentioning an entity
    - co_mention_entities: Find entities that co-occur with another entity
+   Entity name resolution uses PEM (page_entity_mentions) as sole source; no concordance fallback.
 
 3. CONCORDANCE TOOLS (use concordance/alias database):
    - expand_aliases: Get aliases/variants for a term from concordance
@@ -100,19 +101,26 @@ def _build_filters(
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
     document_id: Optional[int] = None,
+    document_ids: Optional[List[int]] = None,
     exclude_chunk_ids: Optional[List[int]] = None,
     exclude_page_ids: Optional[List[int]] = None,
     exclude_document_ids: Optional[List[int]] = None,
+    exclude_collections: Optional[List[str]] = None,
 ) -> SearchFilters:
-    """Build SearchFilters from common parameters."""
+    """Build SearchFilters from common parameters.
+
+    Precedence: document_ids > document_id > collections (enforced in _build_where).
+    """
     return SearchFilters(
         collection_slugs=collections if collections else None,
         date_from=date_from,
         date_to=date_to,
         document_id=document_id,
+        document_ids=document_ids if document_ids else None,
         exclude_chunk_ids=exclude_chunk_ids,
         exclude_page_ids=exclude_page_ids,
         exclude_document_ids=exclude_document_ids,
+        exclude_collection_slugs=exclude_collections,
     )
 
 
@@ -136,16 +144,19 @@ def _extract_chunk_hits(hits: List[ChunkHit]) -> tuple:
 def hybrid_search_tool(
     conn,
     query: str = None,
-    top_k: int = 200,
+    top_k: int = 205,
     collections: Optional[List[str]] = None,
+    document_ids: Optional[List[int]] = None,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
     expand_concordance: bool = True,
     fuzzy_enabled: bool = True,
+    use_canonical_embeddings: Optional[bool] = None,
     # V7 Phase 2: Exclusion/pagination params
     exclude_chunk_ids: Optional[List[int]] = None,
     exclude_page_ids: Optional[List[int]] = None,
     exclude_document_ids: Optional[List[int]] = None,
+    exclude_collections: Optional[List[str]] = None,
 ) -> ToolResult:
     """
     Hybrid search combining vector + lexical via Reciprocal Rank Fusion.
@@ -157,6 +168,10 @@ def hybrid_search_tool(
     V7 Phase 2: Supports exclude_chunk_ids, exclude_page_ids, exclude_document_ids
     for pagination and novelty control.
     """
+    import os
+    if use_canonical_embeddings is None:
+        # Default: neutral (original) embeddings. USE_CANONICAL_EMBEDDINGS=1 opts in to canonical.
+        use_canonical_embeddings = os.getenv("USE_CANONICAL_EMBEDDINGS", "0").strip().lower() in ("1", "true", "yes")
     start = time.time()
     
     # Validate and normalize inputs
@@ -188,9 +203,11 @@ def hybrid_search_tool(
     try:
         filters = _build_filters(
             collections, date_from, date_to,
+            document_ids=document_ids,
             exclude_chunk_ids=exclude_chunk_ids,
             exclude_page_ids=exclude_page_ids,
             exclude_document_ids=exclude_document_ids,
+            exclude_collections=exclude_collections,
         )
         
         # First, get the aliases that will be expanded (for reporting)
@@ -214,6 +231,7 @@ def hybrid_search_tool(
             k=fetch_k,
             expand_concordance=expand_concordance,
             fuzzy_lex_enabled=fuzzy_enabled,
+            use_canonical_embeddings=use_canonical_embeddings,
             log_run=False,  # We log at tool level
         )
         
@@ -244,6 +262,8 @@ def hybrid_search_tool(
                 "aliases_expanded": len(expanded_aliases) > 0,
                 "expanded_aliases": expanded_aliases[:10] if expanded_aliases else [],
                 "total_alias_count": len(expanded_aliases),
+                "index_used": "canonical" if use_canonical_embeddings else "original",
+                "fallback_used": [],  # e.g. ["missing_canonical_for:fbi", "vector_too_sparse"]
             },
             elapsed_ms=elapsed,
             has_more=has_more,
@@ -270,11 +290,13 @@ def hybrid_search_tool(
 def vector_search_tool(
     conn,
     query: str = None,
-    top_k: int = 200,
+    top_k: int = 205,
     collections: Optional[List[str]] = None,
+    document_ids: Optional[List[int]] = None,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
     expand_concordance: bool = True,
+    use_canonical_embeddings: Optional[bool] = None,
     # V7 Phase 2: Exclusion/pagination params
     exclude_chunk_ids: Optional[List[int]] = None,
     exclude_page_ids: Optional[List[int]] = None,
@@ -290,6 +312,10 @@ def vector_search_tool(
     V7 Phase 2: Supports exclude_chunk_ids, exclude_page_ids, exclude_document_ids
     for pagination and novelty control.
     """
+    import os
+    if use_canonical_embeddings is None:
+        # Default: neutral (original) embeddings. USE_CANONICAL_EMBEDDINGS=1 opts in to canonical.
+        use_canonical_embeddings = os.getenv("USE_CANONICAL_EMBEDDINGS", "0").strip().lower() in ("1", "true", "yes")
     start = time.time()
     
     # Validate and normalize inputs
@@ -321,6 +347,7 @@ def vector_search_tool(
     try:
         filters = _build_filters(
             collections, date_from, date_to,
+            document_ids=document_ids,
             exclude_chunk_ids=exclude_chunk_ids,
             exclude_page_ids=exclude_page_ids,
             exclude_document_ids=exclude_document_ids,
@@ -346,6 +373,7 @@ def vector_search_tool(
             filters=filters,
             k=fetch_k,
             expand_concordance=expand_concordance,
+            use_canonical_embeddings=use_canonical_embeddings,
             log_run=False,
         )
         
@@ -375,6 +403,8 @@ def vector_search_tool(
                 "aliases_expanded": len(expanded_aliases) > 0,
                 "expanded_aliases": expanded_aliases[:10] if expanded_aliases else [],
                 "total_alias_count": len(expanded_aliases),
+                "index_used": "canonical" if use_canonical_embeddings else "original",
+                "fallback_used": [],
             },
             elapsed_ms=elapsed,
             has_more=has_more,
@@ -401,8 +431,9 @@ def vector_search_tool(
 def lexical_search_tool(
     conn,
     terms: List[str],
-    top_k: int = 200,
+    top_k: int = 205,
     collections: Optional[List[str]] = None,
+    document_ids: Optional[List[int]] = None,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
     expand_aliases: bool = True,
@@ -458,6 +489,7 @@ def lexical_search_tool(
     try:
         filters = _build_filters(
             collections, date_from, date_to,
+            document_ids=document_ids,
             exclude_chunk_ids=exclude_chunk_ids,
             exclude_page_ids=exclude_page_ids,
             exclude_document_ids=exclude_document_ids,
@@ -611,8 +643,9 @@ def lexical_search_tool(
 def lexical_exact_tool(
     conn,
     term: str = None,
-    top_k: int = 200,
+    top_k: int = 205,
     collections: Optional[List[str]] = None,
+    document_ids: Optional[List[int]] = None,
     case_sensitive: bool = False,
     expand_aliases: bool = True,
     # V7 Phase 2: Exclusion/pagination params
@@ -645,7 +678,7 @@ def lexical_exact_tool(
             params={"term": term, "top_k": top_k},
             chunk_ids=[],
             scores={},
-            metadata={"message": "Empty term provided"},
+            metadata={"message": "Empty term provided", "index_used": "lexical", "fallback_used": []},
             elapsed_ms=0,
             success=True,  # Graceful empty result
         )
@@ -661,6 +694,7 @@ def lexical_exact_tool(
     try:
         filters = _build_filters(
             collections,
+            document_ids=document_ids,
             exclude_chunk_ids=exclude_chunk_ids,
             exclude_page_ids=exclude_page_ids,
             exclude_document_ids=exclude_document_ids,
@@ -734,6 +768,8 @@ def lexical_exact_tool(
                 "term_hit_counts": term_hit_counts,
                 "aliases_expanded": len(search_terms) > 1,
                 "alias_count": len(search_terms) - 1,
+                "index_used": "lexical",
+                "fallback_used": [],
             },
             elapsed_ms=elapsed,
             has_more=has_more,
@@ -750,7 +786,7 @@ def lexical_exact_tool(
             params={"term": term, "top_k": top_k},
             chunk_ids=[],
             scores={},
-            metadata={"error_type": type(e).__name__},
+            metadata={"error_type": type(e).__name__, "index_used": "lexical", "fallback_used": []},
             elapsed_ms=elapsed,
             success=False,
             error=str(e),
@@ -827,83 +863,168 @@ def expand_aliases_tool(
 # Entity Tools - Use entity_mentions index for precise entity-based search
 # =============================================================================
 
-def _lookup_entity_by_name(conn, name: str):
+def _get_mention_count(cur, entity_id: int) -> int:
+    """Fast indexed count of entity_mentions for an entity."""
+    cur.execute(
+        "SELECT COUNT(*) FROM entity_mentions WHERE entity_id = %s",
+        (entity_id,),
+    )
+    row = cur.fetchone()
+    return row[0] if row else 0
+
+
+def _score_candidate(match_type_score: float, mention_count: int) -> float:
+    """Combine match-type score with mention-count popularity boost.
+
+    Formula: match_type_score + 0.3 * log10(mention_count + 1)
+    This ensures a partial-match entity with 5000 mentions
+    easily beats an exact-alias entity with 0 mentions, while
+    two entities matched the same way are ranked by popularity.
     """
-    Internal helper to lookup entity by name with concordance expansion.
-    
-    Returns: (entity_id, canonical_name, entity_type, matched_via) or (None, None, None, None)
+    import math
+    popularity = 0.3 * math.log10(mention_count + 1)
+    return match_type_score + popularity
+
+
+def _lookup_entity_global(
+    conn, name: str, limit: int = 15
+) -> List[Dict[str, Any]]:
     """
+    Global entity lookup via entities + entity_aliases (no PEM).
+    Returns multiple candidates with score and metadata for disambiguation.
+    Uses DISTINCT ON / aggregate to avoid duplicate rows per entity.
+    """
+    import re as _re
+
+    if not name or len(name.strip()) < 2:
+        return []
+
+    name = name.strip()
+    if len(name) >= 2 and name[0] == name[-1] and name[0] in '"\'':
+        name = name[1:-1].strip()
+    if len(name) < 2:
+        return []
+
+    term_lower = name.lower()
+    term_norm = _re.sub(r"[^a-z0-9 ]", "", term_lower).strip().replace(" ", "")
+
+    try:
+        with conn.cursor() as cur:
+            # Match: alias_norm, LOWER(alias), LOWER(canonical_name)
+            # May return multiple rows per entity; we dedupe by entity_id keeping best score
+            cur.execute("""
+                SELECT e.id, e.canonical_name, e.entity_type, ea.alias AS top_alias,
+                       CASE
+                           WHEN ea.alias_norm = %s THEN 1.0
+                           WHEN LOWER(ea.alias) = %s THEN 0.9
+                           WHEN LOWER(e.canonical_name) = %s THEN 0.85
+                           ELSE 0.5
+                       END AS score
+                FROM entities e
+                LEFT JOIN entity_aliases ea ON ea.entity_id = e.id
+                  AND (ea.alias_norm = %s OR LOWER(ea.alias) = %s)
+                WHERE LOWER(e.canonical_name) = %s OR ea.id IS NOT NULL
+            """, (term_norm, term_lower, term_lower, term_norm, term_lower, term_lower))
+            rows = cur.fetchall()
+
+        # Dedupe by entity_id, keep row with best score per entity
+        seen: Dict[int, tuple] = {}
+        for row in rows:
+            eid = row[0]
+            score = float(row[4])
+            if eid not in seen or score > seen[eid][4]:
+                seen[eid] = row
+        sorted_rows = sorted(seen.values(), key=lambda r: (float(r[4]), -r[0]), reverse=True)[:limit]
+
+        out = []
+        for row in sorted_rows:
+            out.append({
+                "entity_id": row[0],
+                "canonical_name": row[1] or "",
+                "entity_type": row[2] or "",
+                "top_alias_matched": row[3],
+                "score": float(row[4]),
+            })
+        return out
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return []
+
+
+def _is_codename_like(term: str) -> bool:
+    """True if term looks like a codename (all-caps, short token)."""
+    import re
+    t = term.strip()
+    if len(t) < 3 or len(t) > 20:
+        return False
+    return bool(re.match(r"^[A-Z0-9\-]{3,}$", t))
+
+
+def _lookup_entity_by_name(conn, name: str, verbose: bool = False, scope=None):
+    """
+    Entity lookup: global (entities/entity_aliases) when scope empty; PEM when scope includes V/V and term is codename-like.
+
+    When scope.collections is empty: try global lookup first. No V/V assumption.
+    When scope includes Venona/Vassiliev and term is codename-like: try PEM first, then global.
+    Otherwise: global lookup only.
+
+    Returns (entity_id, canonical_name, entity_type, "pem"|"global") or (None, None, None, None).
+    """
+    import sys as _sys
+
     if not name or not name.strip():
         return None, None, None, None
-    
+
     name = name.strip()
-    
-    with conn.cursor() as cur:
-        # Try exact canonical name match first
-        cur.execute(
-            "SELECT id, canonical_name, entity_type FROM entities WHERE LOWER(canonical_name) = LOWER(%s) LIMIT 1",
-            (name,)
+    if len(name) >= 2 and name[0] == name[-1] and name[0] in '"\'':
+        name = name[1:-1].strip()
+    if len(name) < 2:
+        return None, None, None, None
+
+    try:
+        from retrieval.agent.v9_types import ScopeFilter
+
+        _scope = scope if scope is not None else ScopeFilter()
+        scope_collections = _scope.collections if _scope and _scope.collections else []
+        has_vv = bool(scope_collections and set(scope_collections) & {"venona", "vassiliev"})
+
+        # When scope has V/V and term is codename-like: try PEM first
+        if has_vv and _is_codename_like(name):
+            from retrieval.agent.v9_pem_lane import resolve_keyword_via_pem
+            pem_result = resolve_keyword_via_pem(conn, name, _scope, verbose=verbose)
+            if pem_result:
+                eid, canonical = pem_result
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute("SELECT entity_type FROM entities WHERE id = %s", (eid,))
+                        row = cur.fetchone()
+                        etype = row[0] if row else ""
+                    return (eid, canonical, etype, "pem")
+                except Exception:
+                    return (eid, canonical, "", "pem")
+
+        # Global lookup (scope empty or PEM didn't match)
+        candidates = _lookup_entity_global(conn, name, limit=15)
+        if not candidates:
+            return None, None, None, None
+        best = candidates[0]
+        return (
+            best["entity_id"],
+            best["canonical_name"],
+            best["entity_type"],
+            "global",
         )
-        row = cur.fetchone()
-        if row:
-            return row[0], row[1], row[2], "canonical_name"
-        
-        # Try alias match
-        cur.execute("""
-            SELECT e.id, e.canonical_name, e.entity_type
-            FROM entities e
-            JOIN entity_aliases ea ON ea.entity_id = e.id
-            WHERE LOWER(ea.alias) = LOWER(%s)
-            LIMIT 1
-        """, (name,))
-        row = cur.fetchone()
-        if row:
-            return row[0], row[1], row[2], "alias"
-        
-        # Try partial match on canonical name
-        cur.execute("""
-            SELECT id, canonical_name, entity_type 
-            FROM entities 
-            WHERE LOWER(canonical_name) LIKE LOWER(%s)
-            ORDER BY LENGTH(canonical_name)
-            LIMIT 1
-        """, (f"%{name}%",))
-        row = cur.fetchone()
-        if row:
-            return row[0], row[1], row[2], "partial_match"
-        
-        # Try concordance expansion - maybe the name is a codename or variant
+
+    except Exception as e:
+        if verbose:
+            print(f"    [_lookup] Lookup failed for '{name}': {e}", file=_sys.stderr)
         try:
-            expanded = concordance_expand_terms(
-                conn=conn,
-                text=name,
-                max_aliases_out=10,
-            )
-            for alias in expanded:
-                if alias.lower() != name.lower():
-                    # Try each expanded alias
-                    cur.execute(
-                        "SELECT id, canonical_name, entity_type FROM entities WHERE LOWER(canonical_name) = LOWER(%s) LIMIT 1",
-                        (alias,)
-                    )
-                    row = cur.fetchone()
-                    if row:
-                        return row[0], row[1], row[2], f"concordance:{alias}"
-                    
-                    # Also try alias table
-                    cur.execute("""
-                        SELECT e.id, e.canonical_name, e.entity_type
-                        FROM entities e
-                        JOIN entity_aliases ea ON ea.entity_id = e.id
-                        WHERE LOWER(ea.alias) = LOWER(%s)
-                        LIMIT 1
-                    """, (alias,))
-                    row = cur.fetchone()
-                    if row:
-                        return row[0], row[1], row[2], f"concordance:{alias}"
+            conn.rollback()
         except Exception:
-            pass  # Concordance expansion failed - continue without it
-        
+            pass
         return None, None, None, None
 
 
@@ -914,14 +1035,14 @@ def entity_lookup_tool(
     """
     Look up an entity by name to get its ID.
     
-    Searches canonical names, aliases, AND concordance expansions.
+    Resolves names via PEM (page_entity_mentions) only.
     This means searching for "PAL" will find "Nathan Gregory Silvermaster".
     
     GRACEFUL: Returns success=True with found=False if entity doesn't exist.
     Only returns success=False on actual errors.
     
     Example: entity_lookup("Silvermaster") -> {entity_id: 123, canonical_name: "Nathan Gregory Silvermaster"}
-    Example: entity_lookup("PAL") -> {entity_id: 123, canonical_name: "Nathan Gregory Silvermaster", matched_via: "concordance:PAL"}
+    Example: entity_lookup("PAL") -> {entity_id: 123, canonical_name: "Nathan Gregory Silvermaster", matched_via: "pem"}
     """
     start = time.time()
     
@@ -1009,10 +1130,10 @@ def entity_surfaces_tool(
     Returns canonical name and all known aliases in metadata.
     Use these surface forms for subsequent lexical searches.
     
-    Can use EITHER entity_id OR name (name will be looked up with concordance expansion).
+    Can use EITHER entity_id OR name (name resolved via PEM; see docs/entity_resolution_pem_only.md).
     
     Example: entity_surfaces(entity_id=123) -> {canonical: "Silvermaster", aliases: ["PAL", "Robert"]}
-    Example: entity_surfaces(name="PAL") -> finds Silvermaster's surfaces via concordance
+    Example: entity_surfaces(name="PAL") -> finds Silvermaster's surfaces via PEM
     """
     start = time.time()
     
@@ -1028,10 +1149,10 @@ def entity_surfaces_tool(
         except (ValueError, TypeError):
             entity_id = None
     
-    # Resolve entity_id from name if needed (with concordance expansion)
+    # Resolve entity_id from name if needed (via PEM)
     resolved_id = entity_id
     matched_via = None
-    
+
     if resolved_id is None and name:
         eid, canonical, etype, matched = _lookup_entity_by_name(conn, name)
         if eid:
@@ -1046,7 +1167,7 @@ def entity_surfaces_tool(
                 scores={},
                 metadata={
                     "found": False,
-                    "message": f"Entity '{name}' not found (checked concordance too).",
+                    "message": f"Entity '{name}' not found in PEM.",
                 },
                 elapsed_ms=elapsed,
                 success=True,  # Graceful
@@ -1110,7 +1231,8 @@ def entity_mentions_tool(
     conn,
     entity_id: Optional[int] = None,
     name: Optional[str] = None,
-    top_k: int = 200,
+    top_k: int = 205,
+    collections: Optional[List[str]] = None,
 ) -> ToolResult:
     """
     Find all chunks that mention a specific entity.
@@ -1119,12 +1241,15 @@ def entity_mentions_tool(
     Much more precise than lexical search for finding specific people/orgs.
     
     Can use EITHER entity_id OR name (name will be looked up automatically).
-    Name lookup includes CONCORDANCE EXPANSION - so "PAL" finds Silvermaster.
+    Name lookup uses PEM (page_entity_mentions) — so "PAL" finds Silvermaster if in PEM.
     
     GRACEFUL: Returns empty results (not error) if entity not found.
     
+    Args:
+        collections: Optional list of collection slugs to filter results
+    
     Example: entity_mentions(name="Silvermaster", top_k=100) -> chunks mentioning Silvermaster
-    Example: entity_mentions(name="PAL") -> finds Silvermaster via concordance
+    Example: entity_mentions(name="PAL") -> finds Silvermaster via PEM
     """
     start = time.time()
     
@@ -1141,16 +1266,22 @@ def entity_mentions_tool(
             entity_id = None
     
     if top_k is None or not isinstance(top_k, int):
-        top_k = 200
+        top_k = 205
     top_k = min(max(top_k, 1), 500)  # Clamp to reasonable range
     
-    # Resolve entity_id from name if needed (with concordance expansion)
+    # Normalize collections
+    if collections and isinstance(collections, list):
+        collections = [c for c in collections if c]
+    else:
+        collections = None
+    
+    # Resolve entity_id from name if needed (via PEM)
     resolved_id = entity_id
     resolved_name = None
     matched_via = None
     
     if resolved_id is None and name:
-        # Look up entity by name (includes concordance expansion)
+        # Look up entity by name (via PEM)
         eid, canonical, etype, matched = _lookup_entity_by_name(conn, name)
         if eid:
             resolved_id = eid
@@ -1166,7 +1297,7 @@ def entity_mentions_tool(
                 scores={},
                 metadata={
                     "entity_found": False,
-                    "message": f"Entity '{name}' not in database (checked concordance too). Try hybrid_search or lexical_exact instead.",
+                    "message": f"Entity '{name}' not in PEM. Try hybrid_search or lexical_exact instead.",
                     "suggestion": f"lexical_exact(term='{name}')",
                 },
                 elapsed_ms=elapsed,
@@ -1190,14 +1321,26 @@ def entity_mentions_tool(
     try:
         with conn.cursor() as cur:
             # Get chunks mentioning this entity, ordered by document/page for coherence
-            cur.execute("""
-                SELECT DISTINCT em.chunk_id, cm.document_id, cm.first_page_id
-                FROM entity_mentions em
-                LEFT JOIN chunk_metadata cm ON cm.chunk_id = em.chunk_id
-                WHERE em.entity_id = %s
-                ORDER BY cm.document_id, cm.first_page_id
-                LIMIT %s
-            """, (resolved_id, top_k))
+            # If collections specified, filter to only chunks in those collections
+            if collections:
+                cur.execute("""
+                    SELECT DISTINCT em.chunk_id, cm.document_id, cm.first_page_id
+                    FROM entity_mentions em
+                    JOIN chunk_metadata cm ON cm.chunk_id = em.chunk_id
+                    WHERE em.entity_id = %s
+                    AND cm.collection_slug = ANY(%s)
+                    ORDER BY cm.document_id, cm.first_page_id
+                    LIMIT %s
+                """, (resolved_id, collections, top_k))
+            else:
+                cur.execute("""
+                    SELECT DISTINCT em.chunk_id, cm.document_id, cm.first_page_id
+                    FROM entity_mentions em
+                    LEFT JOIN chunk_metadata cm ON cm.chunk_id = em.chunk_id
+                    WHERE em.entity_id = %s
+                    ORDER BY cm.document_id, cm.first_page_id
+                    LIMIT %s
+                """, (resolved_id, top_k))
             
             rows = cur.fetchall()
             chunk_ids = [row[0] for row in rows]
@@ -1254,7 +1397,8 @@ def co_mention_entities_tool(
     conn,
     entity_id: Optional[int] = None,
     name: Optional[str] = None,
-    top_k: int = 30,
+    top_k: int = 35,
+    collections: Optional[List[str]] = None,
 ) -> ToolResult:
     """
     Find entities that frequently co-occur with a given entity.
@@ -1263,12 +1407,15 @@ def co_mention_entities_tool(
     Useful for discovering network members, associates, or related concepts.
     
     Can use EITHER entity_id OR name (name will be looked up automatically).
-    Name lookup includes CONCORDANCE EXPANSION - so "PAL" finds Silvermaster's co-mentions.
+    Name lookup uses PEM — so "PAL" finds Silvermaster's co-mentions if in PEM.
     
     GRACEFUL: Returns empty results (not error) if entity not found.
     
+    Args:
+        collections: Optional list of collection slugs to filter results
+    
     Example: co_mention_entities(name="Silvermaster") -> [Harry White, Ullmann, Perlo, ...]
-    Example: co_mention_entities(name="PAL") -> finds Silvermaster's co-mentions via concordance
+    Example: co_mention_entities(name="PAL") -> finds Silvermaster's co-mentions via PEM
     """
     start = time.time()
     
@@ -1285,16 +1432,22 @@ def co_mention_entities_tool(
             entity_id = None
     
     if top_k is None or not isinstance(top_k, int):
-        top_k = 30
+        top_k = 35
     top_k = min(max(top_k, 1), 100)  # Clamp to reasonable range
     
-    # Resolve entity_id from name if needed (with concordance expansion)
+    # Normalize collections
+    if collections and isinstance(collections, list):
+        collections = [c for c in collections if c]
+    else:
+        collections = None
+    
+    # Resolve entity_id from name if needed (via PEM)
     resolved_id = entity_id
     resolved_name = None
     matched_via = None
     
     if resolved_id is None and name:
-        # Look up entity by name (includes concordance expansion)
+        # Look up entity by name (via PEM)
         eid, canonical, etype, matched = _lookup_entity_by_name(conn, name)
         if eid:
             resolved_id = eid
@@ -1310,7 +1463,7 @@ def co_mention_entities_tool(
                 scores={},
                 metadata={
                     "entity_found": False,
-                    "message": f"Entity '{name}' not in database (checked concordance too). Try hybrid_search instead.",
+                    "message": f"Entity '{name}' not in PEM. Try hybrid_search instead.",
                     "co_entities": [],  # Empty list, not missing key
                 },
                 elapsed_ms=elapsed,
@@ -1335,20 +1488,39 @@ def co_mention_entities_tool(
     try:
         with conn.cursor() as cur:
             # Find entities mentioned in same chunks, ranked by co-occurrence count
-            cur.execute("""
-                SELECT 
-                    em2.entity_id, 
-                    e.canonical_name, 
-                    e.entity_type,
-                    COUNT(DISTINCT em1.chunk_id) as co_count
-                FROM entity_mentions em1
-                JOIN entity_mentions em2 ON em2.chunk_id = em1.chunk_id AND em2.entity_id != em1.entity_id
-                JOIN entities e ON e.id = em2.entity_id
-                WHERE em1.entity_id = %s
-                GROUP BY em2.entity_id, e.canonical_name, e.entity_type
-                ORDER BY co_count DESC
-                LIMIT %s
-            """, (resolved_id, top_k))
+            # If collections specified, filter to only chunks in those collections
+            if collections:
+                cur.execute("""
+                    SELECT 
+                        em2.entity_id, 
+                        e.canonical_name, 
+                        e.entity_type,
+                        COUNT(DISTINCT em1.chunk_id) as co_count
+                    FROM entity_mentions em1
+                    JOIN entity_mentions em2 ON em2.chunk_id = em1.chunk_id AND em2.entity_id != em1.entity_id
+                    JOIN entities e ON e.id = em2.entity_id
+                    JOIN chunk_metadata cm ON cm.chunk_id = em1.chunk_id
+                    WHERE em1.entity_id = %s
+                    AND cm.collection_slug = ANY(%s)
+                    GROUP BY em2.entity_id, e.canonical_name, e.entity_type
+                    ORDER BY co_count DESC
+                    LIMIT %s
+                """, (resolved_id, collections, top_k))
+            else:
+                cur.execute("""
+                    SELECT 
+                        em2.entity_id, 
+                        e.canonical_name, 
+                        e.entity_type,
+                        COUNT(DISTINCT em1.chunk_id) as co_count
+                    FROM entity_mentions em1
+                    JOIN entity_mentions em2 ON em2.chunk_id = em1.chunk_id AND em2.entity_id != em1.entity_id
+                    JOIN entities e ON e.id = em2.entity_id
+                    WHERE em1.entity_id = %s
+                    GROUP BY em2.entity_id, e.canonical_name, e.entity_type
+                    ORDER BY co_count DESC
+                    LIMIT %s
+                """, (resolved_id, top_k))
             
             co_entities = [
                 {
@@ -1364,16 +1536,30 @@ def co_mention_entities_tool(
             chunk_ids = []
             if co_entities:
                 top_entity_ids = [e["entity_id"] for e in co_entities[:5]]
-                cur.execute("""
-                    SELECT DISTINCT em1.chunk_id
-                    FROM entity_mentions em1
-                    WHERE em1.entity_id = %s
-                    AND EXISTS (
-                        SELECT 1 FROM entity_mentions em2 
-                        WHERE em2.chunk_id = em1.chunk_id AND em2.entity_id = ANY(%s)
-                    )
-                    LIMIT 100
-                """, (resolved_id, top_entity_ids))
+                if collections:
+                    cur.execute("""
+                        SELECT DISTINCT em1.chunk_id
+                        FROM entity_mentions em1
+                        JOIN chunk_metadata cm ON cm.chunk_id = em1.chunk_id
+                        WHERE em1.entity_id = %s
+                        AND cm.collection_slug = ANY(%s)
+                        AND EXISTS (
+                            SELECT 1 FROM entity_mentions em2 
+                            WHERE em2.chunk_id = em1.chunk_id AND em2.entity_id = ANY(%s)
+                        )
+                        LIMIT 100
+                    """, (resolved_id, collections, top_entity_ids))
+                else:
+                    cur.execute("""
+                        SELECT DISTINCT em1.chunk_id
+                        FROM entity_mentions em1
+                        WHERE em1.entity_id = %s
+                        AND EXISTS (
+                            SELECT 1 FROM entity_mentions em2 
+                            WHERE em2.chunk_id = em1.chunk_id AND em2.entity_id = ANY(%s)
+                        )
+                        LIMIT 100
+                    """, (resolved_id, top_entity_ids))
                 chunk_ids = [row[0] for row in cur.fetchall()]
             
             elapsed = (time.time() - start) * 1000
@@ -1423,12 +1609,12 @@ def first_mention_tool(
     Useful for establishing when a person first appears in the record.
     
     Can use EITHER entity_id OR name (name will be looked up automatically).
-    Name lookup includes CONCORDANCE EXPANSION - so "PAL" finds Silvermaster's first mention.
+    Name lookup uses PEM — so "PAL" finds Silvermaster's first mention if in PEM.
     
     GRACEFUL: Returns empty results (not error) if entity not found.
     
     Example: first_mention(name="Alger Hiss") -> earliest chunk mentioning Hiss
-    Example: first_mention(name="ALES") -> finds Hiss's first mention via concordance
+    Example: first_mention(name="ALES") -> finds Hiss's first mention via PEM
     """
     start = time.time()
     
@@ -1444,13 +1630,13 @@ def first_mention_tool(
         except (ValueError, TypeError):
             entity_id = None
     
-    # Resolve entity_id from name if needed (with concordance expansion)
+    # Resolve entity_id from name if needed (via PEM)
     resolved_id = entity_id
     resolved_name = None
     matched_via = None
     
     if resolved_id is None and name:
-        # Look up entity by name (includes concordance expansion)
+        # Look up entity by name (via PEM)
         eid, canonical, etype, matched = _lookup_entity_by_name(conn, name)
         if eid:
             resolved_id = eid
@@ -1466,7 +1652,7 @@ def first_mention_tool(
                 scores={},
                 metadata={
                     "entity_found": False,
-                    "message": f"Entity '{name}' not in database (checked concordance too).",
+                    "message": f"Entity '{name}' not in PEM.",
                 },
                 elapsed_ms=elapsed,
                 success=True,  # Graceful - not a crash

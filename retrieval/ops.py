@@ -49,7 +49,7 @@ def concordance_expand_terms(
     conn,
     text: str,
     *,
-    source_slug: str = "venona_vassiliev_concordance_v3",
+    source_slug: str = "vassiliev_venona_index_20260130",
     max_entities_scan: int = 5000,
     max_aliases_out: int = 25,
 ) -> List[str]:
@@ -110,13 +110,47 @@ def concordance_expand_terms(
         )
         alias_rows = cur.fetchall()
 
-    # 3) Determine which entity_ids match the query key
+    # 3) Filter out garbage entities/aliases before matching.
+    #    Canonical names or aliases with > 3 words are sentence fragments
+    #    from the concordance source, not real entity names.
+    def _is_valid_concordance_term(term: str) -> bool:
+        t = (term or "").strip()
+        if not t:
+            return False
+        if len(t.split()) > 3:
+            return False
+        # Reject strings with semicolons, numbers (page refs), em-dashes
+        if any(ch in t for ch in ";–—"):
+            return False
+        if any(ch.isdigit() for ch in t):
+            return False
+        return True
+
+    entity_rows = [(eid, term) for eid, term in entity_rows
+                    if _is_valid_concordance_term(term)]
+    alias_rows = [(eid, term) for eid, term in alias_rows
+                   if _is_valid_concordance_term(term)]
+
+    # 4) Determine which entity_ids match the query key.
+    #    Two matching modes:
+    #      a) Exact: _norm_key(term) == q_key  (e.g. "PAL" == "pal")
+    #      b) Token: q_key appears as a full token in _norm_key(term)
+    #         This handles surnames: "silvermaster" matches
+    #         "nathan gregory silvermaster".  We only do token match when
+    #         the query key is a single token (no spaces) to avoid false
+    #         positives on very short fragments.
     matched_entity_ids = set()
+    q_is_single_token = " " not in q_key and len(q_key) >= 3
 
     def _consider(entity_id: int, term: str):
         if not term:
             return
-        if _norm_key(term) == q_key:
+        tk = _norm_key(term)
+        if tk == q_key:
+            matched_entity_ids.add(entity_id)
+        elif q_is_single_token and q_key in tk.split():
+            # Token-level match: "silvermaster" is a token in
+            # "nathan gregory silvermaster"
             matched_entity_ids.add(entity_id)
 
     for entity_id, term in entity_rows:
@@ -128,7 +162,7 @@ def concordance_expand_terms(
     if not matched_entity_ids:
         return []
 
-    # 4) Collect expansions (canonical + aliases for matched entities)
+    # 5) Collect expansions (canonical + aliases for matched entities)
     out: List[str] = []
     seen = set()
 
@@ -160,7 +194,7 @@ def concordance_expand_terms_fuzzy(
     conn,
     text: str,
     *,
-    source_slug: str = "venona_vassiliev_concordance_v3",
+    source_slug: str = "vassiliev_venona_index_20260130",
     similarity_threshold: float = 0.6,
     max_candidates: int = 5,
     max_aliases_out: int = 25,
@@ -591,12 +625,14 @@ def build_expanded_query_string(
 
 @dataclass(frozen=True)
 class SearchFilters:
-    chunk_pv: str = "chunk_v1_full"
+    chunk_pv: Optional[str] = None  # None = no PV constraint (search all collections)
     meta_pv: Optional[str] = None  # defaults to chunk_pv if None
 
     # optional filters
     collection_slugs: Optional[List[str]] = None
+    collection_pv_pairs: Optional[List[Tuple[str, str]]] = None  # (collection_slug, pipeline_version); set by resolver when collection_slugs used
     document_id: Optional[int] = None  
+    document_ids: Optional[List[int]] = None   # multi-doc filter (wins over collection_slugs)
     date_from: Optional[str] = None  # YYYY-MM-DD
     date_to: Optional[str] = None    # YYYY-MM-DD
     
@@ -604,6 +640,7 @@ class SearchFilters:
     exclude_chunk_ids: Optional[List[int]] = None      # granular exclusion
     exclude_page_ids: Optional[List[int]] = None       # reduces near-duplicate churn
     exclude_document_ids: Optional[List[int]] = None   # broader exclusion
+    exclude_collection_slugs: Optional[List[str]] = None  # exclude collections (e.g. venona,vassiliev)
 
 
 @dataclass
@@ -1133,8 +1170,68 @@ def vector_literal(vec: Sequence[float]) -> str:
     return "[" + ",".join(f"{x:.8f}" for x in vec) + "]"
 
 
-def _meta_pv(filters: SearchFilters) -> str:
+def _meta_pv(filters: SearchFilters) -> Optional[str]:
     return filters.meta_pv or filters.chunk_pv
+
+
+def resolve_collection_pipeline_versions(
+    conn, collection_slugs: List[str]
+) -> List[Tuple[str, str]]:
+    """
+    Resolve (collection_slug, pipeline_version) for each collection.
+    Raises ValueError if any collection has multiple pipeline versions.
+    """
+    if not collection_slugs:
+        return []
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT cm.collection_slug, c.pipeline_version
+            FROM chunks c
+            JOIN chunk_metadata cm ON cm.chunk_id = c.id
+            WHERE cm.collection_slug = ANY(%s)
+            GROUP BY cm.collection_slug, c.pipeline_version
+            """,
+            (list(collection_slugs),),
+        )
+        rows = cur.fetchall()
+    by_coll: Dict[str, List[str]] = {}
+    for coll, pv in rows:
+        by_coll.setdefault(coll, []).append(pv)
+    for coll in collection_slugs:
+        pvs = by_coll.get(coll, [])
+        if len(pvs) > 1:
+            raise ValueError(
+                f"Collection '{coll}' has multiple pipeline versions: {sorted(set(pvs))}. "
+                "Cannot search: pipeline version must be unique per collection."
+            )
+        if len(pvs) == 0:
+            raise ValueError(f"Collection '{coll}' has no chunks in the database.")
+    return [(coll, list(by_coll[coll])[0]) for coll in collection_slugs if coll in by_coll]
+
+
+def _resolve_filters_for_search(conn, filters: SearchFilters) -> SearchFilters:
+    """
+    When collection_slugs is set, resolve to collection_pv_pairs.
+    Returns filters with collection_pv_pairs set (and collection_slugs cleared for where clause).
+    """
+    if not filters.collection_slugs or filters.collection_pv_pairs is not None:
+        return filters
+    pairs = resolve_collection_pipeline_versions(conn, filters.collection_slugs)
+    return SearchFilters(
+        chunk_pv=filters.chunk_pv,
+        meta_pv=filters.meta_pv,
+        collection_slugs=None,
+        collection_pv_pairs=pairs,
+        document_id=filters.document_id,
+        document_ids=filters.document_ids,
+        date_from=filters.date_from,
+        date_to=filters.date_to,
+        exclude_chunk_ids=filters.exclude_chunk_ids,
+        exclude_page_ids=filters.exclude_page_ids,
+        exclude_document_ids=filters.exclude_document_ids,
+        exclude_collection_slugs=filters.exclude_collection_slugs,
+    )
 
 
 def _build_where(filters: SearchFilters, params: Dict[str, Any]) -> str:
@@ -1143,21 +1240,31 @@ def _build_where(filters: SearchFilters, params: Dict[str, Any]) -> str:
     Assumes caller uses:
       FROM chunks c
       JOIN chunk_metadata cm ON cm.chunk_id = c.id
+
+    Pipeline version: when chunk_pv is None, no PV constraint (search all).
+    When collection_pv_pairs is set, use (collection_slug, pipeline_version) IN.
     """
-    where = [
-        "c.pipeline_version = %(chunk_pv)s",
-        "cm.pipeline_version = %(meta_pv)s",
-    ]
-    params["chunk_pv"] = filters.chunk_pv
-    params["meta_pv"] = _meta_pv(filters)
+    where: List[str] = []
 
-    if filters.collection_slugs:
-        where.append("cm.collection_slug = ANY(%(collection_slugs)s)")
-        params["collection_slugs"] = filters.collection_slugs
+    if filters.collection_pv_pairs:
+        where.append("(cm.collection_slug, c.pipeline_version) IN %(collection_pv_pairs)s")
+        params["collection_pv_pairs"] = tuple(filters.collection_pv_pairs)
+    elif filters.chunk_pv is not None:
+        where.append("c.pipeline_version = %(chunk_pv)s")
+        where.append("cm.pipeline_version = %(meta_pv)s")
+        params["chunk_pv"] = filters.chunk_pv
+        params["meta_pv"] = _meta_pv(filters)
 
-    if filters.document_id is not None:
+    # Precedence: document_ids > document_id > collection_slugs (when not using collection_pv_pairs)
+    if filters.document_ids:
+        where.append("cm.document_id = ANY(%(document_ids)s)")
+        params["document_ids"] = filters.document_ids
+    elif filters.document_id is not None:
         where.append("cm.document_id = %(document_id)s")
         params["document_id"] = filters.document_id
+    elif filters.collection_slugs:
+        where.append("cm.collection_slug = ANY(%(collection_slugs)s)")
+        params["collection_slugs"] = filters.collection_slugs
 
     if filters.date_from:
         # include chunks that might overlap the range
@@ -1181,7 +1288,11 @@ def _build_where(filters: SearchFilters, params: Dict[str, Any]) -> str:
         where.append("cm.document_id != ALL(%(exclude_document_ids)s)")
         params["exclude_document_ids"] = filters.exclude_document_ids
 
-    return " AND ".join(where)
+    if filters.exclude_collection_slugs:
+        where.append("(cm.collection_slug IS NULL OR cm.collection_slug <> ALL(%(exclude_collection_slugs)s))")
+        params["exclude_collection_slugs"] = filters.exclude_collection_slugs
+
+    return " AND ".join(where) if where else "TRUE"
 
 
 def _clean_preview(s: str) -> str:
@@ -1282,6 +1393,7 @@ def lex_exact(
     Note: this is not token-exact; it is literal substring match (optionally case-sensitive).
     """
     params: Dict[str, Any] = {"k": k, "preview_chars": preview_chars}
+    filters = _resolve_filters_for_search(conn, filters)
     where_sql = _build_where(filters, params)
 
     if case_sensitive:
@@ -1375,6 +1487,7 @@ def lex_and(
         raise ValueError("lex_and requires at least 2 terms")
 
     params: Dict[str, Any] = {"k": k, "preview_chars": preview_chars}
+    filters = _resolve_filters_for_search(conn, filters)
     where_sql = _build_where(filters, params)
 
     clauses: List[str] = []
@@ -1630,12 +1743,19 @@ def vector_search(
     preview_chars: int = 2000,
     probes: int = 20,
     expand_concordance: bool = True,
-    concordance_source_slug: str = "venona_vassiliev_concordance_v3",
+    concordance_source_slug: str = "vassiliev_venona_index_20260130",
     log_run: bool = True,
     session_id: Optional[int] = None,
+    use_canonical_embeddings: bool = False,
+    canonical_embedding_model: Optional[str] = None,
 ) -> List[ChunkHit]:
     params: Dict[str, Any] = {"k": k, "preview_chars": preview_chars}
+    filters = _resolve_filters_for_search(conn, filters)
     where_sql = _build_where(filters, params)
+
+    if canonical_embedding_model is None:
+        canonical_embedding_model = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small")
+    params["canonical_embedding_model"] = canonical_embedding_model
 
     query_for_embedding = query
     exp_terms: List[str] = []
@@ -1647,7 +1767,34 @@ def vector_search(
     qvec = embed_query(query_for_embedding)
     params["qvec"] = vector_literal(qvec)
 
-    sql = f"""
+    if use_canonical_embeddings:
+        sql = f"""
+    SELECT
+      c.id AS chunk_id,
+      cm.collection_slug,
+      cm.document_id,
+      cm.first_page_id,
+      cm.last_page_id,
+      cm.date_min,
+      cm.date_max,
+      LEFT(COALESCE(c.clean_text, c.text), %(preview_chars)s) AS preview,
+      NULL::double precision AS score,
+      (COALESCE(cec.embedding, c.embedding) <=> %(qvec)s::vector) AS distance,
+      NULL::int AS r_vec,
+      NULL::int AS r_lex
+    FROM chunks c
+    LEFT JOIN chunk_embeddings_canonical cec
+      ON cec.chunk_id = c.id
+      AND cec.pipeline_version = c.pipeline_version
+      AND cec.embedding_model = %(canonical_embedding_model)s
+    JOIN chunk_metadata cm ON cm.chunk_id = c.id
+    WHERE {where_sql}
+      AND (cec.embedding IS NOT NULL OR c.embedding IS NOT NULL)
+    ORDER BY COALESCE(cec.embedding, c.embedding) <=> %(qvec)s::vector
+    LIMIT %(k)s;
+    """
+    else:
+        sql = f"""
     SELECT
       c.id AS chunk_id,
       cm.collection_slug,
@@ -1947,7 +2094,7 @@ def hybrid_rrf(
     top_n_lex: int = 200,
     rrf_k: int = 50,
     expand_concordance: bool = True,
-    concordance_source_slug: str = "venona_vassiliev_concordance_v3",
+    concordance_source_slug: str = "vassiliev_venona_index_20260130",
     log_run: bool = True,
     use_soft_lex: bool = False,
     soft_lex_threshold: float = 0.3,
@@ -1960,6 +2107,8 @@ def hybrid_rrf(
     fuzzy_lex_top_k_per_token: int = 5,
     fuzzy_lex_max_total_variants: int = 50,
     session_id: Optional[int] = None,
+    use_canonical_embeddings: bool = False,
+    canonical_embedding_model: Optional[str] = None,
 ) -> List[ChunkHit]:
     params: Dict[str, Any] = {
         "k": k,
@@ -1969,7 +2118,13 @@ def hybrid_rrf(
         "rrf_k": rrf_k,
         "soft_lex_trigram_threshold": soft_lex_trigram_threshold,
     }
+    filters = _resolve_filters_for_search(conn, filters)
     where_sql = _build_where(filters, params)
+
+    # Canonical embedding model (default from env for dual-index)
+    if canonical_embedding_model is None:
+        canonical_embedding_model = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small")
+    params["canonical_embedding_model"] = canonical_embedding_model
 
     # Optionally expand query for embeddings + lexical ranking.
     query_for_embedding = query
@@ -2120,8 +2275,26 @@ def hybrid_rrf(
             
             print(" query built", flush=True)
 
-    sql = f"""
-    WITH
+    # Vector CTE: use chunk_embeddings_canonical when use_canonical_embeddings
+    if use_canonical_embeddings:
+        vec_cte = f"""
+    vec AS (
+      SELECT
+        c.id AS chunk_id,
+        row_number() OVER (ORDER BY COALESCE(cec.embedding, c.embedding) <=> %(qvec)s::vector) AS r_vec
+      FROM chunks c
+      LEFT JOIN chunk_embeddings_canonical cec
+        ON cec.chunk_id = c.id
+        AND cec.pipeline_version = c.pipeline_version
+        AND cec.embedding_model = %(canonical_embedding_model)s
+      JOIN chunk_metadata cm ON cm.chunk_id = c.id
+      WHERE {where_sql}
+        AND (cec.embedding IS NOT NULL OR c.embedding IS NOT NULL)
+      ORDER BY COALESCE(cec.embedding, c.embedding) <=> %(qvec)s::vector
+      LIMIT %(top_n_vec)s
+    ),"""
+    else:
+        vec_cte = f"""
     vec AS (
       SELECT
         c.id AS chunk_id,
@@ -2132,7 +2305,11 @@ def hybrid_rrf(
         AND c.embedding IS NOT NULL
       ORDER BY c.embedding <=> %(qvec)s::vector
       LIMIT %(top_n_vec)s
-    ),
+    ),"""
+
+    sql = f"""
+    WITH
+    {vec_cte}
     lex AS (
       SELECT
         c.id AS chunk_id,

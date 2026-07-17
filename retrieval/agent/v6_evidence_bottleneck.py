@@ -18,17 +18,22 @@ import json
 import sys
 import time
 import random
-from typing import List, Dict, Any, Optional, Tuple, Literal, Set
+from typing import List, Dict, Any, Optional, Tuple, Literal, Set, Union
 from dataclasses import dataclass, field
 
 from retrieval.agent.v6_query_parser import ParsedQuery, TaskType
+from retrieval.agent.v7_bundle_types import (
+    BundleCandidate,
+    BundleKind,
+    BundleBottleneckSelection,
+)
 
 
 # =============================================================================
 # Configuration
 # =============================================================================
 
-BOTTLENECK_MODEL = "gpt-3.5-turbo"  # Faster than gpt-4o-mini, good enough for filtering
+BOTTLENECK_MODEL = "gpt-3.5-turbo"  # Faster than gpt-4.1-mini, good enough for filtering
 BOTTLENECK_BATCH_SIZE = 15
 DEFAULT_BOTTLENECK_SIZE = 40  # Max spans after bottleneck
 
@@ -43,8 +48,11 @@ ELO_K_FACTOR = 32.0  # How much ratings change per match
 ELO_MATCHES_PER_SPAN = 4  # Each span participates in ~this many matchups
 
 # Grading modes
-GradingMode = Literal["tournament", "absolute"]
-DEFAULT_GRADING_MODE: GradingMode = "tournament"
+# - "score": Use retrieval scores (RRF/vector/lexical) - fastest, no LLM calls
+# - "absolute": Each span graded independently 0-10 - moderate speed
+# - "tournament": Elo-style pairwise comparisons - most robust, slowest
+GradingMode = Literal["score", "absolute", "tournament"]
+DEFAULT_GRADING_MODE: GradingMode = "score"  # Fast by default
 
 
 # =============================================================================
@@ -58,7 +66,7 @@ class BottleneckSpan:
     span_id: str
     chunk_id: int
     doc_id: Optional[int]
-    page: Optional[str]
+    page: Optional[Union[str, int]]  # 1-based PDF page number (int) or display string e.g. "p.5"
     source_label: str
     
     # The actual quotable text
@@ -306,6 +314,89 @@ Output JSON with a decision for each matchup:
 
 
 # =============================================================================
+# Bundle Comparison Prompts (for pre-bundled evidence)
+# =============================================================================
+
+BUNDLE_COMPARISON_SYSTEM = """You are a research evidence judge comparing evidence bundles.
+
+Each bundle contains grouped evidence about a topic. Pick which bundle is MORE relevant.
+
+Consider:
+- Does the bundle directly answer the question?
+- Does it contain specific names, dates, or facts vs vague references?
+- Is it PERSON_EVIDENCE (resolved people) or CODENAME_EVIDENCE (unresolved codenames)?
+- For roster queries: prefer bundles that NAME SPECIFIC MEMBERS
+
+Be decisive. Pick exactly one winner."""
+
+
+def build_bundle_matchup_prompt(
+    question: str,
+    task_type: TaskType,
+    bundle_a: "BundleCandidate",
+    bundle_b: "BundleCandidate",
+) -> str:
+    """Build prompt for comparing two bundles."""
+    
+    task_guidance = ""
+    if task_type == TaskType.ROSTER_ENUMERATION:
+        task_guidance = """TASK: Finding network MEMBERS.
+- PREFER PERSON_EVIDENCE bundles (resolved people) over CODENAME_EVIDENCE
+- Prefer bundles that name specific people
+- Codenames alone are NOT members"""
+    
+    return f"""QUESTION: {question}
+{task_guidance}
+
+Which bundle provides better evidence?
+
+BUNDLE A:
+{bundle_a.format_for_bottleneck()}
+
+BUNDLE B:
+{bundle_b.format_for_bottleneck()}
+
+Pick A or B. Output JSON:
+{{"winner": "A", "reason": "brief reason", "member_yield": 3}}"""
+
+
+def build_bundle_absolute_prompt(
+    question: str,
+    task_type: TaskType,
+    bundles: List["BundleCandidate"],
+) -> str:
+    """Build prompt for absolute scoring of bundles."""
+    
+    task_guidance = ""
+    if task_type == TaskType.ROSTER_ENUMERATION:
+        task_guidance = """TASK: Finding network MEMBERS.
+- Score PERSON_EVIDENCE bundles higher than CODENAME_EVIDENCE
+- Prefer bundles that explicitly name members
+- Codenames alone should score low for membership evidence"""
+    
+    bundle_sections = []
+    for i, bundle in enumerate(bundles):
+        bundle_sections.append(f"""[{i}] {bundle.format_for_bottleneck()}""")
+    
+    bundles_text = "\n---\n".join(bundle_sections)
+    
+    return f"""QUESTION: {question}
+{task_guidance}
+
+Score each bundle for relevance (0-10):
+
+{bundles_text}
+
+Output JSON:
+{{
+  "scores": [
+    {{"bundle_index": 0, "score": 8, "pass": true, "reason": "...", "member_yield": 3}},
+    {{"bundle_index": 1, "score": 3, "pass": false, "reason": "only codenames"}}
+  ]
+}}"""
+
+
+# =============================================================================
 # Evidence Bottleneck
 # =============================================================================
 
@@ -366,7 +457,9 @@ class EvidenceBottleneck:
             return result
         
         # Dispatch to appropriate grading mode
-        if self.grading_mode == "tournament":
+        if self.grading_mode == "score":
+            top_spans = self._score_filter(chunks, parsed_query, result)
+        elif self.grading_mode == "tournament":
             top_spans = self._tournament_filter(chunks, parsed_query, result)
         else:
             top_spans = self._absolute_filter(chunks, parsed_query, result)
@@ -417,6 +510,525 @@ class EvidenceBottleneck:
             print(f"    └─────────────────────────────────────────────────────────────", file=sys.stderr)
         
         return result
+    
+    # =========================================================================
+    # Bundle Filtering (for pre-bundled evidence)
+    # =========================================================================
+    
+    def filter_bundles(
+        self,
+        bundles: List[BundleCandidate],
+        parsed_query: ParsedQuery,
+        max_bundles: int = 5,
+    ) -> BundleBottleneckSelection:
+        """
+        Filter pre-bundled evidence through the bottleneck.
+        
+        Instead of scoring individual chunks, scores bundles as units.
+        Uses tournament or absolute mode based on grading_mode setting.
+        
+        Args:
+            bundles: BundleCandidate objects from pre-bundler
+            parsed_query: Parsed query with task type
+            max_bundles: Maximum bundles to select (default 5)
+            
+        Returns:
+            BundleBottleneckSelection with selected bundles and flattened chunks
+        """
+        start = time.time()
+        
+        result = BundleBottleneckSelection(
+            bundles_input=len(bundles),
+        )
+        
+        if not bundles:
+            return result
+        
+        if self.verbose:
+            print(f"  [Bottleneck] Filtering {len(bundles)} bundles -> max {max_bundles}", 
+                  file=sys.stderr)
+            print(f"    Mode: {self.grading_mode.upper()} (bundle scoring)", file=sys.stderr)
+        
+        # Dispatch to appropriate grading mode
+        if self.grading_mode == "score":
+            selected_bundles, scores = self._score_filter_bundles(bundles, parsed_query, max_bundles)
+        elif self.grading_mode == "tournament":
+            selected_bundles, scores = self._tournament_filter_bundles(bundles, parsed_query, max_bundles)
+        else:
+            selected_bundles, scores = self._absolute_filter_bundles(bundles, parsed_query, max_bundles)
+        
+        # Build result
+        result.selected_bundles = selected_bundles
+        result.selected_bundle_ids = [b.bundle_id for b in selected_bundles]
+        result.bundle_scores = scores
+        result.bundles_selected = len(selected_bundles)
+        
+        # Flatten chunks from selected bundles
+        all_chunk_ids = []
+        for bundle in selected_bundles:
+            all_chunk_ids.extend(bundle.chunk_ids)
+        result.selected_chunk_ids = list(set(all_chunk_ids))
+        result.total_chunks_selected = len(result.selected_chunk_ids)
+        
+        # Track rejected bundles
+        selected_ids = set(result.selected_bundle_ids)
+        result.rejected_bundle_ids = [b.bundle_id for b in bundles if b.bundle_id not in selected_ids]
+        
+        elapsed_ms = (time.time() - start) * 1000
+        
+        if self.verbose:
+            print(f"    ┌─────────────────────────────────────────────────────────────", file=sys.stderr)
+            print(f"    │ BUNDLE BOTTLENECK RESULT", file=sys.stderr)
+            print(f"    │ Input: {result.bundles_input} bundles", file=sys.stderr)
+            print(f"    │ Selected: {result.bundles_selected} bundles", file=sys.stderr)
+            print(f"    │ Total chunks: {result.total_chunks_selected}", file=sys.stderr)
+            print(f"    │", file=sys.stderr)
+            print(f"    │ SELECTED BUNDLES:", file=sys.stderr)
+            for i, bundle in enumerate(selected_bundles[:5]):
+                score = scores.get(bundle.bundle_id, 0)
+                print(f"    │   [{i}] {bundle.bundle_kind.value}: {bundle.topic[:40]}...", file=sys.stderr)
+                print(f"    │       Score: {score:.1f}, Chunks: {bundle.chunk_count()}", file=sys.stderr)
+            print(f"    │ Elapsed: {elapsed_ms:.0f}ms", file=sys.stderr)
+            print(f"    └─────────────────────────────────────────────────────────────", file=sys.stderr)
+        
+        return result
+    
+    def _tournament_filter_bundles(
+        self,
+        bundles: List[BundleCandidate],
+        parsed_query: ParsedQuery,
+        max_bundles: int,
+    ) -> Tuple[List[BundleCandidate], Dict[str, float]]:
+        """
+        Tournament mode for bundle scoring (Elo-style).
+        
+        Bundles compete head-to-head, ratings update based on outcomes.
+        """
+        if len(bundles) <= max_bundles:
+            # All bundles selected
+            scores = {b.bundle_id: 10.0 for b in bundles}
+            return bundles, scores
+        
+        # Initialize ratings
+        ratings = {b.bundle_id: ELO_INITIAL_RATING for b in bundles}
+        bundle_by_id = {b.bundle_id: b for b in bundles}
+        
+        # Run matchups
+        total_matchups = max(len(bundles), len(bundles) * 2)
+        bundle_ids = list(ratings.keys())
+        
+        if self.verbose:
+            print(f"    Running ~{total_matchups} bundle matchups", file=sys.stderr)
+        
+        for matchup_num in range(total_matchups):
+            # Pick two different bundles
+            idx_a, idx_b = random.sample(range(len(bundle_ids)), 2)
+            id_a, id_b = bundle_ids[idx_a], bundle_ids[idx_b]
+            bundle_a, bundle_b = bundle_by_id[id_a], bundle_by_id[id_b]
+            
+            # Run matchup
+            decision = self._run_bundle_matchup(bundle_a, bundle_b, parsed_query)
+            winner_id = id_a if decision.get("winner", "A").upper() == "A" else id_b
+            loser_id = id_b if winner_id == id_a else id_a
+            
+            # Update Elo ratings
+            rating_winner = ratings[winner_id]
+            rating_loser = ratings[loser_id]
+            
+            expected_winner = 1.0 / (1.0 + 10 ** ((rating_loser - rating_winner) / 400.0))
+            ratings[winner_id] += ELO_K_FACTOR * (1.0 - expected_winner)
+            ratings[loser_id] += ELO_K_FACTOR * (0.0 - (1.0 - expected_winner))
+        
+        # Sort by rating and select top
+        sorted_bundles = sorted(bundles, key=lambda b: ratings[b.bundle_id], reverse=True)
+        selected = sorted_bundles[:max_bundles]
+        
+        # Convert ratings to 0-10 scores
+        scores = {}
+        for b in bundles:
+            # Normalize: map rating range (800-1200) to (0-10)
+            normalized = min(10.0, max(0.0, (ratings[b.bundle_id] - 800) / 40.0))
+            scores[b.bundle_id] = normalized
+        
+        return selected, scores
+    
+    def _run_bundle_matchup(
+        self,
+        bundle_a: BundleCandidate,
+        bundle_b: BundleCandidate,
+        parsed_query: ParsedQuery,
+    ) -> Dict[str, Any]:
+        """Run a single bundle vs bundle matchup."""
+        
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            return self._fallback_bundle_matchup(bundle_a, bundle_b, parsed_query)
+        
+        prompt = build_bundle_matchup_prompt(
+            question=parsed_query.original_query,
+            task_type=parsed_query.task_type,
+            bundle_a=bundle_a,
+            bundle_b=bundle_b,
+        )
+        
+        try:
+            from openai import OpenAI
+            client = OpenAI(api_key=api_key)
+            
+            response = client.chat.completions.create(
+                model=TOURNAMENT_MODEL,
+                messages=[
+                    {"role": "system", "content": BUNDLE_COMPARISON_SYSTEM},
+                    {"role": "user", "content": prompt},
+                ],
+                response_format={"type": "json_object"},
+                max_completion_tokens=200,
+            )
+            
+            content = response.choices[0].message.content
+            if content:
+                return json.loads(content)
+                
+        except Exception as e:
+            if self.verbose:
+                print(f"    [BundleMatchup] Error: {e}", file=sys.stderr)
+        
+        return self._fallback_bundle_matchup(bundle_a, bundle_b, parsed_query)
+    
+    def _fallback_bundle_matchup(
+        self,
+        bundle_a: BundleCandidate,
+        bundle_b: BundleCandidate,
+        parsed_query: ParsedQuery,
+    ) -> Dict[str, Any]:
+        """Fallback heuristic for bundle comparison."""
+        
+        # Prefer PERSON_EVIDENCE over CODENAME_EVIDENCE
+        score_a = 0
+        score_b = 0
+        
+        if bundle_a.bundle_kind == BundleKind.PERSON_EVIDENCE:
+            score_a += 3
+        if bundle_b.bundle_kind == BundleKind.PERSON_EVIDENCE:
+            score_b += 3
+        
+        # Prefer bundles with resolved entities
+        score_a += len(bundle_a.primary_entities)
+        score_b += len(bundle_b.primary_entities)
+        
+        # Penalize codename-only bundles for roster queries
+        if parsed_query.task_type == TaskType.ROSTER_ENUMERATION:
+            if bundle_a.is_codename_only():
+                score_a -= 2
+            if bundle_b.is_codename_only():
+                score_b -= 2
+        
+        # More chunks = more evidence
+        score_a += bundle_a.chunk_count() * 0.5
+        score_b += bundle_b.chunk_count() * 0.5
+        
+        winner = "A" if score_a >= score_b else "B"
+        return {"winner": winner, "reason": "heuristic"}
+    
+    # =========================================================================
+    # Score-Based Filtering (uses retrieval scores - no LLM calls)
+    # =========================================================================
+    
+    def _score_filter_bundles(
+        self,
+        bundles: List[BundleCandidate],
+        parsed_query: ParsedQuery,
+        max_bundles: int,
+    ) -> Tuple[List[BundleCandidate], Dict[str, float]]:
+        """
+        Score-based mode for bundle selection.
+        
+        Uses aggregate retrieval scores from chunks within each bundle.
+        No LLM calls - just rank by best chunk scores.
+        """
+        if len(bundles) <= max_bundles:
+            # Calculate scores for all bundles
+            scores = {}
+            for bundle in bundles:
+                scores[bundle.bundle_id] = self._calculate_bundle_base_score(bundle)
+            return bundles, scores
+        
+        if self.verbose:
+            print(f"    [Bottleneck] Score-based bundle filtering (no LLM calls)", file=sys.stderr)
+        
+        # Calculate base score for each bundle from chunk retrieval scores
+        scores = {}
+        for bundle in bundles:
+            scores[bundle.bundle_id] = self._calculate_bundle_base_score(bundle)
+        
+        # Sort by score descending
+        sorted_bundles = sorted(bundles, key=lambda b: scores.get(b.bundle_id, 0), reverse=True)
+        selected = sorted_bundles[:max_bundles]
+        
+        if self.verbose:
+            print(f"    [Bottleneck] Selected {len(selected)}/{len(bundles)} bundles by score", file=sys.stderr)
+            for i, b in enumerate(selected[:3]):
+                print(f"      [{i}] {b.bundle_id}: score={scores[b.bundle_id]:.3f}", file=sys.stderr)
+        
+        return selected, scores
+    
+    def _calculate_bundle_base_score(self, bundle: BundleCandidate) -> float:
+        """
+        Calculate a single base_score for a bundle from its chunk retrieval scores.
+        
+        Combines:
+        - Best chunk score (primary signal)
+        - Mean chunk score (quality of all evidence)
+        - Chunk count bonus (more evidence = better)
+        - Entity resolution bonus (linked entities add value)
+        """
+        if not bundle.chunks:
+            return 0.0
+        
+        # Extract retrieval scores from chunks
+        chunk_scores = []
+        for chunk in bundle.chunks:
+            # Try different score fields
+            score = (
+                chunk.get("retrieval_score") or 
+                chunk.get("score_hybrid") or 
+                chunk.get("rrf_score") or
+                chunk.get("score_vector") or
+                chunk.get("score_lexical") or
+                0.0
+            )
+            if score:
+                chunk_scores.append(float(score))
+        
+        if not chunk_scores:
+            # Fallback: use position-based scoring (earlier chunks = higher score)
+            # This happens when scores weren't attached to chunks
+            base = 0.5
+            # Add bonuses for entity resolution
+            if bundle.primary_entities:
+                base += 0.2 * min(len(bundle.primary_entities), 3)
+            # Bonus for self-contained bundles (all references resolved)
+            if bundle.self_contained:
+                base += 0.1
+            return base
+        
+        # Calculate composite score
+        best_score = max(chunk_scores)
+        mean_score = sum(chunk_scores) / len(chunk_scores)
+        
+        # Combine: 60% best, 30% mean, 10% volume bonus
+        base_score = (best_score * 0.6) + (mean_score * 0.3)
+        
+        # Volume bonus (logarithmic, capped)
+        volume_bonus = min(0.1, 0.02 * len(chunk_scores))
+        base_score += volume_bonus
+        
+        # Entity resolution bonus
+        if bundle.primary_entities:
+            base_score += 0.05 * min(len(bundle.primary_entities), 3)
+        
+        # Self-contained bonus (all codenames resolved)
+        if bundle.self_contained:
+            base_score += 0.03
+        
+        # Confidence bonus (bundle cohesion quality)
+        base_score += 0.02 * bundle.confidence
+        
+        return base_score
+    
+    def _absolute_filter_bundles(
+        self,
+        bundles: List[BundleCandidate],
+        parsed_query: ParsedQuery,
+        max_bundles: int,
+    ) -> Tuple[List[BundleCandidate], Dict[str, float]]:
+        """
+        Absolute mode for bundle scoring.
+        
+        Each bundle scored independently on 0-10 scale.
+        """
+        if len(bundles) <= max_bundles:
+            scores = {b.bundle_id: 10.0 for b in bundles}
+            return bundles, scores
+        
+        # Score all bundles
+        scores = self._grade_bundles_absolute(bundles, parsed_query)
+        
+        # Sort by score and select top
+        sorted_bundles = sorted(bundles, key=lambda b: scores.get(b.bundle_id, 0), reverse=True)
+        selected = sorted_bundles[:max_bundles]
+        
+        return selected, scores
+    
+    def _grade_bundles_absolute(
+        self,
+        bundles: List[BundleCandidate],
+        parsed_query: ParsedQuery,
+    ) -> Dict[str, float]:
+        """Grade bundles using absolute scoring."""
+        
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            return self._fallback_grade_bundles(bundles, parsed_query)
+        
+        prompt = build_bundle_absolute_prompt(
+            question=parsed_query.original_query,
+            task_type=parsed_query.task_type,
+            bundles=bundles,
+        )
+        
+        try:
+            from openai import OpenAI
+            client = OpenAI(api_key=api_key)
+            
+            response = client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": BUNDLE_COMPARISON_SYSTEM},
+                    {"role": "user", "content": prompt},
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.1,
+                max_tokens=2000,
+            )
+            
+            content = response.choices[0].message.content
+            if content:
+                data = json.loads(content)
+                scores = {}
+                for item in data.get("scores", []):
+                    idx = item.get("bundle_index", -1)
+                    if 0 <= idx < len(bundles):
+                        scores[bundles[idx].bundle_id] = item.get("score", 5.0)
+                return scores
+                
+        except Exception as e:
+            if self.verbose:
+                print(f"    [BundleGrading] Error: {e}", file=sys.stderr)
+        
+        return self._fallback_grade_bundles(bundles, parsed_query)
+    
+    def _fallback_grade_bundles(
+        self,
+        bundles: List[BundleCandidate],
+        parsed_query: ParsedQuery,
+    ) -> Dict[str, float]:
+        """Fallback heuristic scoring for bundles."""
+        
+        scores = {}
+        for bundle in bundles:
+            score = 5.0  # Base score
+            
+            # Prefer PERSON_EVIDENCE
+            if bundle.bundle_kind == BundleKind.PERSON_EVIDENCE:
+                score += 2.0
+            elif bundle.bundle_kind == BundleKind.CODENAME_EVIDENCE:
+                score -= 1.0
+            
+            # More resolved entities = better
+            score += min(len(bundle.primary_entities), 3)
+            
+            # Penalize codename-only for roster
+            if parsed_query.task_type == TaskType.ROSTER_ENUMERATION:
+                if bundle.is_codename_only():
+                    score -= 2.0
+            
+            scores[bundle.bundle_id] = max(0.0, min(10.0, score))
+        
+        return scores
+    
+    # =========================================================================
+    # Original Chunk Filtering Methods
+    # =========================================================================
+    
+    def _score_filter(
+        self,
+        chunks: List[Dict[str, Any]],
+        parsed_query: ParsedQuery,
+        result: BottleneckResult,
+    ) -> List[Dict[str, Any]]:
+        """
+        Score-based filtering: uses retrieval scores to rank chunks.
+        
+        NO LLM calls - fastest mode. Uses the retrieval scores already 
+        computed during search (RRF, vector similarity, lexical scores).
+        
+        Builds a single base_score per chunk from:
+        - score_hybrid (RRF fusion score) - preferred
+        - score_vector (embedding similarity)
+        - score_lexical (BM25/keyword score)
+        - Fallback: position-based scoring
+        """
+        if self.verbose:
+            print(f"  [Bottleneck] Filtering {len(chunks)} chunks -> max {self.max_spans} spans", 
+                  file=sys.stderr)
+            print(f"    Mode: SCORE (retrieval-based, no LLM calls)", file=sys.stderr)
+            print(f"    Using retrieval scores already computed during search", file=sys.stderr)
+        
+        # Calculate base_score for each chunk
+        scored_chunks = []
+        for i, chunk in enumerate(chunks):
+            base_score = self._calculate_chunk_base_score(chunk, i, len(chunks))
+            scored_chunks.append({
+                "chunk_index": i,
+                "score": base_score * 10,  # Normalize to 0-10 for compatibility
+                "claim": f"Evidence from chunk {chunk.get('id', i)}",
+                "responsive": True,  # Assume all retrieved chunks are potentially responsive
+                "pass": True,  # All pass in score mode - we just rank
+            })
+        
+        result.spans_extracted = len(scored_chunks)
+        
+        # Sort by score descending
+        scored_chunks.sort(key=lambda x: x["score"], reverse=True)
+        
+        # Take top N
+        selected = scored_chunks[:self.max_spans]
+        
+        if self.verbose:
+            print(f"    Selected top {len(selected)} chunks by retrieval score", file=sys.stderr)
+            for i, s in enumerate(selected[:5]):
+                chunk = chunks[s["chunk_index"]]
+                print(f"      [{i}] chunk_id={chunk.get('id')}, score={s['score']:.2f}", file=sys.stderr)
+        
+        return selected
+    
+    def _calculate_chunk_base_score(
+        self,
+        chunk: Dict[str, Any],
+        position: int,
+        total_chunks: int,
+    ) -> float:
+        """
+        Calculate a single base_score for a chunk from retrieval scores.
+        
+        Priority:
+        1. score_hybrid (RRF) - best fusion of lexical + semantic
+        2. retrieval_score - generic score field
+        3. score_vector - embedding similarity
+        4. score_lexical - keyword/BM25 score
+        5. Fallback: position-based (earlier = higher)
+        """
+        # Try to get an explicit score
+        score = (
+            chunk.get("score_hybrid") or
+            chunk.get("retrieval_score") or
+            chunk.get("rrf_score") or
+            chunk.get("score_vector") or
+            chunk.get("score_lexical") or
+            None
+        )
+        
+        if score is not None:
+            return float(score)
+        
+        # Fallback: position-based scoring
+        # Earlier chunks (retrieved first) get higher scores
+        if total_chunks > 0:
+            # Score from 1.0 (first) to 0.1 (last)
+            return 1.0 - (0.9 * position / total_chunks)
+        
+        return 0.5  # Default
     
     def _absolute_filter(
         self,
@@ -946,3 +1558,32 @@ def apply_bottleneck(
         verbose=verbose,
     )
     return bottleneck.filter(chunks, parsed_query)
+
+
+def apply_bundle_bottleneck(
+    bundles: List[BundleCandidate],
+    parsed_query: ParsedQuery,
+    max_bundles: int = 5,
+    grading_mode: GradingMode = DEFAULT_GRADING_MODE,
+    verbose: bool = True,
+) -> BundleBottleneckSelection:
+    """
+    Apply the evidence bottleneck to pre-bundled evidence.
+    
+    Use this when chunks have been pre-bundled by the PreBundler.
+    
+    Args:
+        bundles: BundleCandidate objects from PreBundler
+        parsed_query: Parsed query with task type
+        max_bundles: Maximum bundles to select (default 5)
+        grading_mode: "tournament" (default) or "absolute"
+        verbose: Print progress
+    
+    Returns:
+        BundleBottleneckSelection with selected bundles
+    """
+    bottleneck = EvidenceBottleneck(
+        grading_mode=grading_mode,
+        verbose=verbose,
+    )
+    return bottleneck.filter_bundles(bundles, parsed_query, max_bundles)

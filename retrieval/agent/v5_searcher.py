@@ -30,7 +30,7 @@ from retrieval.agent.tools import get_tools_for_prompt, TOOL_REGISTRY
 # Configuration
 # =============================================================================
 
-SEARCHER_MODEL = "gpt-4o"  # Main reasoning model
+SEARCHER_MODEL = "gpt-4.1-mini-2025-04-14"  # Main reasoning model
 SEARCHER_TEMPERATURE = 0.3
 
 

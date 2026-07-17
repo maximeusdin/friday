@@ -42,8 +42,8 @@ from retrieval.agent.v3_summarizer import doc_balanced_sample
 # =============================================================================
 
 V4_VERSION = "4.0.0"
-V4_MODEL_DEFAULT = os.getenv("OPENAI_MODEL_V4", "gpt-4o")
-V4_MODEL_PLANNER = os.getenv("OPENAI_MODEL_V4_PLANNER", "gpt-4o-mini")
+V4_MODEL_DEFAULT = os.getenv("OPENAI_MODEL_V4", "gpt-4.1-mini-2025-04-14")
+V4_MODEL_PLANNER = os.getenv("OPENAI_MODEL_V4_PLANNER", "gpt-4.1-mini-2025-04-14")
 
 # Default budgets
 V4_BUDGETS = {

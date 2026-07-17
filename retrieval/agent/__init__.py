@@ -39,7 +39,7 @@ V3_ENABLED = os.getenv("V3_ENABLED", "0") == "1"
 
 # Version info
 V3_VERSION = "3.0.0"
-V3_MODEL_DEFAULT = os.getenv("OPENAI_MODEL_V3", "gpt-4o-mini")
+V3_MODEL_DEFAULT = os.getenv("OPENAI_MODEL_V3", "gpt-4.1-mini-2025-04-14")
 
 # Default budgets
 DEFAULT_BUDGETS = {
@@ -311,6 +311,61 @@ from retrieval.agent.v6_runner import (
     run_v6_query,
 )
 
+# V9 Investigation Loop (V9.4)
+from retrieval.agent.v9_types import (
+    ResearchWorkspace,
+    CatalogHit,
+    WorkspaceChunk,
+    WorkspaceEntity,
+    EntityCandidate,
+    ProgressSignal,
+    SufficiencyCheck,
+    V9Claim,
+    V9Synthesis,
+    V9VerificationReport,
+    V9Result,
+    GroundedClaim,
+    ScopeFilter,
+    ResponsivenessResult as V9ResponsivenessResult,
+    RosterEntry,
+    TimelineEntry,
+    EvidenceEntry,
+    RelationshipEdge,
+    IdentityResolution,
+    InvestigationState,
+    InvestigationStep,
+    WorkspaceDelta,
+)
+from retrieval.agent.v9_runner import (
+    V9Runner,
+    run_v9_query,
+    format_v9_result,
+    detect_scope,
+)
+
+# V9 Session / Dispatch
+from retrieval.agent.v9_session import (
+    SessionState,
+    RunRecord,
+    RecentQueryContext,
+    EvidenceItem as V9EvidenceItem,
+    RunStep as V9RunStep,
+    load_session as v9_load_session,
+    create_session as v9_create_session,
+    load_recent_runs as v9_load_recent_runs,
+)
+from retrieval.agent.v9_router import (
+    RouterDecision,
+    route_message as v9_route_message,
+)
+from retrieval.agent.v9_dispatch import (
+    DispatchResult,
+    dispatch_message as v9_dispatch_message,
+)
+
+# V11 Stripped (no PEM, no query entity resolution; optional lightweight PEM)
+from retrieval.agent.v11_runner import run_v11_query
+
 __all__ = [
     # Config
     "V3_ENABLED",
@@ -494,4 +549,46 @@ __all__ = [
     "V6Result",
     "V6Runner",
     "run_v6_query",
+    # V9 Investigation Loop (V9.4)
+    "ResearchWorkspace",
+    "CatalogHit",
+    "WorkspaceChunk",
+    "WorkspaceEntity",
+    "EntityCandidate",
+    "ProgressSignal",
+    "SufficiencyCheck",
+    "V9Claim",
+    "V9Synthesis",
+    "V9VerificationReport",
+    "V9Result",
+    "GroundedClaim",
+    "ScopeFilter",
+    "V9ResponsivenessResult",
+    "RosterEntry",
+    "TimelineEntry",
+    "EvidenceEntry",
+    "RelationshipEdge",
+    "IdentityResolution",
+    "InvestigationState",
+    "InvestigationStep",
+    "WorkspaceDelta",
+    "V9Runner",
+    "run_v9_query",
+    "format_v9_result",
+    "detect_scope",
+    # V9 Session / Dispatch
+    "SessionState",
+    "RunRecord",
+    "RecentQueryContext",
+    "V9EvidenceItem",
+    "V9RunStep",
+    "v9_load_session",
+    "v9_create_session",
+    "v9_load_recent_runs",
+    "RouterDecision",
+    "v9_route_message",
+    "DispatchResult",
+    "v9_dispatch_message",
+    # V11
+    "run_v11_query",
 ]

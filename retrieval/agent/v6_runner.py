@@ -152,6 +152,8 @@ def run_v6_query(
     max_bottleneck_spans: int = 40,
     max_rounds: int = 5,
     verbose: bool = True,
+    pre_bundling_mode: str = "micro",
+    bottleneck_grading_mode: str = "score",
 ) -> V6Result:
     """
     Run a V6 query with principled architecture.
@@ -162,6 +164,15 @@ def run_v6_query(
         max_bottleneck_spans: Max spans after bottleneck (forces convergence)
         max_rounds: Max retrieval rounds
         verbose: Print progress
+        pre_bundling_mode: Pre-bundling mode for concordance-aware evidence grouping:
+            - "micro": Small bundles around top seeds (default, fast)
+            - "semantic": Full LLM-based bundling with concordance (comprehensive)
+            - "passthrough": Single bundle with all chunks (fast)
+            - "off": No bundling
+        bottleneck_grading_mode: How to score evidence at bottleneck:
+            - "score": Use retrieval scores (default, fastest - no LLM calls)
+            - "absolute": Grade each chunk 0-10 with LLM
+            - "tournament": Elo-style pairwise comparisons (slowest, most robust)
     
     Returns:
         V6Result with answer, claims, and responsiveness check
@@ -170,6 +181,8 @@ def run_v6_query(
         max_bottleneck_spans=max_bottleneck_spans,
         max_rounds=max_rounds,
         verbose=verbose,
+        pre_bundling_mode=pre_bundling_mode,
+        bottleneck_grading_mode=bottleneck_grading_mode,
     )
     
     runner = V6Runner(config=config)
@@ -189,6 +202,10 @@ def main():
     parser.add_argument("--max-spans", type=int, default=40, help="Max bottleneck spans")
     parser.add_argument("--max-rounds", type=int, default=5, help="Max retrieval rounds")
     parser.add_argument("--quiet", action="store_true", help="Suppress progress output")
+    parser.add_argument("--pre-bundling", choices=["off", "passthrough", "micro", "semantic"],
+                       default="micro", help="Pre-bundling mode (default: micro)")
+    parser.add_argument("--bottleneck-mode", choices=["score", "absolute", "tournament"],
+                       default="score", help="Bottleneck grading mode: score (fastest, no LLM), absolute, tournament (default: score)")
     
     args = parser.parse_args()
     
@@ -203,6 +220,8 @@ def main():
             max_bottleneck_spans=args.max_spans,
             max_rounds=args.max_rounds,
             verbose=not args.quiet,
+            pre_bundling_mode=args.pre_bundling,
+            bottleneck_grading_mode=args.bottleneck_mode,
         )
         
         print("\n" + "="*60)

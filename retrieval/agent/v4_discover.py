@@ -592,7 +592,7 @@ def propose_discovery_plan(
         from openai import OpenAI
         client = OpenAI(api_key=api_key)
         
-        model = os.getenv("OPENAI_MODEL_V4_PLANNER", "gpt-4o-mini")
+        model = os.getenv("OPENAI_MODEL_V4_PLANNER", "gpt-4.1-mini-2025-04-14")
         
         response = client.chat.completions.create(
             model=model,

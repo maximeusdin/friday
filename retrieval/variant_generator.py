@@ -124,7 +124,7 @@ OUTPUT: JSON array of strings, e.g. ["variant 1", "variant 2"]"""
     try:
         from openai import OpenAI
         
-        model = os.getenv("OPENAI_MODEL_PLAN", "gpt-4o-mini")
+        model = os.getenv("OPENAI_MODEL_PLAN", "gpt-4.1-mini-2025-04-14")
         client = OpenAI(api_key=api_key)
         
         resp = client.chat.completions.create(

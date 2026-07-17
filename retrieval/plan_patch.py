@@ -377,7 +377,7 @@ def get_plan_patch(
     if not api_key:
         raise RuntimeError("Missing OPENAI_API_KEY environment variable")
     
-    model = os.getenv("OPENAI_MODEL_PLAN", "gpt-4o-mini")
+    model = os.getenv("OPENAI_MODEL_PLAN", "gpt-4.1-mini-2025-04-14")
     client = OpenAI(api_key=api_key)
     
     request_params = {
@@ -469,7 +469,7 @@ OUTPUT: JSON with "actions" array and "reasoning" string."""
             reasoning="API key missing, dropping all bullets as fallback"
         )
     
-    model = os.getenv("OPENAI_MODEL_PLAN", "gpt-4o-mini")
+    model = os.getenv("OPENAI_MODEL_PLAN", "gpt-4.1-mini-2025-04-14")
     client = OpenAI(api_key=api_key)
     
     request_params = {

@@ -240,7 +240,7 @@ def analyze_query(query_text: str, conn) -> QueryAnalysis:
     if not api_key:
         raise RuntimeError("Missing OPENAI_API_KEY environment variable")
     
-    model = os.getenv("OPENAI_MODEL_PLAN", "gpt-4o-mini")
+    model = os.getenv("OPENAI_MODEL_PLAN", "gpt-4.1-mini-2025-04-14")
     client = OpenAI(api_key=api_key)
     
     request_params = {

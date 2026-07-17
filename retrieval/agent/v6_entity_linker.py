@@ -383,7 +383,7 @@ Output JSON: {{"use_for_retrieval": true/false, "reason": "..."}}"""
 def llm_decide_retrieval(
     entity: LinkedEntity,
     parsed_query: ParsedQuery,
-    model: str = "gpt-4o-mini",
+    model: str = "gpt-4.1-mini-2025-04-14",
 ) -> bool:
     """Use LLM to decide if entity should be used for retrieval."""
     

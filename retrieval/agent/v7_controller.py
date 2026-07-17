@@ -61,7 +61,7 @@ class RoundSummaryGenerator:
     - Recommending next steps (continue, pivot, narrow, stop)
     """
     
-    def __init__(self, verbose: bool = True, model: str = "gpt-4o-mini"):
+    def __init__(self, verbose: bool = True, model: str = "gpt-4.1-mini-2025-04-14"):
         self.verbose = verbose
         self.model = model
     

@@ -51,15 +51,9 @@ INCLUDE_COGNITO_CLIENT_SECRET="true"
 COGNITO_CLIENT_SECRET_NAME="cognito-client"
 APP_SESSION_SECRET_NAME="app-session-secret"
 
-# RDS-managed secret — ECS extracts the "password" JSON key at task launch.
-# This survives RDS password rotation automatically.
-RDS_SECRET_ARN="arn:aws:secretsmanager:us-west-1:682405977227:secret:rds!db-d7eff14c-c6f9-449a-ace0-ac376ada5dc0-0gmQ1B"
-
-# DB connection components (non-secret)
-DB_HOST="friday-postgres.cheoc40uk4v7.us-west-1.rds.amazonaws.com"
-DB_NAME="friday"
-DB_USER="friday"
-DB_PORT="5432"
+# DATABASE_URL secret — full connection string (same as friday_env.sh for CLI).
+# ECS injects DATABASE_URL at task launch. App uses it directly.
+DATABASE_URL_SECRET_NAME="friday/DATABASE_URL"
 
 
 
@@ -83,6 +77,13 @@ echo "Target image: ${IMAGE_SHA}"
 command -v jq >/dev/null 2>&1 || { echo "ERROR: jq is required."; exit 1; }
 command -v aws >/dev/null 2>&1 || { echo "ERROR: aws CLI is required."; exit 1; }
 command -v docker >/dev/null 2>&1 || { echo "ERROR: docker is required."; exit 1; }
+
+# Auth: warn if prod redirect_uri differs from expected (prevents login outages)
+EXPECTED_REDIRECT="https://api.fridayarchive.org/auth/oauth/cognito/callback"
+if [[ "${COGNITO_REDIRECT_URI}" != "${EXPECTED_REDIRECT}" ]]; then
+  echo "WARNING: COGNITO_REDIRECT_URI=${COGNITO_REDIRECT_URI} != ${EXPECTED_REDIRECT}"
+  echo "  Auth may fail. See docs/AUTH_DEPLOY_CHECKLIST.md"
+fi
 
 ############################################
 # 1) Build image with BUILD_SHA baked in
@@ -190,7 +191,36 @@ if [[ "${INCLUDE_COGNITO_CLIENT_SECRET}" == "true" ]]; then
   fi
 fi
 
+DATABASE_URL_SECRET_ARN="$(aws secretsmanager describe-secret \
+  --region "${AWS_REGION}" \
+  --secret-id "${DATABASE_URL_SECRET_NAME}" \
+  --query "ARN" --output text)"
+
+if [[ -z "${DATABASE_URL_SECRET_ARN}" || "${DATABASE_URL_SECRET_ARN}" == "None" ]]; then
+  echo "ERROR: Could not resolve ARN for Secrets Manager secret: ${DATABASE_URL_SECRET_NAME}"
+  exit 1
+fi
+
+# Detect secret format: JSON with DATABASE_URL key, or plain string
+# JSON: valueFrom = arn:...:secret-name:DATABASE_URL::
+# Plain: valueFrom = arn:...:secret-name (full ARN, no key)
+DATABASE_URL_VALUE_FROM="${DATABASE_URL_SECRET_ARN}"
+_raw_secret="$(aws secretsmanager get-secret-value \
+  --region "${AWS_REGION}" \
+  --secret-id "${DATABASE_URL_SECRET_NAME}" \
+  --query SecretString \
+  --output text 2>/dev/null || true)"
+if [[ -n "${_raw_secret}" ]]; then
+  if _parsed="$(echo "${_raw_secret}" | jq -r '.DATABASE_URL // empty' 2>/dev/null)" && [[ -n "${_parsed}" ]]; then
+    DATABASE_URL_VALUE_FROM="${DATABASE_URL_SECRET_ARN}:DATABASE_URL::"
+    echo "DATABASE_URL secret: JSON format (key=DATABASE_URL)"
+  else
+    echo "DATABASE_URL secret: plain string format"
+  fi
+fi
+
 echo "APP_SESSION_SECRET_ARN: ${APP_SESSION_SECRET_ARN}"
+echo "DATABASE_URL_SECRET_ARN: ${DATABASE_URL_SECRET_ARN}"
 if [[ "${INCLUDE_COGNITO_CLIENT_SECRET}" == "true" ]]; then
   echo "COGNITO_CLIENT_SECRET_ARN: ${COGNITO_CLIENT_SECRET_ARN}"
 else
@@ -211,11 +241,7 @@ UPDATED_TASKDEF_OBJ="$(echo "${TASKDEF_OBJ}" | jq \
   --arg cookie_domain "${COOKIE_DOMAIN}" \
   --arg cookie_secure "${COOKIE_SECURE}" \
   --arg session_cookie_name "${SESSION_COOKIE_NAME}" \
-  --arg db_host "${DB_HOST}" \
-  --arg db_name "${DB_NAME}" \
-  --arg db_user "${DB_USER}" \
-  --arg db_port "${DB_PORT}" \
-  --arg rds_secret_arn "${RDS_SECRET_ARN}" \
+  --arg database_url_value_from "${DATABASE_URL_VALUE_FROM}" \
   --arg app_session_secret_arn "${APP_SESSION_SECRET_ARN}" \
   --arg cognito_client_secret_arn "${COGNITO_CLIENT_SECRET_ARN}" \
   --arg include_cognito_secret "${INCLUDE_COGNITO_CLIENT_SECRET}" \
@@ -227,6 +253,8 @@ UPDATED_TASKDEF_OBJ="$(echo "${TASKDEF_OBJ}" | jq \
       ( . // [] )
       | map(select(
           .name != "USE_V9_AGENT" and
+          .name != "USE_V12_AGENT" and
+          .name != "V12_DISABLE_LLM" and
           .name != "S3_PDF_BUCKET" and
           .name != "COGNITO_DOMAIN" and
           .name != "COGNITO_ISSUER" and
@@ -243,6 +271,8 @@ UPDATED_TASKDEF_OBJ="$(echo "${TASKDEF_OBJ}" | jq \
         ))
       + [
           {"name":"USE_V9_AGENT","value":"0"},
+          {"name":"USE_V12_AGENT","value":"1"},
+          {"name":"V12_DISABLE_LLM","value":"0"},
           {"name":"S3_PDF_BUCKET","value":$s3bucket},
           {"name":"COGNITO_DOMAIN","value":$cognito_domain},
           {"name":"COGNITO_ISSUER","value":$cognito_issuer},
@@ -251,18 +281,15 @@ UPDATED_TASKDEF_OBJ="$(echo "${TASKDEF_OBJ}" | jq \
           {"name":"UI_REDIRECT_AFTER_LOGIN","value":$ui_redirect},
           {"name":"COOKIE_DOMAIN","value":$cookie_domain},
           {"name":"COOKIE_SECURE","value":$cookie_secure},
-          {"name":"SESSION_COOKIE_NAME","value":$session_cookie_name},
-          {"name":"DB_HOST","value":$db_host},
-          {"name":"DB_NAME","value":$db_name},
-          {"name":"DB_USER","value":$db_user},
-          {"name":"DB_PORT","value":$db_port}
+          {"name":"SESSION_COOKIE_NAME","value":$session_cookie_name}
         ]
     )
 
   # --- Secrets (Secrets Manager references) ---
+  # DATABASE_URL: full connection string from friday/DATABASE_URL (same as friday_env.sh)
+  # DB_PASS removed — use DATABASE_URL instead
   | .containerDefinitions[$idx].secrets |= (
       ( . // [] )
-      # remove prior injected entries to avoid duplicates
       | map(select(
           .name != "APP_SESSION_SECRET" and
           .name != "COGNITO_CLIENT_SECRET" and
@@ -272,14 +299,14 @@ UPDATED_TASKDEF_OBJ="$(echo "${TASKDEF_OBJ}" | jq \
       + (
           if $include_cognito_secret == "true" then
             [
+              {"name":"DATABASE_URL","valueFrom":$database_url_value_from},
               {"name":"APP_SESSION_SECRET","valueFrom":($app_session_secret_arn + ":APP_SESSION_SECRET::")},
-              {"name":"COGNITO_CLIENT_SECRET","valueFrom":($cognito_client_secret_arn + ":COGNITO_CLIENT_SECRET::")},
-              {"name":"DB_PASS","valueFrom":($rds_secret_arn + ":password::")}
+              {"name":"COGNITO_CLIENT_SECRET","valueFrom":($cognito_client_secret_arn + ":COGNITO_CLIENT_SECRET::")}
             ]
           else
             [
-              {"name":"APP_SESSION_SECRET","valueFrom":($app_session_secret_arn + ":APP_SESSION_SECRET::")},
-              {"name":"DB_PASS","valueFrom":($rds_secret_arn + ":password::")}
+              {"name":"DATABASE_URL","valueFrom":$database_url_value_from},
+              {"name":"APP_SESSION_SECRET","valueFrom":($app_session_secret_arn + ":APP_SESSION_SECRET::")}
             ]
           end
         )

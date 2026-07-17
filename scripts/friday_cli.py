@@ -39,8 +39,10 @@ import sys
 import argparse
 import json
 import textwrap
+import uuid
 from pathlib import Path
 from datetime import datetime
+from typing import Callable, Optional
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -84,11 +86,12 @@ def list_sessions(conn, limit=10):
 
 def create_session(conn, label: str) -> int:
     """Create a new session or return existing by label."""
+    user_sub = os.getenv("FRIDAY_CLI_USER_SUB", "cli")
     with conn.cursor() as cur:
         try:
             cur.execute(
-                "INSERT INTO research_sessions (label) VALUES (%s) RETURNING id",
-                (label,)
+                "INSERT INTO research_sessions (label, user_sub) VALUES (%s, %s) RETURNING id",
+                (label, user_sub)
             )
             session_id = cur.fetchone()[0]
             conn.commit()
@@ -419,6 +422,102 @@ def format_results_preview(results):
         wrapped = textwrap.fill(preview or "", width=70, initial_indent="      ", subsequent_indent="      ")
         lines.append(wrapped + "...")
     return "\n".join(lines)
+
+
+def _search_progress_callback(phase: str, current: int, total: int, extra: Optional[dict] = None) -> None:
+    """Progress callback for run_search: updates CLI display."""
+    if phase == "collection" and total > 0:
+        slug = (extra or {}).get("slug", "?")
+        hits = (extra or {}).get("hits", 0)
+        pct = int(100 * current / total) if total else 0
+        sys.stdout.write(f"\r  {slug}: {hits} hits — {current}/{total} collections ({pct}%) ")
+    elif phase == "snippets" and total > 0:
+        pct = int(100 * current / total) if total else 0
+        sys.stdout.write(f"\r  Processing hits: {current}/{total} ({pct}%) ")
+    sys.stdout.flush()
+
+
+def run_cli_search(
+    conn,
+    query: str,
+    *,
+    session_id: Optional[int] = None,
+    fuzzy: bool = False,
+    alias_expand: bool = True,
+    on_progress: Optional[Callable[[str, int, int], None]] = None,
+) -> tuple[str, int, list]:
+    """
+    Run concordance search from CLI. Returns (result_set_id, total_hits, preview_rows).
+    Raises if search_result_sets table does not exist (run migration 0068).
+    """
+    # Check schema exists
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT 1 FROM information_schema.tables
+            WHERE table_schema = 'public' AND table_name = 'search_result_sets'
+        """)
+        if not cur.fetchone():
+            raise RuntimeError(
+                "Search tables not found. Run migration 0068:\n"
+                "  psql \"$DATABASE_URL\" -v statement_timeout=0 -f migrations/0068_search_concordance.sql"
+            )
+    user_sub = os.getenv("FRIDAY_CLI_USER_SUB", "cli")
+    scope_json = {"mode": "full_archive"}
+    if session_id:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT scope_json FROM research_sessions WHERE id = %s",
+                (session_id,),
+            )
+            row = cur.fetchone()
+            if row and row[0]:
+                scope_json = row[0] if isinstance(row[0], dict) else {"mode": "full_archive"}
+    result_set_id = str(uuid.uuid4())
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO search_result_sets
+            (id, user_sub, session_id, scope_json, query_raw, mode, unit, sort_order, alias_expand, is_exhaustive, status)
+            VALUES (%s, %s, %s, %s, %s, %s, 'page', 'canonical', %s, %s, 'running')
+            """,
+            (result_set_id, user_sub, session_id, Json(scope_json), query, "fuzzy" if fuzzy else "exact", alias_expand, not fuzzy),
+        )
+    conn.commit()
+    from retrieval.search_executor import run_search
+    out = run_search(
+        conn, result_set_id, query, scope_json,
+        alias_expand=alias_expand, mode="fuzzy" if fuzzy else "exact",
+        on_progress=on_progress,
+    )
+    if out.get("status") == "error":
+        raise RuntimeError(out.get("error", "Search failed"))
+    total = out.get("total_hits", 0)
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT col.slug, d.source_name, h.pdf_page_number, h.snippet
+            FROM search_result_page_hits h
+            JOIN collections col ON col.id = h.collection_id
+            JOIN documents d ON d.id = h.document_id
+            WHERE h.result_set_id = %s
+            ORDER BY h.collection_id, h.document_id, h.page_seq
+            LIMIT 10
+            """,
+            (result_set_id,),
+        )
+        preview = cur.fetchall()
+    return result_set_id, total, preview
+
+
+def format_search_preview(rows: list) -> str:
+    """Format search_result_page_hits for CLI display."""
+    lines = []
+    for slug, doc_title, pdf_page, snippet in rows:
+        lines.append(f"\n  [{slug}] {doc_title or 'Unknown'} p.{pdf_page or '?'}")
+        if snippet:
+            wrapped = textwrap.fill(snippet[:200] + ("…" if len(snippet) > 200 else ""), width=72, initial_indent="    ", subsequent_indent="    ")
+            lines.append(wrapped)
+    return "\n".join(lines) if lines else "  (no preview)"
 
 
 def get_detailed_evidence(conn, result_set_id: int, limit=10):
@@ -1217,6 +1316,10 @@ Commands:
   /sessions     List recent sessions
   /new <label>  Create a new session
   /use <id>     Switch to a different session
+  /search <q>   Concordance search: exhaustive page hits (AND/OR/NOT, phrases)
+                Flags: --fuzzy (OCR/typos), --no-expand (skip alias expansion)
+                Note: Full-archive search can take 10–60s; spinner shows progress
+  /fetch [N]    Load more snippets (default 100). Use after /search when >100 hits.
   /results      Show current result set (brief preview)
   /evidence     Show detailed evidence with full text excerpts
   /summarize    Summarize current results (V4: interpretation with verification)
@@ -1294,11 +1397,11 @@ Environment / Manual fallbacks:
   V11_USE_LIGHTWEIGHT_PEM=1   Enable lightweight PEM for venona/vassiliev chunks (v11)
   THINK_DEEPER_MAX_STEPS=N    Max turns for /deeper (default 8). Use 2-3 for quick tests.
   THINK_DEEPER_MAX_TOOL_CALLS Max tool calls for /deeper (default 10). Use 15 for full Tier 2.
-  V11_QUERY_MAX_TURNS=N       Max tool calls (V9/V11) or rounds (V10) for initial query (default 5). Use 2 for fast /deeper setup.
+  V11_QUERY_MAX_TURNS=N       Max tool calls (V9/V11) or rounds (V10) for initial query (default 10). Use 2 for fast /deeper setup.
   DIAG_SCOPE_BIAS=1           Scope diagnostics (default in CLI): per-collection hits, fulltext, tokens. Set 0 to disable.
 """)
 
-def interactive_mode(session_id: int, auto_execute: bool = False, pre_bundling_mode: str = "micro", bottleneck_mode: str = "score", deeper_max_steps: int = 8, deeper_max_tool_calls: int = 10, query_max_turns: int = 5):
+def interactive_mode(session_id: int, auto_execute: bool = False, pre_bundling_mode: str = "micro", bottleneck_mode: str = "score", deeper_max_steps: int = 8, deeper_max_tool_calls: int = 10, query_max_turns: int = 10):
     """Run interactive CLI mode."""
     # Enable scope-bias diagnostics (per-collection hits, fulltext, tokens) for CLI runs
     if os.getenv("DIAG_SCOPE_BIAS", "1").strip().lower() in ("1", "true", "yes"):
@@ -1313,6 +1416,7 @@ def interactive_mode(session_id: int, auto_execute: bool = False, pre_bundling_m
         session_label = row[0] if row else f"Session {session_id}"
     
     current_result_set_id = None
+    current_search_result_set_id = None  # UUID from /search (search_result_sets)
     current_v3_result = None  # Track V3 result for structured summarization
     last_v9_workspace = None  # Track last V9 workspace for /deeper
     last_v9_question = None   # Track last V9 question for /deeper
@@ -1377,6 +1481,55 @@ def interactive_mode(session_id: int, auto_execute: bool = False, pre_bundling_m
                 except ValueError as e:
                     print(f"Error: {e}")
             
+            elif cmd == "/search":
+                if not arg or not arg.strip():
+                    print("Usage: /search <query> [--fuzzy] [--no-fuzzy] [--no-expand]")
+                    print("  Examples: /search \"harry dexter white\"")
+                    print("            /search harry AND white --fuzzy")
+                    print("            /search \"Soviet agent\" OR Rosenberg --no-fuzzy")
+                    continue
+                arg_clean = (arg or "").strip()
+                use_fuzzy = "--no-fuzzy" not in arg_clean  # fuzzy on by default
+                use_expand = "--no-expand" not in arg_clean
+                query = arg_clean.replace("--fuzzy", "").replace("--no-fuzzy", "").replace("--no-expand", "").strip()
+                if not query:
+                    print("Error: Query cannot be empty after removing flags.")
+                    continue
+                try:
+                    result_set_id, total, preview = run_cli_search(
+                        conn, query, session_id=session_id,
+                        fuzzy=use_fuzzy, alias_expand=use_expand,
+                        on_progress=_search_progress_callback,
+                    )
+                    current_search_result_set_id = result_set_id
+                    sys.stdout.write("\r" + " " * 50 + "\r")
+                    sys.stdout.flush()
+                    print(f"Search: {total} page hits")
+                    if preview:
+                        print(format_search_preview(preview))
+                    print(f"  Result set ID: {result_set_id}")
+                    if total > 100:
+                        print(f"  (Snippets: first 100 loaded. Use /fetch to load more.)")
+                    print()
+                except Exception as e:
+                    print(f"\nSearch error: {e}")
+                    import traceback
+                    traceback.print_exc()
+
+            elif cmd == "/fetch":
+                if not current_search_result_set_id:
+                    print("No search result set. Run /search first.")
+                    continue
+                batch = 100
+                if arg and arg.strip().isdigit():
+                    batch = min(int(arg.strip()), 500)
+                try:
+                    from retrieval.search_executor import fetch_more_snippets
+                    n = fetch_more_snippets(conn, current_search_result_set_id, batch_size=batch)
+                    print(f"Loaded {n} more snippets.")
+                except Exception as e:
+                    print(f"Fetch error: {e}")
+
             elif cmd == "/results":
                 if current_result_set_id:
                     rs = get_result_set(conn, current_result_set_id)
@@ -2815,7 +2968,7 @@ Examples:
         type=int,
         default=None,
         metavar="N",
-        help="Initial query: max tool calls (V9/V11) or rounds (V10). Default 5. Use 2 for fast /deeper setup. Env: V11_QUERY_MAX_TURNS"
+        help="Initial query: max tool calls (V9/V11) or rounds (V10). Default 10. Use 2 for fast /deeper setup. Env: V11_QUERY_MAX_TURNS"
     )
     args = parser.parse_args()
     
@@ -2851,7 +3004,7 @@ Examples:
     # Query max turns: CLI flag > env var > default (speeds up initial retrieval for /deeper)
     query_max_turns = args.query_max_turns
     if query_max_turns is None:
-        query_max_turns = int(os.getenv("V11_QUERY_MAX_TURNS", "5"))
+        query_max_turns = int(os.getenv("V11_QUERY_MAX_TURNS", "10"))
     
     # Deeper Tier 2: max tool calls (default 10, can go to 15)
     deeper_max_tool_calls = int(os.getenv("THINK_DEEPER_MAX_TOOL_CALLS", "10"))

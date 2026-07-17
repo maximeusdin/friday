@@ -211,7 +211,7 @@ def main():
             if args.sleep > 0:
                 time.sleep(args.sleep)
 
-        print("✅ Done.")
+        print("Done.")
     finally:
         conn.close()
 

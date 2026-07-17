@@ -113,7 +113,7 @@ class AgentPlanV2:
     primitive_params: Dict[str, Any] = field(default_factory=dict)
     
     # Metadata for reproducibility
-    model_version: str = "gpt-4o-mini"
+    model_version: str = "gpt-4.1-mini-2025-04-14"
     temperature: float = 0.0  # Deterministic
     created_at: str = ""
     plan_version: str = "v2.0"
@@ -246,7 +246,7 @@ class AgentPlanV2:
             output=output,
             primitives=data.get("primitives", []),
             primitive_params=data.get("primitive_params", {}),
-            model_version=data.get("model_version", "gpt-4o-mini"),
+            model_version=data.get("model_version", "gpt-4.1-mini-2025-04-14"),
             temperature=data.get("temperature", 0.0),
             created_at=data.get("created_at", ""),
             plan_version=data.get("plan_version", "v2.0"),

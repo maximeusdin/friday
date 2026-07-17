@@ -23,7 +23,7 @@ from retrieval.agent.v5_types import CandidateSpan, GraderResult
 # Configuration
 # =============================================================================
 
-RERANK_MODEL = "gpt-4o-mini"  # Fast model for extraction
+RERANK_MODEL = "gpt-4.1-mini-2025-04-14"  # Fast model for extraction
 RERANK_BATCH_SIZE = 10  # Chunks per batch
 MAX_SPANS_PER_CHUNK = 2  # Extract up to 2 spans per chunk
 

@@ -23,7 +23,7 @@ from retrieval.agent.v7_types import ClaimWithCitation
 # Configuration
 # =============================================================================
 
-ENUMERATOR_MODEL = "gpt-3.5-turbo"  # Fast model for claim extraction
+ENUMERATOR_MODEL = "gpt-5-nano"  # Fast model for claim extraction
 MAX_CLAIMS_PER_ANSWER = 30  # Limit claims to prevent explosion
 
 

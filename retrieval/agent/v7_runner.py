@@ -60,6 +60,8 @@ def run_v7_query(
     drop_uncited_claims: bool = True,
     verbose: bool = True,
     progress_callback: Optional[Callable[[str, str, str, Dict[str, Any]], None]] = None,
+    pre_bundling_mode: str = "micro",
+    bottleneck_grading_mode: str = "score",
 ) -> V7Result:
     """
     Run a V7 query with citation enforcement.
@@ -72,6 +74,15 @@ def run_v7_query(
         drop_uncited_claims: If True, drop claims without citations; if False, fail validation
         verbose: Print progress
         progress_callback: Optional callback for streaming progress updates
+        pre_bundling_mode: Pre-bundling mode for concordance-aware evidence grouping:
+            - "micro": Small bundles around top seeds (default, fast)
+            - "semantic": Full LLM-based bundling with concordance (comprehensive)
+            - "passthrough": Single bundle with all chunks (fast)
+            - "off": No bundling
+        bottleneck_grading_mode: How to score evidence at bottleneck:
+            - "score": Use retrieval scores (default, fastest - no LLM calls)
+            - "absolute": Grade each chunk 0-10 with LLM
+            - "tournament": Elo-style pairwise comparisons (slowest, most robust)
     
     Returns:
         V7Result with answer, expanded summary, and validation status
@@ -81,6 +92,8 @@ def run_v7_query(
         max_rounds=max_rounds,
         verbose=verbose,
         progress_callback=progress_callback,
+        pre_bundling_mode=pre_bundling_mode,
+        bottleneck_grading_mode=bottleneck_grading_mode,
     )
     
     config = V7Config(
@@ -232,6 +245,10 @@ def main():
     parser.add_argument("--show-v6", action="store_true", help="Show V6 pipeline details")
     parser.add_argument("--quiet", action="store_true", help="Suppress progress output")
     parser.add_argument("--json", action="store_true", help="Output as JSON")
+    parser.add_argument("--pre-bundling", choices=["off", "passthrough", "micro", "semantic"],
+                       default="micro", help="Pre-bundling mode (default: micro)")
+    parser.add_argument("--bottleneck-mode", choices=["score", "absolute", "tournament"],
+                       default="score", help="Bottleneck grading mode: score (fastest, no LLM), absolute, tournament (default: score)")
     
     args = parser.parse_args()
     
@@ -248,6 +265,8 @@ def main():
             max_rounds=args.max_rounds,
             drop_uncited_claims=not args.keep_uncited,
             verbose=not args.quiet,
+            pre_bundling_mode=args.pre_bundling,
+            bottleneck_grading_mode=args.bottleneck_mode,
         )
         
         if args.json:

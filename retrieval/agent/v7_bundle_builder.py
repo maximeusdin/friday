@@ -37,7 +37,7 @@ class BundleBuilderConfig:
     """Configuration for the bundle builder."""
     
     # LLM settings
-    model: str = "gpt-4o-mini"
+    model: str = "gpt-4.1-mini-2025-04-14"
     temperature: float = 0.3
     
     # Bundle settings

@@ -3,6 +3,7 @@
 import { useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { api } from '@/lib/api';
+import { useRunningSessionIds, stopRun } from '@/lib/chatRunStore';
 import type { Session } from '@/types/api';
 import clsx from 'clsx';
 
@@ -16,7 +17,10 @@ export function SessionList({ activeSessionId, onSessionSelect, onSessionDelete 
   const [newLabel, setNewLabel] = useState('');
   const [isCreating, setIsCreating] = useState(false);
   const [confirmDeleteId, setConfirmDeleteId] = useState<number | null>(null);
+  const [createError, setCreateError] = useState<string | null>(null);
   const queryClient = useQueryClient();
+  // Sessions with an in-flight chat run (chats can run concurrently across sessions).
+  const runningIds = useRunningSessionIds();
 
   const { data: sessions, isLoading, error } = useQuery({
     queryKey: ['sessions'],
@@ -31,11 +35,18 @@ export function SessionList({ activeSessionId, onSessionSelect, onSessionDelete 
       setIsCreating(false);
       onSessionSelect(newSession);
     },
+    onError: (err: unknown) => {
+      // resolveLabel normally prevents duplicates client-side; this is a safety net
+      // for a 409 slipping through (e.g. a race against another tab).
+      const message = err instanceof Error ? err.message : 'Failed to create session';
+      setCreateError(message);
+    },
   });
 
   const deleteMutation = useMutation({
     mutationFn: api.deleteSession,
     onSuccess: (_data, deletedId) => {
+      stopRun(deletedId);  // abort any in-flight chat run for the deleted session
       queryClient.invalidateQueries({ queryKey: ['sessions'] });
       setConfirmDeleteId(null);
       if (deletedId === activeSessionId) {
@@ -60,6 +71,7 @@ export function SessionList({ activeSessionId, onSessionSelect, onSessionDelete 
     e.preventDefault();
     const base = newLabel.trim();
     if (base) {
+      setCreateError(null);
       const label = resolveLabel(base);
       createMutation.mutate({ label });
     }
@@ -118,6 +130,9 @@ export function SessionList({ activeSessionId, onSessionSelect, onSessionDelete 
               Cancel
             </button>
           </div>
+          {createError && (
+            <p className="text-sm text-muted mt-sm" role="alert">{createError}</p>
+          )}
         </form>
       ) : (
         <button
@@ -141,11 +156,34 @@ export function SessionList({ activeSessionId, onSessionSelect, onSessionDelete 
           >
             <div style={{ display: 'flex', alignItems: 'start', justifyContent: 'space-between' }}>
               <div style={{ flex: 1, minWidth: 0 }}>
-                <div className="session-label">{session.label}</div>
+                <div className="session-label" style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                  {runningIds.includes(session.id) && (
+                    <span
+                      className="session-running-dot"
+                      title="Running…"
+                      aria-label="Running"
+                      style={{
+                        flexShrink: 0,
+                        width: '8px',
+                        height: '8px',
+                        borderRadius: '50%',
+                        background: 'var(--color-primary, #4a90d9)',
+                        boxShadow: '0 0 0 0 rgba(74,144,217,0.6)',
+                        animation: 'session-running-pulse 1.4s ease-out infinite',
+                      }}
+                    />
+                  )}
+                  <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    {session.label}
+                  </span>
+                </div>
                 <div className="session-meta">
                   {formatDate(session.last_activity || session.created_at)}
                   {session.message_count !== undefined && (
                     <> · {session.message_count} messages</>
+                  )}
+                  {runningIds.includes(session.id) && (
+                    <span style={{ color: 'var(--color-primary, #4a90d9)' }}> · running…</span>
                   )}
                 </div>
               </div>

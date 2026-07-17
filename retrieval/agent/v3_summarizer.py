@@ -345,7 +345,7 @@ def summarize_from_evidence_set(
     try:
         from openai import OpenAI
         
-        model = os.getenv("OPENAI_MODEL_SUMMARY", "gpt-4o-mini")
+        model = os.getenv("OPENAI_MODEL_SUMMARY", "gpt-4.1-mini-2025-04-14")
         client = OpenAI(api_key=api_key)
         
         response = client.chat.completions.create(

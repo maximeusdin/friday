@@ -29,6 +29,14 @@ from retrieval.agent.v6_responsiveness import ResponsivenessVerifier, Responsive
 from retrieval.agent.v6_progress_gate import ProgressGate, ProgressResult, RoundDecision
 from retrieval.agent.tools import TOOL_REGISTRY, ToolResult, get_tools_for_prompt
 from retrieval.agent.v7_types import RoundSummary
+from retrieval.agent.v7_bundle_types import (
+    PreBundlingConfig,
+    PreBundlingMode,
+    BundleCandidate,
+    PreBundlingResult,
+    BundleBottleneckSelection,
+)
+from retrieval.agent.v7_pre_bundler import PreBundler
 
 
 # =============================================================================
@@ -41,8 +49,8 @@ class V6Config:
     
     # Bottleneck
     max_bottleneck_spans: int = 40
-    # Grading mode: "tournament" (default, pairwise comparison) or "absolute" (0-10 scoring)
-    bottleneck_grading_mode: GradingMode = DEFAULT_GRADING_MODE
+    # Grading mode: "score" (default, uses retrieval scores - no LLM), "absolute" (0-10 scoring), "tournament" (pairwise)
+    bottleneck_grading_mode: GradingMode = DEFAULT_GRADING_MODE  # "score" - fastest
     # Tournament batching: True = batch matchups for speed, False = 1 API call per matchup (slower but more accurate)
     tournament_batch: bool = TOURNAMENT_BATCH_BY_DEFAULT
     
@@ -58,7 +66,7 @@ class V6Config:
     chunks_per_search: int = 150
     
     # Synthesis
-    synthesis_model: str = "gpt-4o"
+    synthesis_model: str = "gpt-4.1-mini-2025-04-14"
     
     verbose: bool = True
     
@@ -75,7 +83,14 @@ class V6Config:
     # V7 Phase 2: Round summary
     # If True, generate RoundSummary after each round for smarter decision-making
     enable_round_summary: bool = True
-    round_summary_model: str = "gpt-4o-mini"
+    round_summary_model: str = "gpt-4.1-mini-2025-04-14"
+    
+    # V7 Pre-Bundling: Concordance-aware evidence grouping before bottleneck
+    # Modes: "off", "passthrough", "micro", "semantic"
+    pre_bundling_mode: str = "micro"  # Default micro (fast doc-based bundles); semantic = full LLM+concordance
+    pre_bundling_config: Optional["PreBundlingConfig"] = None
+    # Maximum bundles to select after bundle-level bottleneck
+    max_bottleneck_bundles: int = 5
 
 
 # =============================================================================
@@ -98,6 +113,10 @@ class V6Trace:
     rounds: List[Dict[str, Any]] = field(default_factory=list)
     bottleneck_spans: List[Any] = field(default_factory=list)  # All spans after bottleneck
     
+    # V7 Pre-bundling (optional)
+    pre_bundling_result: Optional[Dict[str, Any]] = None
+    selected_bundles: List[Dict[str, Any]] = field(default_factory=list)
+    
     # Step 5: Final synthesis
     final_answer: str = ""
     final_claims: List[Dict[str, Any]] = field(default_factory=list)
@@ -118,6 +137,8 @@ class V6Trace:
             "parsed_query": self.parsed_query.to_dict() if self.parsed_query else None,
             "entity_linking": self.entity_linking.to_dict() if self.entity_linking else None,
             "rounds": self.rounds,
+            "pre_bundling_result": self.pre_bundling_result,
+            "selected_bundles": self.selected_bundles,
             "final_answer": self.final_answer,
             "final_claims": self.final_claims,
             "responsiveness": self.responsiveness.to_dict() if self.responsiveness else None,
@@ -192,6 +213,17 @@ class V6Controller:
                 )
             except ImportError:
                 pass  # V7 controller not available
+        
+        # V7 Pre-Bundling: Initialize if mode is not "off"
+        self.pre_bundler: Optional[PreBundler] = None
+        self.pre_bundling_result: Optional[PreBundlingResult] = None
+        self.selected_bundles: List[BundleCandidate] = []
+        if self.config.pre_bundling_mode != "off":
+            pre_bundle_config = self.config.pre_bundling_config or PreBundlingConfig(
+                mode=PreBundlingMode(self.config.pre_bundling_mode),
+                verbose=self.config.verbose,
+            )
+            self.pre_bundler = PreBundler(config=pre_bundle_config)
     
     def _emit_progress(self, step: str, status: str, message: str, details: Optional[Dict[str, Any]] = None):
         """Emit a progress event if callback is configured."""
@@ -341,8 +373,50 @@ class V6Controller:
             # Retrieve
             chunks = self._retrieve(parsed, linking, conn, round_num)
             
-            # Bottleneck
-            bottleneck_result = self.bottleneck.filter(chunks, parsed, conn)
+            # Bottleneck (with optional pre-bundling)
+            if self.pre_bundler is not None:
+                # V7 Pre-Bundling: Group chunks into bundles, then filter bundles
+                self._emit_progress(f"pre_bundling_round_{round_num}", "running", "Pre-bundling chunks...", {})
+                
+                pre_bundle_result = self.pre_bundler.run(chunks, parsed, conn)
+                self.pre_bundling_result = pre_bundle_result
+                
+                if self.config.verbose:
+                    print(f"    [PreBundler] Created {len(pre_bundle_result.bundles)} bundles "
+                          f"from {pre_bundle_result.chunks_selected} chunks", file=sys.stderr)
+                
+                if pre_bundle_result.bundles:
+                    # Filter bundles through bottleneck
+                    bundle_selection = self.bottleneck.filter_bundles(
+                        pre_bundle_result.bundles, 
+                        parsed, 
+                        max_bundles=self.config.max_bottleneck_bundles,
+                    )
+                    self.selected_bundles = bundle_selection.selected_bundles
+                    
+                    # Convert selected bundles to bottleneck result for compatibility
+                    # Extract chunks from selected bundles and run regular bottleneck on them
+                    selected_chunks = bundle_selection.get_chunks_for_synthesis()
+                    
+                    if selected_chunks:
+                        bottleneck_result = self.bottleneck.filter(selected_chunks, parsed, conn)
+                    else:
+                        # No chunks from bundles, create empty result
+                        bottleneck_result = BottleneckResult(chunks_input=len(chunks))
+                    
+                    self._emit_progress(f"pre_bundling_round_{round_num}", "completed", 
+                                       f"Selected {len(self.selected_bundles)} bundles", {
+                                           "bundles_created": len(pre_bundle_result.bundles),
+                                           "bundles_selected": len(self.selected_bundles),
+                                       })
+                else:
+                    # No bundles created, fall back to regular bottleneck
+                    if self.config.verbose:
+                        print(f"    [PreBundler] No bundles created, using regular bottleneck", file=sys.stderr)
+                    bottleneck_result = self.bottleneck.filter(chunks, parsed, conn)
+            else:
+                # Standard bottleneck (no pre-bundling)
+                bottleneck_result = self.bottleneck.filter(chunks, parsed, conn)
             
             # Merge with previous spans
             for span in bottleneck_result.spans:
@@ -490,6 +564,12 @@ class V6Controller:
         # Populate bottleneck spans on trace before returning
         self.trace.bottleneck_spans = self.all_bottleneck_spans
         
+        # V7 Pre-bundling: Include bundling results in trace
+        if self.pre_bundling_result:
+            self.trace.pre_bundling_result = self.pre_bundling_result.to_dict()
+        if self.selected_bundles:
+            self.trace.selected_bundles = [b.to_dict() for b in self.selected_bundles]
+        
         return self.trace
     
     def _retrieve(
@@ -566,7 +646,7 @@ class V6Controller:
                 params = action.get("params", {})
                 
                 # SCOPE ENFORCEMENT: Inject collections into search tools
-                if scope_collections and tool_name in ("hybrid_search", "lexical_search", "lexical_exact", "vector_search"):
+                if scope_collections and tool_name in ("hybrid_search", "lexical_search", "lexical_exact", "vector_search", "co_mention_entities", "entity_mentions"):
                     params["collections"] = scope_collections
                     if self.config.verbose:
                         print(f"    [Scope] INJECTED collections={scope_collections} into {tool_name}", file=sys.stderr)
@@ -592,6 +672,12 @@ class V6Controller:
                 
                 result = self._call_tool(tool_name, params, conn)
                 chunks = self._load_chunks(result.chunk_ids, conn)
+                
+                # Attach retrieval scores to chunks for score-based bottleneck
+                for chunk in chunks:
+                    cid = chunk.get("id")
+                    if cid and cid in result.scores:
+                        chunk["retrieval_score"] = result.scores[cid]
                 
                 # SCOPE ENFORCEMENT: Filter chunks that don't match scope
                 # This catches entity-based searches that can't take collections param
@@ -765,7 +851,7 @@ IMPORTANT:
             client = OpenAI(api_key=api_key)
             
             response = client.chat.completions.create(
-                model="gpt-4o-mini",  # Fast model for tool selection
+                model="gpt-4.1-mini-2025-04-14",  # Fast model for tool selection
                 messages=[
                     {"role": "system", "content": "You select search tools to find evidence. Output valid JSON only."},
                     {"role": "user", "content": prompt},
@@ -891,10 +977,13 @@ IMPORTANT:
                 pass
             
             with conn.cursor() as cur:
+                # Get chunk text, doc, first_page_id, and actual PDF page number for citations
                 cur.execute("""
-                    SELECT c.id, COALESCE(c.clean_text, c.text), cm.document_id, cm.first_page_id, cm.collection_slug
+                    SELECT c.id, COALESCE(c.clean_text, c.text), cm.document_id, cm.first_page_id,
+                           p.pdf_page_number, cm.collection_slug
                     FROM chunks c
                     LEFT JOIN chunk_metadata cm ON cm.chunk_id = c.id
+                    LEFT JOIN pages p ON p.id = cm.first_page_id
                     WHERE c.id = ANY(%s)
                 """, (chunk_ids[:200],))
                 
@@ -903,9 +992,9 @@ IMPORTANT:
                         "id": row[0],
                         "text": row[1] or "",
                         "doc_id": row[2],
-                        "page_id": row[3],  # V7 Phase 2: Include raw page_id for seen tracking
-                        "page": f"p{row[3]}" if row[3] else "",
-                        "source_label": row[4] or "",
+                        "page_id": row[3],  # raw page_id for seen tracking
+                        "page": row[4] if row[4] is not None else "",  # 1-based PDF page number for UI
+                        "source_label": row[5] or "",
                     }
                     for row in cur.fetchall()
                 ]

@@ -297,6 +297,32 @@ def get_mode_config(mode: Literal["conversational", "thorough"]):
 
 
 # =============================================================================
+# Concordance Expansion Configuration (Stage 1.5)
+# =============================================================================
+
+# Target collections for chunk-driven expansion.
+# After initial retrieval, if any chunks belong to these collections,
+# a second search pass extracts entities from concordance tables and
+# runs a targeted expansion restricted to these collections.
+CONCORDANCE_EXPANSION_TARGET_COLLECTIONS = ("venona", "vassiliev")
+
+# Maximum entities to extract from target chunks (ordered by mention frequency)
+CONCORDANCE_EXPANSION_MAX_ENTITIES = 12
+
+# Minimum alias length to include (filters junk like "US", "NK")
+CONCORDANCE_EXPANSION_MIN_ALIAS_LEN = 3
+
+# Maximum aliases per entity (ordered by is_primary desc, length asc)
+CONCORDANCE_EXPANSION_MAX_ALIASES_PER_ENTITY = 5
+
+# Maximum extra chunks from expansion pass (appended with score penalty)
+CONCORDANCE_EXPANSION_MAX_EXTRA_CHUNKS = 10
+
+# Score penalty for expansion-only hits (multiplied against original score)
+CONCORDANCE_EXPANSION_SCORE_PENALTY = 0.8
+
+
+# =============================================================================
 # Threshold UI Helpers
 # =============================================================================
 

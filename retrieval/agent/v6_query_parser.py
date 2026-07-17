@@ -184,7 +184,7 @@ class QueryParser:
     
     def __init__(
         self,
-        model: str = "gpt-4o-mini",
+        model: str = "gpt-4.1-mini-2025-04-14",
         verbose: bool = True,
     ):
         self.model = model

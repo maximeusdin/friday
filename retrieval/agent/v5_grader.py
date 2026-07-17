@@ -2,7 +2,7 @@
 V5 Grader - LLM-based evidence evaluation
 
 The Grader is the sole authority on whether a span is good evidence.
-Uses gpt-4o-mini for speed (as specified in the design).
+Uses gpt-4.1-mini-2025-04-14 for speed (as specified in the design).
 
 No heuristics, no regex, no keyword overlap - pure semantic judgment.
 """
@@ -25,7 +25,7 @@ from retrieval.agent.v5_types import (
 # Configuration
 # =============================================================================
 
-GRADER_MODEL = "gpt-4o-mini"  # Fast model to avoid bottlenecks
+GRADER_MODEL = "gpt-4.1-mini-2025-04-14"  # Fast model to avoid bottlenecks
 GRADER_BATCH_SIZE = 10  # Grade this many spans per LLM call
 GRADER_TEMPERATURE = 0.1  # Low temp for consistency
 
@@ -93,7 +93,7 @@ BE CONSERVATIVE. If uncertain, rate lower. Better to miss some evidence than to 
 # =============================================================================
 
 class Grader:
-    """LLM-based evidence grader using gpt-4o-mini."""
+    """LLM-based evidence grader using gpt-4.1-mini-2025-04-14."""
     
     def __init__(
         self,
