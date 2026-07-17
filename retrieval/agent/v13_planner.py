@@ -200,9 +200,14 @@ def plan_query(question: str, *, model: str = _PLANNER_MODEL, verbose: bool = Fa
     plan["entities"] = _dedup_preserve(plan.get("entities") or [])[:12]
 
     # Records-oriented rewrite (evidence-seeking reframe). Off when the question is
-    # already document-seeking (belt to the planner-prompt suspenders), or via env.
+    # already document-seeking (belt to the planner-prompt suspenders), for count/roster
+    # intents (coverage-first enumeration is the right tool there, and without a person
+    # anchor the reframe degenerates into vague vocabulary soup that dilutes evidence),
+    # or via env.
     rq = [q for q in (plan.get("records_queries") or []) if q and str(q).strip()]
     if os.getenv("FRIDAY_RECORDS_REWRITE", "1") != "1":
+        rq = []
+    elif (plan.get("intent") or "lookup").lower() in ("count", "roster"):
         rq = []
     elif re.search(r"\b(documents?|records?|files?|reports?|memos?|memoranda)\b", question, re.I):
         rq = []
