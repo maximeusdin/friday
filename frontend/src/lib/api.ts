@@ -830,6 +830,7 @@ export interface SearchPageHitItem {
   page: { id: number; seq: number; pdf_page: number };
   snippet?: string;
   chunk_id: number;
+  hidden?: boolean;
   evidence_ref: {
     document_id: number;
     pdf_page: number;
@@ -878,15 +879,16 @@ async function deleteSearchResultSet(id: string): Promise<{ ok: boolean }> {
   return request<{ ok: boolean }>(`/search/result-sets/${id}`, { method: 'DELETE' });
 }
 
-/** Remove a single page hit from a saved search (persists server-side). */
-async function deleteSearchResultItem(
+/** Hide (remove) or restore a single page hit in a saved search (persists server-side, reversible). */
+async function setSearchResultItemHidden(
   resultSetId: string,
   documentId: number,
-  pageId: number
-): Promise<{ deleted: number }> {
-  return request<{ deleted: number }>(
-    `/search/result-sets/${resultSetId}/items?document_id=${documentId}&page_id=${pageId}`,
-    { method: 'DELETE' }
+  pageId: number,
+  hidden: boolean
+): Promise<{ updated: number; hidden: boolean }> {
+  return request<{ updated: number; hidden: boolean }>(
+    `/search/result-sets/${resultSetId}/items/hidden?document_id=${documentId}&page_id=${pageId}&hidden=${hidden}`,
+    { method: 'POST' }
   );
 }
 
@@ -969,7 +971,7 @@ export const api = {
   getSearchResultSet,
   listSearchResultSets,
   deleteSearchResultSet,
-  deleteSearchResultItem,
+  setSearchResultItemHidden,
   getSearchResultSetItems,
   getSearchResultSetExportUrl,
   expandSearchFuzzy,

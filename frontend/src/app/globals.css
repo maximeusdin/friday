@@ -373,6 +373,51 @@ html, body {
   color: #c62828;
 }
 
+.search-result-row-hidden {
+  opacity: 0.55;
+}
+
+.search-result-removed-label {
+  margin-left: 6px;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--color-text-muted);
+  border: 1px solid var(--color-border);
+  border-radius: 3px;
+  padding: 0 4px;
+}
+
+.search-result-restore {
+  background: none;
+  border: 1px solid var(--color-border);
+  border-radius: 3px;
+  padding: 1px 6px;
+  margin-left: 6px;
+  font-size: 11px;
+  color: var(--color-accent, #1a73e8);
+  cursor: pointer;
+}
+
+.search-result-restore:hover {
+  background: var(--color-accent-subtle, rgba(26, 115, 232, 0.08));
+}
+
+.search-show-hidden-toggle {
+  background: none;
+  border: none;
+  padding: 2px 0;
+  margin: 0 0 6px;
+  font-size: 12px;
+  color: var(--color-accent, #1a73e8);
+  cursor: pointer;
+  text-align: left;
+}
+
+.search-show-hidden-toggle:hover {
+  text-decoration: underline;
+}
+
 .global-header-actions {
   display: flex;
   align-items: center;

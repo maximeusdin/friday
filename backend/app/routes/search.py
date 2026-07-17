@@ -126,6 +126,7 @@ class SearchPageHitItem(BaseModel):
     evidence_ref: Dict[str, Any]
     viewer_url: Optional[str] = None
     asset_url: Optional[str] = None
+    hidden: bool = False
 
 
 class SearchItemsResponse(BaseModel):
@@ -371,38 +372,30 @@ def delete_search_result_set(
         conn.close()
 
 
-@router.delete("/result-sets/{result_set_id}/items")
-def delete_search_result_item(
+@router.post("/result-sets/{result_set_id}/items/hidden")
+def set_search_result_item_hidden(
     result_set_id: str,
     document_id: int = Query(...),
     page_id: int = Query(...),
+    hidden: bool = Query(...),
     user=Depends(require_user),
 ):
-    """Remove a single page hit from a saved search (persists across reloads),
-    keeping total_hits in sync so numbering and "Showing X of Y" stay correct."""
+    """Hide (remove) or restore a single page hit in a saved search. Hidden hits
+    persist server-side but stay restorable — no data is deleted."""
     conn = get_conn()
     try:
         _assert_search_result_set_owned(conn, result_set_id, user["sub"])
         with conn.cursor() as cur:
             cur.execute(
                 """
-                DELETE FROM search_result_page_hits
+                UPDATE search_result_page_hits SET hidden = %s
                 WHERE result_set_id = %s AND document_id = %s AND page_id = %s
                 """,
-                (result_set_id, document_id, page_id),
+                (hidden, result_set_id, document_id, page_id),
             )
-            deleted = cur.rowcount
-            if deleted:
-                cur.execute(
-                    """
-                    UPDATE search_result_sets
-                    SET total_hits = GREATEST(COALESCE(total_hits, 0) - %s, 0)
-                    WHERE id = %s
-                    """,
-                    (deleted, result_set_id),
-                )
+            updated = cur.rowcount
         conn.commit()
-        return {"deleted": deleted}
+        return {"updated": updated, "hidden": hidden}
     finally:
         conn.close()
 
@@ -473,7 +466,8 @@ def _build_items_query(
         h.collection_id, h.document_id, h.page_id, h.page_seq, h.pdf_page_number,
         h.chunk_id, h.snippet,
         col.slug AS collection_slug, col.title AS collection_title,
-        d.source_name AS document_title
+        d.source_name AS document_title,
+        h.hidden
     FROM search_result_page_hits h
     JOIN collections col ON col.id = h.collection_id
     JOIN documents d ON d.id = h.document_id
@@ -510,7 +504,7 @@ def get_search_result_set_items(
         items = []
         for r in rows:
             (col_id, doc_id, page_id, page_seq, pdf_page, chunk_id, snippet,
-             col_slug, col_title, doc_title) = r
+             col_slug, col_title, doc_title, hit_hidden) = r
 
             evidence_ref = {
                 "document_id": doc_id,
@@ -528,6 +522,7 @@ def get_search_result_set_items(
                     evidence_ref=evidence_ref,
                     viewer_url=f"/?document_id={doc_id}&pdf_page={pdf_page or page_seq}",
                     asset_url=None,
+                    hidden=bool(hit_hidden),
                 )
             )
 

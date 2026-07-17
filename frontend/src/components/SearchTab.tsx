@@ -18,6 +18,7 @@ export interface SearchResultBlock {
   nextCursor: string | null;
   isFetchingMore?: boolean;
   notice?: string | null;  // e.g. sentence relaxed to keywords
+  showHidden?: boolean;    // "Show removed" toggle state for this search
 }
 
 interface SearchTabProps {
@@ -308,12 +309,12 @@ export function SearchTab({ activeScope, sessionId, onOpenPage, externalResultSe
     });
   }, [searchHistory]);
 
-  // Remove a single hit from a search's results (persists server-side; renumbers)
-  const handleRemoveItem = useCallback(async (resultSetId: string, item: SearchPageHitItem) => {
+  // Hide or restore a single hit (persists server-side, reversible; numbering skips hidden rows)
+  const handleSetItemHidden = useCallback(async (resultSetId: string, item: SearchPageHitItem, hidden: boolean) => {
     try {
-      await api.deleteSearchResultItem(resultSetId, item.document.id, item.page.id);
+      await api.setSearchResultItemHidden(resultSetId, item.document.id, item.page.id, hidden);
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Failed to remove result');
+      setError(e instanceof Error ? e.message : 'Failed to update result');
       return;
     }
     setSearchHistory((prev) => {
@@ -323,9 +324,22 @@ export function SearchTab({ activeScope, sessionId, onOpenPage, externalResultSe
       const next = [...prev];
       next[idx] = {
         ...b,
-        items: b.items.filter((it) => !(it.document.id === item.document.id && it.page.id === item.page.id)),
-        totalHits: Math.max(0, b.totalHits - 1),
+        items: b.items.map((it) =>
+          it.document.id === item.document.id && it.page.id === item.page.id
+            ? { ...it, hidden }
+            : it
+        ),
       };
+      return next;
+    });
+  }, []);
+
+  const toggleShowHidden = useCallback((resultSetId: string) => {
+    setSearchHistory((prev) => {
+      const idx = prev.findIndex((b) => b.resultSetId === resultSetId);
+      if (idx < 0) return prev;
+      const next = [...prev];
+      next[idx] = { ...next[idx], showHidden: !next[idx].showHidden };
       return next;
     });
   }, []);
@@ -552,13 +566,27 @@ export function SearchTab({ activeScope, sessionId, onOpenPage, externalResultSe
                 Export CSV
               </button>
             </div>
+            {(() => {
+              const hiddenCount = block.items.filter((it) => it.hidden).length;
+              if (hiddenCount === 0) return null;
+              return (
+                <button
+                  type="button"
+                  className="search-show-hidden-toggle"
+                  onClick={() => toggleShowHidden(block.resultSetId)}
+                >
+                  {block.showHidden ? 'Hide removed results' : `Show removed results (${hiddenCount})`}
+                </button>
+              );
+            })()}
             <SearchResultsList
               items={block.items}
               totalHits={block.totalHits}
               onOpenPage={onOpenPage}
               resultSetId={block.resultSetId}
               isLoading={false}
-              onRemoveItem={(item) => handleRemoveItem(block.resultSetId, item)}
+              showHidden={!!block.showHidden}
+              onSetItemHidden={(item, hidden) => handleSetItemHidden(block.resultSetId, item, hidden)}
             />
             {block.totalHits > block.items.length && block.nextCursor != null && (
               <button
