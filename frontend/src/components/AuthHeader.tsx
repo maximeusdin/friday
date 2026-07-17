@@ -113,6 +113,81 @@ function AboutModal({ onClose }: { onClose: () => void }) {
             perspiciatis unde omnis iste natus error sit voluptatem
             accusantium doloremque laudantium.
           </p>
+          <details className="about-section">
+            <summary>How to use Friday — a researcher&apos;s tutorial</summary>
+            <div className="about-section-body">
+              <p>
+                Friday searches digitized, OCR-processed declassified archives and answers with
+                citations to the actual pages. It finds and reads documents — it does not add
+                outside knowledge, and it will tell you when the documents don&apos;t answer the question.
+              </p>
+              <p><strong>Asking questions that maximize returns:</strong></p>
+              <ul>
+                <li><strong>Name names.</strong> Include the people, organizations, and places you care
+                  about. Friday automatically expands cover names and aliases (asking about Golos also
+                  finds &ldquo;Sound&rdquo;; asking &ldquo;Who is Jurist?&rdquo; resolves the codename), but it can only
+                  do that when a name is in the question.</li>
+                <li><strong>Include distinctive details.</strong> Rare numbers, dates, and quoted phrases
+                  are gold: &ldquo;500-600 meetings&rdquo; or a distinctive phrase from a document pins the search
+                  to the exact passage.</li>
+                <li><strong>Direct questions are fine.</strong> Friday rewrites questions like &ldquo;When was
+                  X recruited?&rdquo; into the archive&apos;s own record language (&ldquo;initial contact&rdquo;,
+                  &ldquo;memorandum&rdquo;, &ldquo;informant&rdquo;) behind the scenes, because FBI files rarely use everyday
+                  words. Phrasing a question around records (&ldquo;what records exist about&hellip;&rdquo;) works well too.</li>
+                <li><strong>Lists and counts enumerate the whole archive.</strong> &ldquo;Which journalists
+                  were recruited?&rdquo; or &ldquo;How many engineers&hellip;?&rdquo; triggers coverage-first retrieval across
+                  every collection, so members spread over multiple files aren&apos;t missed.</li>
+                <li><strong>Scope narrows the hunt.</strong> Use the Scope panel (right side) to restrict
+                  to specific collections or documents — it applies to both Chat and Search — or just
+                  say it in the question (&ldquo;&hellip;in the Vassiliev notebooks&rdquo;).</li>
+                <li><strong>Click the citations.</strong> Evidence links open the document at the right
+                  page with the supporting passage highlighted. The quoted passage shown is taken
+                  verbatim from the document, never paraphrased.</li>
+              </ul>
+              <p><strong>Reading the answers:</strong> findings marked with a source are grounded in a
+                cited page. A summary labeled <em>unverified</em> means its claims didn&apos;t pass citation
+                checks — treat it as a lead, and click through to the sources. When Friday says it
+                could not find evidence, that is a statement about the search, not proof the fact
+                isn&apos;t somewhere in the archive: rephrase with more specific names or details, or use
+                <em> Think Deeper</em> to extend the investigation.</p>
+              <p><strong>Default settings:</strong> full-archive scope; deep search effort on every
+                query (Think Deeper extends even further, reusing the evidence already gathered);
+                alias/codename expansion on; record-language rewriting on. In the Search tab, exact
+                matching is the default — Fuzzy (for OCR errors and typos) and Aliases are toggles
+                next to the search box.</p>
+              <p><strong>What Friday doesn&apos;t do:</strong> it can&apos;t read text the OCR mangled beyond
+                recognition (try Fuzzy in Search for near-miss spellings); it won&apos;t speculate beyond
+                the documents; and it doesn&apos;t (yet) search outside the indexed collections listed below.</p>
+            </div>
+          </details>
+
+          <details className="about-section">
+            <summary>Chat vs. Search — which to use when</summary>
+            <div className="about-section-body">
+              <p>
+                <strong>Search</strong> is a deterministic concordance: it matches your terms —
+                exact, boolean (<code>AND</code>/<code>OR</code>/<code>NOT</code>, quoted phrases), or
+                fuzzy — against every page and returns numbered page hits you can open, prune, and
+                export as CSV. It never interprets your query. Use Search when you know words that
+                actually appear on the page, when you want <em>every</em> occurrence (not a summary),
+                or when you&apos;re building a citation list. Each search becomes a tab in your session,
+                and numbering lets you stop at hit #40 and resume next week.
+              </p>
+              <p>
+                <strong>Chat</strong> is an investigative assistant: it plans the question, runs many
+                searches (semantic and exact, in your words and the archive&apos;s), resolves codenames,
+                reads the retrieved pages, and writes an answer with citations. Use Chat when you have
+                a question rather than a term, when your wording may not match the documents&apos;
+                vocabulary, or when the answer must be assembled from several documents.
+              </p>
+              <p>
+                They share the same session and the same Scope panel. A rule of thumb: <em>Search
+                finds pages; Chat answers questions.</em> Researchers often begin in Chat, then switch
+                to Search to exhaustively walk the pages behind an answer.
+              </p>
+            </div>
+          </details>
+
           <h3>Funding</h3>
           {/* Placeholder copy — replace with real funding acknowledgement */}
           <p>
@@ -120,6 +195,17 @@ function AboutModal({ onClose }: { onClose: () => void }) {
             enim ipsam voluptatem quia voluptas sit aspernatur aut odit aut
             fugit, sed quia consequuntur magni dolores eos qui ratione
             voluptatem sequi nesciunt.
+          </p>
+          <h3>Origins of Friday</h3>
+          {/* Placeholder copy — replace with the real origin story: who conceived and
+              built Friday (its architects), the institutions involved, and how the
+              project is funded. */}
+          <p>
+            Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed ut
+            perspiciatis unde omnis iste natus error sit voluptatem accusantium
+            doloremque laudantium, totam rem aperiam, eaque ipsa quae ab illo
+            inventore veritatis et quasi architecto beatae vitae dicta sunt
+            explicabo. Nemo enim ipsam voluptatem quia voluptas sit aspernatur.
           </p>
           <h3>Collections</h3>
           <p className="about-collections-hint">
