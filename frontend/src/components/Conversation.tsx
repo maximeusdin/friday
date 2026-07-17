@@ -11,6 +11,7 @@ import type {
 } from '@/types/api';
 import { scopeFingerprint } from '@/lib/scope';
 import { ClarificationCard } from './ClarificationCard';
+import { ConcordanceCard } from './ConcordanceIndex';
 
 const PROGRESS_PHRASES = [
   'Searching archives...',
@@ -273,6 +274,7 @@ export function Conversation({
           </div>
         </div>
 
+        <ConcordanceCard />
       </div>
     );
   }

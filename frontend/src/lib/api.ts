@@ -926,6 +926,52 @@ function getSearchResultSetExportUrl(id: string, format: 'csv' | 'json' = 'csv')
 }
 
 // =============================================================================
+// Concordance Index
+// =============================================================================
+
+export interface ConcordanceEntry {
+  id: number;
+  canonical_name: string;
+  entity_type?: string;
+  description?: string;
+  aliases: string[];
+}
+
+export interface ConcordanceEntriesResponse {
+  entries: ConcordanceEntry[];
+  total: number;
+  offset: number;
+  limit: number;
+}
+
+export interface ConcordanceSummary {
+  entities: number;
+  aliases: number;
+  by_type: { type: string; count: number }[];
+}
+
+async function getConcordanceSummary(): Promise<ConcordanceSummary> {
+  return request<ConcordanceSummary>('/concordance/summary');
+}
+
+async function getConcordanceEntries(opts: {
+  query?: string;
+  limit?: number;
+  offset?: number;
+} = {}): Promise<ConcordanceEntriesResponse> {
+  const params = new URLSearchParams();
+  if (opts.query) params.set('query', opts.query);
+  if (opts.limit != null) params.set('limit', String(opts.limit));
+  if (opts.offset != null) params.set('offset', String(opts.offset));
+  const qs = params.toString();
+  return request<ConcordanceEntriesResponse>(`/concordance/entries${qs ? `?${qs}` : ''}`);
+}
+
+function getConcordanceExportUrl(): string {
+  return `${getRequestBase()}/concordance/export?format=csv`;
+}
+
+// =============================================================================
 // Export
 // =============================================================================
 
@@ -976,6 +1022,10 @@ export const api = {
   getSearchResultSetExportUrl,
   expandSearchFuzzy,
   fetchMoreSearchSnippets,
+  // Concordance Index
+  getConcordanceSummary,
+  getConcordanceEntries,
+  getConcordanceExportUrl,
 };
 
 export { ApiError };

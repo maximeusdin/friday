@@ -26,8 +26,8 @@ def register_routers(app: FastAPI) -> None:
     Container runs: uvicorn app.main:app — so this module is the only place that matters.
     Imports are inside this function to avoid circular imports; any missing router will raise here.
     """
-    from app.routes import auth_cognito, documents, meta, plans, results, sessions
-    from app.routes import chat  # sessions + chat both under /api/sessions
+    from app.routes import auth_cognito, chat, concordance, documents, meta, plans, results, search, sessions
+    # sessions + chat both under /api/sessions
 
     app.include_router(auth_cognito.router, prefix="/auth", tags=["auth"])
     app.include_router(meta.router, prefix="/api", tags=["meta"])
@@ -35,7 +35,9 @@ def register_routers(app: FastAPI) -> None:
     app.include_router(chat.router, prefix="/api/sessions", tags=["chat"])
     app.include_router(plans.router, prefix="/api/plans", tags=["plans"])
     app.include_router(results.router, prefix="/api/result-sets", tags=["results"])
+    app.include_router(search.router, prefix="/api/search", tags=["search"])
     app.include_router(documents.router, prefix="/api", tags=["documents"])
+    app.include_router(concordance.router, prefix="/api", tags=["concordance"])
 
 
 # Load .env for local dev (when file exists or FRIDAY_LOAD_DOTENV=1).
@@ -202,4 +204,24 @@ def health():
     out = {"status": "ok", "build": build, "db": {"ok": db_ok}}
     if db_error and not db_ok:
         out["db"]["error"] = db_error[:200]
+
+    # Auth config check (no secrets exposed)
+    try:
+        from app.routes import auth_cognito
+        ru = (auth_cognito.REDIRECT_URI or "").rstrip("/")
+        expected = "https://api.fridayarchive.org/auth/oauth/cognito/callback"
+        out["auth"] = {
+            "configured": auth_cognito._auth_configured(),
+            "redirect_uri_ok": ru == expected,
+        }
+    except Exception:
+        out["auth"] = {"configured": False, "redirect_uri_ok": False}
+
+    # Agent version check: V11 uses "search", V9 uses "search_chunks"
+    try:
+        from retrieval.agent.v11_runner import V11_TOOLS_DEF
+        first_tool = V11_TOOLS_DEF[0]["function"]["name"] if V11_TOOLS_DEF else "?"
+        out["agent"] = {"first_search_tool": first_tool}
+    except Exception:
+        out["agent"] = {"first_search_tool": "unknown"}
     return out
