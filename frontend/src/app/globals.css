@@ -197,6 +197,111 @@ html, body {
   font-size: 15px;
   color: var(--color-text);
   letter-spacing: -0.01em;
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.global-header-brand:hover {
+  color: var(--color-accent, #1a73e8);
+}
+
+.header-about-btn {
+  background: none;
+  border: none;
+  padding: 4px 8px;
+  font-size: 13px;
+  color: var(--color-text-muted);
+  cursor: pointer;
+  border-radius: var(--radius-sm);
+}
+
+.header-about-btn:hover {
+  color: var(--color-text);
+  background: var(--color-bg-subtle, rgba(0, 0, 0, 0.04));
+}
+
+.about-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.45);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+
+.about-card {
+  background: var(--color-bg);
+  border-radius: var(--radius-md, 8px);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.25);
+  max-width: 560px;
+  width: calc(100% - 48px);
+  max-height: 80vh;
+  overflow-y: auto;
+}
+
+.about-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 20px 0;
+}
+
+.about-card-header h2 {
+  margin: 0;
+  font-size: 18px;
+}
+
+.about-close-btn {
+  background: none;
+  border: none;
+  font-size: 16px;
+  color: var(--color-text-muted);
+  cursor: pointer;
+  padding: 4px 8px;
+  border-radius: var(--radius-sm);
+}
+
+.about-close-btn:hover {
+  color: var(--color-text);
+  background: var(--color-bg-subtle, rgba(0, 0, 0, 0.04));
+}
+
+.about-card-body {
+  padding: 8px 20px 20px;
+  font-size: 14px;
+  line-height: 1.55;
+  color: var(--color-text);
+}
+
+.about-card-body h3 {
+  font-size: 14px;
+  margin: 14px 0 6px;
+}
+
+.copy-answer-btn {
+  float: right;
+  background: none;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  padding: 2px 8px;
+  font-size: 11px;
+  color: var(--color-text-muted);
+  cursor: pointer;
+  margin-left: 8px;
+}
+
+.copy-answer-btn:hover {
+  color: var(--color-text);
+  background: var(--color-bg-subtle, rgba(0, 0, 0, 0.04));
+}
+
+.search-result-num {
+  color: var(--color-text-muted);
+  font-variant-numeric: tabular-nums;
+  font-size: 12px;
+  flex-shrink: 0;
+  min-width: 26px;
 }
 
 .global-header-actions {

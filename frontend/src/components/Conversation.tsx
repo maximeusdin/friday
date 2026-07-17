@@ -273,25 +273,6 @@ export function Conversation({
           </div>
         </div>
 
-        {collections && collections.length > 0 && (
-          <div className="splash-section">
-            <h3 className="splash-section-title">Indexed collections</h3>
-            <div className="splash-collections-pills">
-              {collections.map((c) => (
-                <span
-                  key={c.id}
-                  className="splash-collection-pill"
-                  title={c.description || `${c.title || c.slug} — ${c.document_count} document${c.document_count === 1 ? '' : 's'}`}
-                >
-                  {c.title || c.slug}
-                  {c.document_count != null && (
-                    <span className="splash-collection-count">{c.document_count}</span>
-                  )}
-                </span>
-              ))}
-            </div>
-          </div>
-        )}
       </div>
     );
   }
@@ -586,10 +567,11 @@ function ChatBubble({
   const escalations = v9meta?.escalations;
   const scopeOverride = v9meta?.scope_override;
   const expansionInfo = v9meta?.expansion_info;
-  
+
   return (
     <div className="chat-message chat-message-assistant">
       <div className="chat-answer">
+        <CopyAnswerButton content={message.content} citationMap={citationMap} />
         {/* V9 intent badge */}
         {isV9 && intent && (
           <div style={{ marginBottom: '6px', display: 'flex', gap: '6px', alignItems: 'center' }}>
@@ -660,7 +642,7 @@ function ChatBubble({
             color: 'var(--color-text-secondary, #888)',
             marginBottom: '6px',
           }}>
-            Concordance expansion: {expansionInfo.triggered
+            Alias expansion: {expansionInfo.triggered
               ? `Triggered${expansionInfo.reason ? ` (${expansionInfo.reason.substring(0, 60)})` : ''}`
               : 'Not triggered'
             }
@@ -815,6 +797,56 @@ function ChatBubble({
         )}
       </div>
     </div>
+  );
+}
+
+/**
+ * Copy the answer text (plus a Sources list with document links) to the clipboard.
+ * Links use absolute PDF URLs with #page anchors so they work when pasted elsewhere.
+ */
+function CopyAnswerButton({
+  content,
+  citationMap,
+}: {
+  content: string;
+  citationMap: Record<string, CitationDetail>;
+}) {
+  const [copied, setCopied] = useState(false);
+
+  const handleCopy = async () => {
+    let text = (content || '').trim();
+    const seen = new Set<string>();
+    const lines: string[] = [];
+    for (const [key, det] of Object.entries(citationMap)) {
+      const label = det.label || key;
+      if (!det.document_id || seen.has(label)) continue;
+      seen.add(label);
+      let url = api.getDocumentPdfUrl(det.document_id);
+      if (url.startsWith('/')) url = `${window.location.origin}${url}`;
+      if (det.page != null) url += `#page=${det.page}`;
+      lines.push(`- ${label}: ${url}`);
+    }
+    if (lines.length > 0) text += `\n\nSources:\n${lines.join('\n')}`;
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      /* clipboard unavailable (e.g. insecure context) */
+    }
+  };
+
+  if (!content?.trim()) return null;
+  return (
+    <button
+      type="button"
+      className="copy-answer-btn"
+      onClick={handleCopy}
+      title="Copy this answer, including source links"
+      aria-label="Copy answer"
+    >
+      {copied ? '✓ Copied' : '⎘ Copy'}
+    </button>
   );
 }
 

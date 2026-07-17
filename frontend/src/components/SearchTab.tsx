@@ -283,7 +283,7 @@ export function SearchTab({ activeScope, sessionId, onOpenPage, externalResultSe
     return (
       <div className="pane-content splash-content">
         <div className="splash-hero">
-          <div className="splash-badge">Concordance Search</div>
+          <div className="splash-badge">Archive Search</div>
           <h2 className="splash-title">Search</h2>
           <p className="splash-tagline">Boolean search across Cold War archives.</p>
           <p className="splash-subtitle">

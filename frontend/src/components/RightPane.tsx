@@ -252,6 +252,14 @@ function ScopePanel({
   };
 
   const toggleExpand = async (colId: number) => {
+    // Any interaction with the tree engages custom mode (keeps current selections)
+    if (!isCustom) {
+      onDraftChange({
+        mode: 'custom',
+        included_collection_ids: Array.from(selectedCollectionIds),
+        included_document_ids: Array.from(selectedDocumentIds),
+      });
+    }
     const next = new Set(expandedCollections);
     if (next.has(colId)) {
       next.delete(colId);
@@ -431,14 +439,12 @@ function ScopePanel({
           value={searchFilter}
           onChange={(e) => setSearchFilter(e.target.value)}
           onKeyDown={(e) => { if (e.key === 'Enter') e.preventDefault(); }}
-          disabled={!isCustom}
           style={{
             padding: '4px 6px',
             border: '1px solid var(--color-border, #ddd)',
             borderRadius: '3px',
             fontSize: '12px',
             marginBottom: '6px',
-            opacity: isCustom ? 1 : 0.5,
             color: '#212529',
           }}
         />
@@ -483,14 +489,12 @@ function ScopePanel({
                 {/* Collection row */}
                 <div style={{
                   display: 'flex', alignItems: 'center', gap: 4, padding: '3px 0',
-                  opacity: isCustom ? 1 : 0.5,
                 }}>
                   <input
                     type="checkbox"
                     checked={selectedCollectionIds.has(col.id)}
                     onChange={() => toggleCollection(col.id)}
-                    disabled={!isCustom}
-                    style={{ cursor: isCustom ? 'pointer' : 'default', margin: 0, flexShrink: 0 }}
+                    style={{ cursor: 'pointer', margin: 0, flexShrink: 0 }}
                   />
                   <span
                     onClick={() => toggleExpand(col.id)}
@@ -525,14 +529,13 @@ function ScopePanel({
                       col.documents.map(doc => (
                         <div key={doc.id} style={{
                           display: 'flex', alignItems: 'center', gap: 4, padding: '2px 0',
-                          fontSize: '12px', opacity: isCustom ? 1 : 0.5,
+                          fontSize: '12px',
                         }}>
                           <input
                             type="checkbox"
                             checked={selectedDocumentIds.has(doc.id)}
                             onChange={() => toggleDocument(doc.id)}
-                            disabled={!isCustom}
-                            style={{ cursor: isCustom ? 'pointer' : 'default', margin: 0, flexShrink: 0 }}
+                            style={{ cursor: 'pointer', margin: 0, flexShrink: 0 }}
                           />
                           <a
                             href={api.getDocumentPdfUrl(doc.id)}

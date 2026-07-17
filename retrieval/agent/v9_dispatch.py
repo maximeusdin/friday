@@ -245,8 +245,10 @@ class DispatchResult:
 # =============================================================================
 
 def _max_tool_calls_from_env() -> int:
-    """Same as CLI: V11_QUERY_MAX_TURNS (default 10)."""
-    return int(os.getenv("V11_QUERY_MAX_TURNS", "10"))
+    """V11_QUERY_MAX_TURNS (default 20: new queries get the think-deeper-level
+    budget up front, per user request that deeper search be the default).
+    Easy queries still stop early via progress gates."""
+    return int(os.getenv("V11_QUERY_MAX_TURNS", "20"))
 
 
 def _think_deeper_budget_from_env() -> int:
