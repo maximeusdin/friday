@@ -256,13 +256,26 @@ function AboutModal({ onClose }: { onClose: () => void }) {
                     {docs === 'error' && <div className="search-error">Failed to load files.</div>}
                     {Array.isArray(docs) && (
                       docs.length > 0 ? (
-                        <ul className="about-collection-files">
-                          {docs.map((d) => (
-                            <li key={d.id} title={d.source_ref || d.source_name}>
-                              {d.source_name || d.source_ref || `Document #${d.id}`}
-                            </li>
-                          ))}
-                        </ul>
+                        <div className="about-collection-files-scroll">
+                          <table className="about-collection-files-table">
+                            <thead>
+                              <tr>
+                                <th>#</th>
+                                <th>File</th>
+                                <th>Source reference</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {docs.map((d, i) => (
+                                <tr key={d.id}>
+                                  <td className="files-table-num">{i + 1}</td>
+                                  <td>{d.source_name || `Document #${d.id}`}</td>
+                                  <td className="files-table-ref">{d.source_ref || '—'}</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
                       ) : (
                         <div className="about-collection-files-empty">No documents.</div>
                       )

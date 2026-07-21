@@ -297,11 +297,12 @@ html, body {
 }
 
 .search-result-num {
-  color: var(--color-text-muted);
+  color: var(--color-text);
   font-variant-numeric: tabular-nums;
-  font-size: 12px;
+  font-size: 16px;
+  font-weight: 700;
   flex-shrink: 0;
-  min-width: 26px;
+  min-width: 34px;
 }
 
 /* Search tabs: one chip per search, wrapping to multiple rows so full query names stay visible */
@@ -672,6 +673,50 @@ html, body {
   overflow-y: auto;
   font-size: 12px;
   line-height: 1.6;
+}
+
+.about-collection-files-scroll {
+  max-height: 260px;
+  overflow-y: auto;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+}
+
+.about-collection-files-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.about-collection-files-table th {
+  position: sticky;
+  top: 0;
+  background: var(--color-bg-secondary, #f6f7f8);
+  text-align: left;
+  padding: 5px 8px;
+  border-bottom: 1px solid var(--color-border);
+  font-weight: 600;
+}
+
+.about-collection-files-table td {
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--color-border);
+  vertical-align: top;
+}
+
+.about-collection-files-table tr:last-child td {
+  border-bottom: none;
+}
+
+.files-table-num {
+  color: var(--color-text-muted);
+  font-variant-numeric: tabular-nums;
+  width: 34px;
+}
+
+.files-table-ref {
+  color: var(--color-text-muted);
+  word-break: break-all;
 }
 
 .about-collection-files-empty {
