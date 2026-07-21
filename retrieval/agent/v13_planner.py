@@ -491,7 +491,16 @@ def prime_workspace(
                 # The researcher's query shape: pin the SCOPE term, OR the alternatives.
                 # "OSS AND (NKVD OR Soviet OR agent OR espionage)" finds Halperin's
                 # "Soviet"-phrased chunks that a literal "NKVD AND OSS" misses.
-                primary = _scope_anchors[0] if _scope_anchors else ba[0]
+                # Primary = the RAREST candidate anchor (deterministic; planner anchor
+                # order varies run-to-run and pinning the common term — NKVD over OSS —
+                # excludes scope pages phrased without it).
+                _cands = (_scope_anchors or ba)[:3]
+                try:
+                    _counts = {a: _true_lexical_count(conn, str(a), cols) for a in _cands}
+                    _pos = {c: n for c, n in _counts.items() if n > 0}
+                    primary = min(_pos, key=_pos.get) if _pos else _cands[0]
+                except Exception:
+                    primary = _cands[0]
                 others = [a for a in ba if a != primary][:2]
                 syns = [s for s in (plan.get("target_synonyms") or []) if s and len(s) >= 4][:3]
                 or_group = list(dict.fromkeys(
