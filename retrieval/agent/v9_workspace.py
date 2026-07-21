@@ -1052,6 +1052,18 @@ def merge_evidence_summary_update(
             if bullet.pinned:
                 workspace.pinned_bullet_ids.append(bid)
 
+    # Accumulate answer_terms (dynamic attr; validated upstream) for the chase
+    _terms = getattr(update, "answer_terms", None) or []
+    if _terms:
+        _acc = getattr(workspace, "_answer_terms", None)
+        if _acc is None:
+            _acc = []
+            workspace._answer_terms = _acc
+        _seen = {t["term"].lower() for t in _acc}
+        for _t in _terms:
+            if _t["term"].lower() not in _seen:
+                _acc.append(dict(_t))
+
     # Append update to memory
     workspace.evidence_memory.append(update)
     workspace._summarized_chunk_ids.update(update.generated_from_chunk_ids)

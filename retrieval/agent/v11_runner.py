@@ -740,6 +740,51 @@ def _run_insufficiency_mine(conn, workspace, plan, question: str, *, verbose: bo
     return "\n".join(lines)
 
 
+def _run_answer_term_chase(conn, workspace, terms, question, *, verbose=False):
+    """One-hop chase: a passage NAMED the answer's subject (e.g. "pumpkin papers")
+    even though the question's wording never could. Pool the term, read every page,
+    return verbatim findings for the resynthesis. Chase output cannot spawn chases."""
+    from retrieval.agent.v11_tools import boolean_search, mine_pool
+    sess = getattr(workspace, "_search_session", None) or {}
+    lines = []
+    for t in terms:
+        t["chased"] = True
+        term = t.get("term") or ""
+        if len(term) < 3:
+            continue
+        bq = f'"{term}"' if " " in term else term
+        bres = boolean_search(conn, bq, scope=workspace.scope,
+                              session_id=sess.get("session_id"),
+                              user_sub=sess.get("user_sub") or "chat-engine",
+                              origin_query=question, max_hits_returned=80)
+        pool = [h["chunk_id"] for h in (bres.get("hits") or [])]
+        if not pool:
+            continue
+        if verbose:
+            print(f"  [V14] answer-term chase: '{term}' -> {bres.get('total_hits')} hits",
+                  file=sys.stderr)
+        spec = (f"Every statement explaining what {term} is/was and how it relates to: "
+                f"{question}. Verbatim sentences with any dates.")
+        mres = mine_pool(conn, pool, spec, question, max_chunks=60, verbose=verbose)
+        for e in (mres.get("entries") or [])[:5]:
+            for c in e["citations"][:2]:
+                q_txt = (c.get("quote") or "")[:240]
+                lines.append(f'- [chunk {c["chunk_id"]}] "{q_txt}"')
+        top_cids = list(dict.fromkeys(
+            c["chunk_id"] for e in (mres.get("entries") or [])[:5]
+            for c in e["citations"]))[:8]
+        try:
+            fetched = fetch_chunks(conn, chunk_ids=top_cids)
+            merge_fetched_chunks(workspace, fetched)
+        except Exception:
+            pass
+    if not lines:
+        return ""
+    head = ("ANSWER-TERM CHASE — a passage named the specific subject of the question; "
+            "every page mentioning it has now been read. Verbatim findings (cite chunk_ids):")
+    return head + chr(10) + chr(10).join(lines) + chr(10) + "Revise your answer to use these findings."
+
+
 def _lookup_quote_page(conn, chunk_id: int, quote: str) -> Optional[int]:
     """Find which of a chunk's PDF pages contains the quote, by matching the quote
     against each page's raw_text (chunk_pages char offsets are unpopulated, so text
@@ -1140,6 +1185,7 @@ def run_v11_query(
     tool_calls_executed = 0
     model_turns = 0
     finalize_retries = 0  # bounded pushback on rejected finalizations (anti-give-up)
+    answer_chase_done = False  # one-hop answer-term chase (FRIDAY_ANSWER_TERMS)
     done = False
     synthesis: Optional[V9Synthesis] = None
     prev_counts = _snapshot_counts(workspace)
@@ -1421,6 +1467,27 @@ def run_v11_query(
             })
             prev_counts = _snapshot_counts(workspace)
             continue
+
+        # Answer-term chase (one hop, before accepting a final): a fetched passage
+        # NAMED the thing the question asks about — read every page naming it first.
+        if (content.get("final")
+                and os.getenv("FRIDAY_ANSWER_TERMS", "0") == "1"
+                and not answer_chase_done):
+            _pending = [t for t in (getattr(workspace, "_answer_terms", None) or [])
+                        if not t.get("chased")]
+            if _pending:
+                answer_chase_done = True
+                try:
+                    _chase_msg = _run_answer_term_chase(
+                        conn, workspace, _pending[:2], clean_question, verbose=verbose)
+                except Exception as _ce:
+                    _chase_msg = ""
+                    if verbose:
+                        print(f"  [V14] answer-term chase failed: {_ce}", file=sys.stderr)
+                if _chase_msg:
+                    messages.append({"role": "user", "content": _chase_msg})
+                    prev_counts = _snapshot_counts(workspace)
+                    continue
 
         # Finalization
         content["artifact"] = _build_artifact_dict(content.get("artifact") or {})

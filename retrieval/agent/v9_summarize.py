@@ -65,8 +65,21 @@ _SUMMARIZER_SCHEMA = {
                 "type": "array",
                 "items": {"type": "string"},
             },
+            "answer_terms": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "term": {"type": "string"},
+                        "quote": {"type": "string"},
+                        "chunk_id": {"type": "integer"},
+                    },
+                    "required": ["term", "quote", "chunk_id"],
+                    "additionalProperties": False,
+                },
+            },
         },
-        "required": ["bullets", "open_questions", "leads", "warnings"],
+        "required": ["bullets", "open_questions", "leads", "warnings", "answer_terms"],
         "additionalProperties": False,
     },
 }
@@ -101,6 +114,11 @@ Given the research question and a set of document chunks, produce:
 - open_questions (max 4): unanswered questions raised by these chunks.
 - leads (max 6): promising follow-up searches or chunk_ids to investigate.
 - warnings (max 3): contradictions, OCR errors, or reliability concerns.
+- answer_terms (max 2): if a passage NAMES a specific object, document, codename,
+  or event AS the thing the research question is asking about — even when the
+  passage's wording does not resemble the question's — record it: term (the name,
+  e.g. 'pumpkin papers'), the verbatim quote naming it, and its chunk_id. This
+  flags answers hiding under their own name. Usually empty.
 
 Be concise. Bullet text should be under 220 characters.
 Only reference chunk_ids that appear in the provided chunks below."""
@@ -295,8 +313,27 @@ def _normalize_summary(
             file=sys.stderr,
         )
 
+    clean_terms = []
+    for t in (raw.get("answer_terms") or [])[:2]:
+        term = (t.get("term") or "").strip()
+        cid = t.get("chunk_id")
+        try:
+            cid = _coerce_int(cid)
+        except (ValueError, TypeError):
+            continue
+        if not term or len(term) < 3 or cid not in provided_chunk_ids:
+            continue
+        vq, _ = _validate_or_repair_quote(
+            t.get("quote") or "",
+            [(cid, (chunk_text_map or {}).get(cid, ""))],
+        )
+        if not vq or term.lower() not in vq.lower():
+            continue  # term must be literally named inside a verbatim passage
+        clean_terms.append({"term": term[:80], "quote": vq, "chunk_id": cid})
+
     return {
         "bullets": clean_bullets,
+        "answer_terms": clean_terms,
         "open_questions": [str(q)[:200] for q in (raw.get("open_questions") or [])[:_MAX_OPEN_QUESTIONS]],
         "leads": [str(l)[:200] for l in (raw.get("leads") or [])[:_MAX_LEADS]],
         "warnings": [str(w)[:200] for w in (raw.get("warnings") or [])[:_MAX_WARNINGS]],
@@ -436,7 +473,7 @@ def summarize_delta_chunks(
         for b in normalized["bullets"]
     ]
 
-    return EvidenceSummaryUpdate(
+    upd = EvidenceSummaryUpdate(
         update_id=update_id,
         generated_from_chunk_ids=sorted(all_chunk_ids),
         summarizer_model=model,
@@ -446,3 +483,6 @@ def summarize_delta_chunks(
         leads=normalized["leads"],
         warnings=normalized["warnings"],
     )
+    # Dynamic attr (kept off the dataclass to avoid touching persistence)
+    upd.answer_terms = normalized.get("answer_terms") or []
+    return upd
