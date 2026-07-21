@@ -99,7 +99,11 @@ def _roster_scope_anchors(plan) -> List[str]:
     out = []
     for a in (plan.get("anchors") or []):
         a = str(a).strip()
-        if len(a) < 4 or a.lower() in _FRAMING:
+        # Short ALL-CAPS acronyms (OSS, GRU, AEC) ARE distinctive scope anchors —
+        # the len<4 cut was silently dropping "OSS" from scope selection, which
+        # left NKVD as the only candidate and mis-pinned every boolean pool.
+        _acronym = len(a) >= 3 and a.isupper() and a.isalpha()
+        if (len(a) < 4 and not _acronym) or a.lower() in _FRAMING:
             continue
         # An anchor scopes the roster only if it contains a DISTINCTIVE proper noun — a
         # capitalized word that is NOT a generic espionage/category word. Check each WORD, so a
