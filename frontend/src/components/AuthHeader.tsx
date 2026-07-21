@@ -181,9 +181,16 @@ function AboutModal({ onClose }: { onClose: () => void }) {
                 vocabulary, or when the answer must be assembled from several documents.
               </p>
               <p>
-                They share the same session and the same Scope panel. A rule of thumb: <em>Search
-                finds pages; Chat answers questions.</em> Researchers often begin in Chat, then switch
-                to Search to exhaustively walk the pages behind an answer.
+                They share the same session and the same Scope panel — and they meet in the middle:
+                Chat runs the same boolean search engine you do, and every search it runs is saved
+                into your session under <strong>⚡ Chat&apos;s searches</strong> in the Search tab.
+                Open one to see exactly what Chat looked at, prune its results, or continue the
+                investigation yourself where it left off.
+              </p>
+              <p>
+                A rule of thumb: <em>Search finds pages; Chat answers questions.</em> Researchers
+                often begin in Chat, then switch to Search to exhaustively walk the pages behind
+                an answer.
               </p>
             </div>
           </details>
