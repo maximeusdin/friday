@@ -595,7 +595,6 @@ function ChatBubble({
   return (
     <div className="chat-message chat-message-assistant">
       <div className="chat-answer">
-        <CopyAnswerButton content={message.content} citationMap={citationMap} />
         {/* V9 intent badge */}
         {isV9 && intent && (
           <div style={{ marginBottom: '6px', display: 'flex', gap: '6px', alignItems: 'center' }}>
@@ -819,6 +818,11 @@ function ChatBubble({
         {!isV9 && message.v6_stats && (
           <V6StatsFooter stats={message.v6_stats} />
         )}
+
+        {/* Copy at the bottom, where you've finished reading */}
+        <div className="copy-answer-row">
+          <CopyAnswerButton content={message.content} citationMap={citationMap} />
+        </div>
       </div>
     </div>
   );
