@@ -495,6 +495,7 @@ def prime_workspace(
                 # BOTH orientations, unioned — no chooser. Rarity/order heuristics kept
                 # mis-pinning the pool (NKVD=476 is genuinely rarer than OSS=693, yet OSS
                 # is the scope); a researcher unsure which term is the scope runs both.
+                _cands = (_scope_anchors or ba)[:3]
                 syns = [x for x in (plan.get("target_synonyms") or []) if x and len(x) >= 4][:3]
                 _queries = []
                 for _prim in _cands[:2]:
