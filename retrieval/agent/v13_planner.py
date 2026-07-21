@@ -492,35 +492,34 @@ def prime_workspace(
                 def _bt(t: str) -> str:
                     return f'"{t}"' if " " in t else t
 
-                # The researcher's query shape: pin the SCOPE term, OR the alternatives.
-                # "OSS AND (NKVD OR Soviet OR agent OR espionage)" finds Halperin's
-                # "Soviet"-phrased chunks that a literal "NKVD AND OSS" misses.
-                # Primary = the RAREST candidate anchor (deterministic; planner anchor
-                # order varies run-to-run and pinning the common term — NKVD over OSS —
-                # excludes scope pages phrased without it).
-                _cands = (_scope_anchors or ba)[:3]
-                try:
-                    _counts = {a: _true_lexical_count(conn, str(a), cols) for a in _cands}
-                    _pos = {c: n for c, n in _counts.items() if n > 0}
-                    primary = min(_pos, key=_pos.get) if _pos else _cands[0]
-                except Exception:
-                    primary = _cands[0]
-                others = [a for a in ba if a != primary][:2]
-                syns = [s for s in (plan.get("target_synonyms") or []) if s and len(s) >= 4][:3]
-                or_group = list(dict.fromkeys(
-                    [*others, *syns, "Soviet", "agent", "espionage"]))[:6]
-                bq = f"{_bt(primary)} AND ({' OR '.join(_bt(t) for t in or_group)})"
-                bres = boolean_search(
-                    conn, bq, scope=scope,
-                    session_id=sess.get("session_id"),
-                    user_sub=sess.get("user_sub") or "chat-engine",
-                    origin_query=workspace.question or "",
-                    max_hits_returned=250,
-                )
-                bids = [h["chunk_id"] for h in (bres.get("hits") or []) if h.get("chunk_id")]
-                if bids:
-                    result_sets.append(bids); rare_flags.append(True)
+                # BOTH orientations, unioned — no chooser. Rarity/order heuristics kept
+                # mis-pinning the pool (NKVD=476 is genuinely rarer than OSS=693, yet OSS
+                # is the scope); a researcher unsure which term is the scope runs both.
+                syns = [x for x in (plan.get("target_synonyms") or []) if x and len(x) >= 4][:3]
+                _queries = []
+                for _prim in _cands[:2]:
+                    _others = [a for a in ba if a != _prim][:2]
+                    _og = list(dict.fromkeys(
+                        [*_others, *syns, "Soviet", "agent", "espionage"]))[:6]
+                    _queries.append(
+                        f"{_bt(_prim)} AND ({' OR '.join(_bt(t) for t in _og)})")
+                bq = _queries[0]
+                _union = []
+                for bq in _queries:
+                    bres = boolean_search(
+                        conn, bq, scope=scope,
+                        session_id=sess.get("session_id"),
+                        user_sub=sess.get("user_sub") or "chat-engine",
+                        origin_query=workspace.question or "",
+                        max_hits_returned=250,
+                    )
+                    bids = [h["chunk_id"] for h in (bres.get("hits") or [])
+                            if h.get("chunk_id")]
+                    if not bids:
+                        continue
+                    _union.extend(bids)
                     labels.append(f"bool:{bq[:40]}({bres.get('total_hits', 0)})")
+                    result_sets.append(bids); rare_flags.append(True)
                     try:
                         workspace._boolean_result_sets.append({
                             "result_set_id": bres.get("result_set_id"),
@@ -918,8 +917,16 @@ def _true_lexical_count(conn, term: str, cols) -> int:
     """Approximate corpus frequency of a term (scoped), to pick the most discriminating
     entity to sweep. Uses a scoped ILIKE count — cheap and good enough for ranking."""
     try:
-        params: List[Any] = [f"%{term}%"]
-        where = "COALESCE(c.clean_text, c.text) ILIKE %s"
+        # Word-boundary matching for short single-word terms — substring counting
+        # made "OSS" look like a 26,758-hit common word (cross/possible/loss) and
+        # inverted every rarity ranking it fed. Same fix as lex_exact.
+        import re as _re
+        if len(term) <= 4 and _re.match(r"^[A-Za-z0-9]+$", term):
+            params: List[Any] = [r"\m" + term + r"\M"]
+            where = "COALESCE(c.clean_text, c.text) ~* %s"
+        else:
+            params = [f"%{term}%"]
+            where = "COALESCE(c.clean_text, c.text) ILIKE %s"
         if cols:
             where += " AND cm.collection_slug = ANY(%s)"
             params.append(list(cols))
@@ -1271,6 +1278,40 @@ def apply_anti_false_negative(result, workspace, *, verbose: bool = False) -> No
 
 
 _ROSTER_MODEL = os.getenv("V14_ROSTER_MODEL", "gpt-4.1-mini-2025-04-14")
+
+
+def _pool_anchor_count(conn, term: str, cols, cap: int = 5000) -> int:
+    """Word-boundary corpus count for pool-primary selection. Unlike
+    _true_lexical_count (bounded at the sweep cap, so common terms tie),
+    this discriminates up to `cap` — enough to rank OSS (693) vs NKVD (1000s)."""
+    import re as _re
+    try:
+        if len(term) <= 4 and _re.match(r"^[A-Za-z0-9]+$", term):
+            pat = chr(92) + "m" + term + chr(92) + "M"
+            where = "COALESCE(c.clean_text, c.text) ~* %s"
+        else:
+            pat = f"%{term}%"
+            where = "COALESCE(c.clean_text, c.text) ILIKE %s"
+        params = [pat]
+        if cols:
+            where += " AND cm.collection_slug = ANY(%s)"
+            params.append(list(cols))
+        params.append(cap + 1)
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""SELECT count(*) FROM (
+                        SELECT 1 FROM chunks c
+                        JOIN chunk_metadata cm ON cm.chunk_id = c.id
+                        WHERE {where} LIMIT %s) t""",
+                params,
+            )
+            return int(cur.fetchone()[0])
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return cap + 1
 
 
 def _boolean_pool_chunk_ids(conn, workspace, cap: int = 500):
