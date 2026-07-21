@@ -475,7 +475,10 @@ def prime_workspace(
     # enumeration pool is exhaustive rather than top-k sampled (this is how Halperin's
     # 295 OSS chunks stop being missable). The result set persists as a session search
     # (origin='chat') the researcher can open and continue.
-    if intent in _COVERAGE_INTENTS or len(content_anchors) >= 2:
+    # Enumeration intents ONLY: on lookups the exhaustive pool quadruples latency
+    # (fuchs 361s -> 1446s in the handoff matrix) for no accuracy gain, and the
+    # widened pool can surface misleading recollections over the precise record.
+    if intent in _COVERAGE_INTENTS:
         ba = [str(a) for a in content_anchors if len(str(a)) >= 3][:4]
         if len(ba) >= 2:
             try:
