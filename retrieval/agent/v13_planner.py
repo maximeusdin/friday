@@ -476,12 +476,24 @@ def prime_workspace(
     # 295 OSS chunks stop being missable). The result set persists as a session search
     # (origin='chat') the researcher can open and continue.
     if intent in _COVERAGE_INTENTS or len(content_anchors) >= 2:
-        ba = [a for a in content_anchors if len(str(a)) >= 3][:3]
+        ba = [str(a) for a in content_anchors if len(str(a)) >= 3][:4]
         if len(ba) >= 2:
             try:
                 from retrieval.agent.v11_tools import boolean_search
                 sess = getattr(workspace, "_search_session", None) or {}
-                bq = " AND ".join(f'"{a}"' if " " in str(a) else str(a) for a in ba[:2])
+
+                def _bt(t: str) -> str:
+                    return f'"{t}"' if " " in t else t
+
+                # The researcher's query shape: pin the SCOPE term, OR the alternatives.
+                # "OSS AND (NKVD OR Soviet OR agent OR espionage)" finds Halperin's
+                # "Soviet"-phrased chunks that a literal "NKVD AND OSS" misses.
+                primary = _scope_anchors[0] if _scope_anchors else ba[0]
+                others = [a for a in ba if a != primary][:2]
+                syns = [s for s in (plan.get("target_synonyms") or []) if s and len(s) >= 4][:3]
+                or_group = list(dict.fromkeys(
+                    [*others, *syns, "Soviet", "agent", "espionage"]))[:6]
+                bq = f"{_bt(primary)} AND ({' OR '.join(_bt(t) for t in or_group)})"
                 bres = boolean_search(
                     conn, bq, scope=scope,
                     session_id=sess.get("session_id"),
