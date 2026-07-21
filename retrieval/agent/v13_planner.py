@@ -190,7 +190,13 @@ def plan_query(question: str, *, model: str = _PLANNER_MODEL, verbose: bool = Fa
     # Deterministic anchor augmentation
     det_anchors = _regex_anchors(question)
     anchors = _dedup_preserve([*(plan.get("anchors") or []), *det_anchors])
-    plan["anchors"] = [a for a in anchors if a and len(str(a).strip()) >= 2][:12]
+    # Drop framing/generic words the model leaks into anchors despite instructions
+    # ("Names", "spies", "infiltrated") — as lexical sets they are 10k+-hit noise that
+    # poisons the multi-anchor intersection.
+    plan["anchors"] = [
+        a for a in anchors
+        if a and len(str(a).strip()) >= 2 and str(a).strip().lower() not in _FRAMING
+    ][:12]
 
     # Ensure at least one keyword query exists (fallback = framing-stripped question)
     queries = [q for q in (plan.get("queries") or []) if q and str(q).strip()]
@@ -248,6 +254,12 @@ _FRAMING = {
     "and", "or", "that", "this", "these", "those", "me", "us", "all", "any", "some",
     "spied", "spy", "spying", "recruited", "recruit", "meeting", "meet", "met", "times",
     "notebooks", "notebook", "file", "files", "about", "soviet", "intelligence",
+    # Roster-question framing: category nouns and verbs that are never distinctive
+    # anchors ("Names of NKVD spies who infiltrated the OSS" must anchor on
+    # NKVD + OSS, not on names/spies/infiltrated — those are 10k+-hit generics).
+    "names", "name", "spies", "agents", "agent", "sources", "source", "members",
+    "member", "infiltrated", "infiltrate", "penetrated", "penetrate", "worked",
+    "working", "involved", "identified",
 }
 
 

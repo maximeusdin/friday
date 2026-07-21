@@ -1390,13 +1390,22 @@ def lex_exact(
 ) -> List[ChunkHit]:
     """
     Lexical "exact" (transparent): substring match on COALESCE(clean_text, text).
-    Note: this is not token-exact; it is literal substring match (optionally case-sensitive).
+    Note: this is not token-exact; it is literal substring match (optionally case-sensitive) —
+    EXCEPT for short single-word terms (<= 4 chars), which match on word boundaries:
+    a substring "OSS" hits 26k+ chunks (cross/possible/loss) vs ~700 real mentions,
+    which poisons anchor intersection and buries the actual topic.
     """
     params: Dict[str, Any] = {"k": k, "preview_chars": preview_chars}
     filters = _resolve_filters_for_search(conn, filters)
     where_sql = _build_where(filters, params)
 
-    if case_sensitive:
+    _short_word = len(term) <= 4 and re.match(r"^[A-Za-z0-9]+$", term)
+    if _short_word:
+        # \m / \M are Postgres word-boundary markers; regex-safe because the term is alphanumeric
+        params["pat"] = r"\m" + term + r"\M"
+        match_sql = ("COALESCE(c.clean_text, c.text) ~ %(pat)s" if case_sensitive
+                     else "COALESCE(c.clean_text, c.text) ~* %(pat)s")
+    elif case_sensitive:
         # LIKE is case-sensitive depending on collation; safest: use POSITION on raw string
         # We do a simple POSITION on the display text.
         params["term"] = term
