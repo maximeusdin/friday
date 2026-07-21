@@ -205,19 +205,50 @@ html, body {
   color: var(--color-accent, #1a73e8);
 }
 
-.header-about-btn {
-  background: none;
-  border: none;
-  padding: 4px 8px;
-  font-size: 13px;
-  color: var(--color-text-muted);
-  cursor: pointer;
-  border-radius: var(--radius-sm);
+/* Prominent header info buttons: About / How to Use / Chat vs Search */
+.header-info-nav {
+  display: flex;
+  gap: 8px;
+  margin-left: 20px;
+  flex: 1;
 }
 
-.header-about-btn:hover {
-  color: var(--color-text);
-  background: var(--color-bg-subtle, rgba(0, 0, 0, 0.04));
+.header-info-btn {
+  background: var(--color-bg);
+  border: 1.5px solid var(--color-accent, #1a73e8);
+  border-radius: 6px;
+  padding: 5px 14px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--color-accent, #1a73e8);
+  cursor: pointer;
+}
+
+.header-info-btn:hover {
+  background: var(--color-accent, #1a73e8);
+  color: #fff;
+}
+
+.splash-info-row {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.splash-info-btn {
+  background: var(--color-bg);
+  border: 1.5px solid var(--color-accent, #1a73e8);
+  border-radius: 8px;
+  padding: 12px 22px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--color-accent, #1a73e8);
+  cursor: pointer;
+}
+
+.splash-info-btn:hover {
+  background: var(--color-accent, #1a73e8);
+  color: #fff;
 }
 
 .about-overlay {

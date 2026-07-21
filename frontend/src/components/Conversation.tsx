@@ -12,6 +12,7 @@ import type {
 import { scopeFingerprint } from '@/lib/scope';
 import { ClarificationCard } from './ClarificationCard';
 import { ConcordanceCard } from './ConcordanceIndex';
+import { InfoModal, INFO_SECTIONS, type InfoSection } from './InfoModal';
 
 const PROGRESS_PHRASES = [
   'Searching archives...',
@@ -147,6 +148,7 @@ export function Conversation({
 
   // Toast state for scope actions
   const [toastMessage, setToastMessage] = useState<string | null>(null);
+  const [splashInfo, setSplashInfo] = useState<InfoSection | null>(null);
   useEffect(() => {
     if (toastMessage) {
       const timer = setTimeout(() => setToastMessage(null), 3000);
@@ -274,7 +276,24 @@ export function Conversation({
           </div>
         </div>
 
+        <div className="splash-section">
+          <h3 className="splash-section-title">Learn more</h3>
+          <div className="splash-info-row">
+            {INFO_SECTIONS.map((s) => (
+              <button
+                key={s.key}
+                type="button"
+                className="splash-info-btn"
+                onClick={() => setSplashInfo(s.key)}
+              >
+                {s.label}
+              </button>
+            ))}
+          </div>
+        </div>
+
         <ConcordanceCard />
+        {splashInfo && <InfoModal section={splashInfo} onClose={() => setSplashInfo(null)} />}
       </div>
     );
   }
