@@ -493,3 +493,233 @@ def boolean_search(
             pass
         return {"error": str(e)[:300], "total_hits": 0, "hits": [],
                 "result_set_id": result_set_id}
+
+
+# =============================================================================
+# Pool mining — the exhaustive reader. Boolean pools bound WHAT to read;
+# this reads ALL of it: temperature-0 map over fixed batches, each extraction
+# carrying a verbatim quote validated against its chunk (never fabricated),
+# then a deterministic reduce (concordance canonicalization, OCR fuzzy-merge,
+# frequency ranking, mechanical citation attribution).
+# =============================================================================
+
+_MINE_SCHEMA = {
+    "name": "pool_extraction",
+    "strict": True,
+    "schema": {
+        "type": "object",
+        "properties": {
+            "findings": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "subject": {"type": "string"},
+                        "role": {"type": "string"},
+                        "date": {"type": "string"},
+                        "quote": {"type": "string"},
+                        "chunk_id": {"type": "integer"},
+                    },
+                    "required": ["subject", "role", "date", "quote", "chunk_id"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        "required": ["findings"],
+        "additionalProperties": False,
+    },
+}
+
+
+def _mine_norm_name(s: str) -> str:
+    import re as _re
+    return _re.sub(r"[^a-z0-9 ]", "", (s or "").lower()).strip()
+
+
+def mine_pool(
+    conn,
+    chunk_ids: List[int],
+    extraction_spec: str,
+    question: str,
+    *,
+    max_chunks: int = 150,
+    batch_size: int = 15,
+    model: str = "gpt-4.1-mini-2025-04-14",
+    max_workers: int = 4,
+    verbose: bool = False,
+) -> Dict[str, Any]:
+    """Read EVERY chunk in the pool (up to max_chunks, semantically ordered when
+    over) with a narrow extraction question; merge results deterministically.
+
+    Returns {"entries": [...], "mined": n, "total_pool": N, "cutoff": bool}.
+    Each entry: {canonical, surface_forms, count, roles, citations:[{chunk_id,
+    quote, date}]} ranked by pool frequency. Quotes are validated verbatim
+    against their chunk text — an extraction whose quote can't be located is
+    dropped, so mining can miss but cannot fabricate.
+    """
+    import json as _json
+    import sys as _sys
+    from concurrent.futures import ThreadPoolExecutor
+    from retrieval.agent.v9_summarize import _validate_or_repair_quote
+
+    pool = list(dict.fromkeys(int(c) for c in (chunk_ids or []) if c))
+    total_pool = len(pool)
+    if not pool:
+        return {"entries": [], "mined": 0, "total_pool": 0, "cutoff": False}
+
+    cutoff = total_pool > max_chunks
+    if cutoff:
+        # Semantic ordering for the cutoff: keep the most question-relevant slice,
+        # and SAY so in the output rather than being silently approximate.
+        try:
+            from retrieval.ops import embed_query
+            qvec = embed_query(question)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT id FROM chunks
+                    WHERE id = ANY(%s) AND embedding IS NOT NULL
+                    ORDER BY embedding <=> %s::vector
+                    LIMIT %s
+                    """,
+                    (pool, str(qvec), max_chunks),
+                )
+                ordered = [r[0] for r in cur.fetchall()]
+            seen = set(ordered)
+            missing = [c for c in pool if c not in seen][: max_chunks - len(ordered)]
+            pool = (ordered + missing)[:max_chunks]
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            pool = pool[:max_chunks]
+
+    # Load texts once
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT id, COALESCE(clean_text, text) FROM chunks WHERE id = ANY(%s)",
+            (pool,),
+        )
+        texts = {r[0]: (r[1] or "") for r in cur.fetchall()}
+    pool = [c for c in pool if texts.get(c)]
+
+    batches = [pool[i:i + batch_size] for i in range(0, len(pool), batch_size)]
+
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return {"entries": [], "mined": 0, "total_pool": total_pool, "cutoff": cutoff,
+                "error": "OPENAI_API_KEY missing"}
+    from openai import OpenAI
+    client = OpenAI(api_key=api_key)
+
+    def _run_batch(batch: List[int]) -> List[Dict[str, Any]]:
+        parts = [
+            f"Research question: {question}\n\nEXTRACTION TASK: {extraction_spec}\n"
+            "Rules: quote must be COPIED VERBATIM from the chunk (including OCR "
+            "errors); chunk_id must be the chunk the quote came from; date is '' "
+            "unless the quote contains one; role is a 2-6 word characterization. "
+            "Extract from EVERY chunk that has relevant content; return an empty "
+            "list only if none do.\n"
+        ]
+        for cid in batch:
+            parts.append(f"\n[chunk_id={cid}]\n{texts[cid][:2600]}")
+        try:
+            resp = client.chat.completions.create(
+                model=model,
+                temperature=0.0,
+                max_completion_tokens=1800,
+                response_format={"type": "json_schema", "json_schema": _MINE_SCHEMA},
+                messages=[{"role": "user", "content": "".join(parts)}],
+            )
+            raw = _json.loads(resp.choices[0].message.content or "{}")
+            out = []
+            batch_set = set(batch)
+            for f in (raw.get("findings") or []):
+                cid = f.get("chunk_id")
+                if cid not in batch_set or not (f.get("subject") or "").strip():
+                    continue
+                vq, _vcid = _validate_or_repair_quote(
+                    f.get("quote") or "", [(cid, texts.get(cid, ""))])
+                if not vq:
+                    continue  # quote not locatable in chunk -> drop (anti-fabrication)
+                out.append({"subject": f["subject"].strip()[:120],
+                            "role": (f.get("role") or "").strip()[:80],
+                            "date": (f.get("date") or "").strip()[:40],
+                            "quote": vq, "chunk_id": cid})
+            return out
+        except Exception as e:
+            if verbose:
+                print(f"  [mine_pool] batch error: {str(e)[:120]}", file=_sys.stderr)
+            return []
+
+    findings: List[Dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        for res in ex.map(_run_batch, batches):
+            findings.extend(res)
+
+    # --- Reduce: canonicalize via concordance, fuzzy-merge OCR variants, rank ---
+    surfaces = list({f["subject"] for f in findings})
+    canon: Dict[str, str] = {}
+    if surfaces:
+        try:
+            norm_surfaces = list({_mine_norm_name(s) for s in surfaces if _mine_norm_name(s)})
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT lower(regexp_replace(a.alias, '[^A-Za-z0-9 ]', '', 'g')),
+                           e.canonical_name
+                    FROM entity_aliases a JOIN entities e ON e.id = a.entity_id
+                    WHERE lower(regexp_replace(a.alias, '[^A-Za-z0-9 ]', '', 'g')) = ANY(%s)
+                    """,
+                    (norm_surfaces,),
+                )
+                alias_map = {r[0]: r[1] for r in cur.fetchall()}
+            for s in surfaces:
+                canon[s] = alias_map.get(_mine_norm_name(s), s)
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            canon = {s: s for s in surfaces}
+
+    # Fuzzy-merge canonical keys that are OCR-variants of each other
+    from difflib import SequenceMatcher
+    keys = sorted({canon[s] for s in surfaces}, key=lambda k: -sum(
+        1 for f in findings if canon[f["subject"]] == k))
+    merged: Dict[str, str] = {}
+    for k in keys:
+        nk = _mine_norm_name(k)
+        nk_toks = set(nk.split())
+        target = k
+        for kept in set(merged.values()):
+            kt = _mine_norm_name(kept)
+            kt_toks = set(kt.split())
+            # OCR-variant similarity OR name-subset ("Duncan Lee" <= "Duncan Chaplin Lee")
+            if (SequenceMatcher(None, nk, kt).ratio() >= 0.86
+                    or (len(nk_toks) >= 2 and (nk_toks <= kt_toks or kt_toks <= nk_toks))):
+                target = kept
+                break
+        merged[k] = target
+
+    entries: Dict[str, Dict[str, Any]] = {}
+    for f in findings:
+        base = canon.get(f["subject"], f["subject"])
+        key = merged.get(base, base)
+        e = entries.setdefault(key, {"canonical": key, "surface_forms": set(),
+                                     "roles": [], "citations": [], "count": 0})
+        e["surface_forms"].add(f["subject"])
+        if f["role"] and f["role"] not in e["roles"]:
+            e["roles"].append(f["role"])
+        e["citations"].append({"chunk_id": f["chunk_id"], "quote": f["quote"][:350],
+                               "date": f["date"]})
+        e["count"] += 1
+    out_entries = sorted(entries.values(), key=lambda e: -e["count"])
+    for e in out_entries:
+        e["surface_forms"] = sorted(e["surface_forms"])
+        e["roles"] = e["roles"][:4]
+        e["citations"] = e["citations"][:6]
+
+    return {"entries": out_entries, "mined": len(pool), "total_pool": total_pool,
+            "cutoff": cutoff, "batches": len(batches)}

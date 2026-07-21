@@ -1260,6 +1260,31 @@ def apply_anti_false_negative(result, workspace, *, verbose: bool = False) -> No
 _ROSTER_MODEL = os.getenv("V14_ROSTER_MODEL", "gpt-4.1-mini-2025-04-14")
 
 
+def _boolean_pool_chunk_ids(conn, workspace, cap: int = 500):
+    """Chunk ids of the primed boolean pool(s) for this run (roster mining input)."""
+    sets = getattr(workspace, "_boolean_result_sets", None) or []
+    ids = []
+    for s in sets:
+        rsid = s.get("result_set_id")
+        if not rsid:
+            continue
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT chunk_id FROM search_result_page_hits WHERE result_set_id = %s "
+                    "ORDER BY collection_id, document_id, page_seq LIMIT %s",
+                    (rsid, cap),
+                )
+                ids.extend(r[0] for r in cur.fetchall())
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+    return list(dict.fromkeys(ids))[:cap]
+
+
+
 def assemble_roster(conn, workspace, target: str, *, question: str = "", plan=None,
                     verbose: bool = False):
     """Enumerate distinct target-people (e.g. journalists) from the corpus-wide FETCHED
@@ -1424,6 +1449,70 @@ def assemble_roster(conn, workspace, target: str, *, question: str = "", plan=No
                 if any(n.lower() in txt for n in needles):
                     if c.chunk_id not in e["cids"]:
                         e["cids"].append(c.chunk_id)
+
+    # Pool mining: exhaustive roster read over the primed boolean pool — membership
+    # becomes structural (every pool page read once) instead of fetch-sampled, which
+    # is what made Halperin (295 matching pages) missable. FRIDAY_POOL_MINING=0 off.
+    if os.getenv("FRIDAY_POOL_MINING", "1") == "1":
+        try:
+            _pool_ids = _boolean_pool_chunk_ids(conn, workspace)
+            if _pool_ids:
+                from retrieval.agent.v11_tools import mine_pool
+                _spec = (role_rule[:1500]
+                         + " Report each person's name EXACTLY as written in the passage.")
+                _mres = mine_pool(conn, _pool_ids, _spec,
+                                  question or workspace.question, verbose=verbose)
+                for _me in _mres.get("entries", []):
+                    _nm = (_me.get("canonical") or "").strip()
+                    if len(_nm) < 3:
+                        continue
+                    _key = _nm.lower()
+                    _e = entries.setdefault(_key, {"name": _nm, "code": "",
+                                                   "role": "", "cids": []})
+                    if not _e["role"] and _me.get("roles"):
+                        _e["role"] = _me["roles"][0]
+                    for _c in _me.get("citations", []):
+                        if _c["chunk_id"] not in _e["cids"]:
+                            _e["cids"].append(_c["chunk_id"])
+                if verbose:
+                    print(f"  [V14] pool-mine merged: {len(_mres.get('entries', []))} candidates "
+                          f"from {_mres.get('mined')}/{_mres.get('total_pool')} pool chunks "
+                          f"(cutoff={_mres.get('cutoff')})", file=sys.stderr)
+        except Exception as _me_err:
+            if verbose:
+                print(f"  [V14] pool mining failed: {_me_err}", file=sys.stderr)
+
+    # Fuzzy-dedup entry keys (mined canonical "Duncan Chaplin Lee" vs fetched
+    # "Duncan Lee") — merge citations into the richer-cited survivor.
+    try:
+        from difflib import SequenceMatcher
+        _keys = sorted(entries.keys(), key=lambda k: -len(entries[k]["cids"]))
+        _alias_of = {}
+        for _k in _keys:
+            _ktoks = set(_k.split())
+            for _kept in list(_alias_of.values()):
+                if _k == _kept:
+                    continue
+                _ptoks = set(_kept.split())
+                if (SequenceMatcher(None, _k, _kept).ratio() >= 0.82
+                        or (len(_ktoks) >= 2 and (_ktoks <= _ptoks or _ptoks <= _ktoks))):
+                    _alias_of[_k] = _kept
+                    break
+            else:
+                _alias_of[_k] = _k
+        _merged_entries = {}
+        for _k, _tgt in _alias_of.items():
+            _src = entries[_k]
+            _dst = _merged_entries.setdefault(_tgt, {"name": "", "code": "", "role": "", "cids": []})
+            for _f in ("name", "code", "role"):
+                if _src.get(_f) and not _dst.get(_f):
+                    _dst[_f] = _src[_f]
+            for _cid in _src["cids"]:
+                if _cid not in _dst["cids"]:
+                    _dst["cids"].append(_cid)
+        entries = _merged_entries
+    except Exception:
+        pass
 
     out = []
     for e in entries.values():
