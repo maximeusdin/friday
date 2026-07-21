@@ -669,6 +669,77 @@ _QUOTE_PAGE_STOPWORDS = frozenset(
 )
 
 
+def _run_insufficiency_mine(conn, workspace, plan, question: str, *, verbose: bool = False) -> str:
+    """Pool-walk escalation for a rejected give-up: boolean pool from the question's
+    entities AND record vocabulary, mined exhaustively; extracted facts (verbatim,
+    validated quotes) are fetched into the workspace and summarized into the pushback
+    message so the resynthesis can cite them."""
+    import re as _re
+    from retrieval.agent.v11_tools import boolean_search, mine_pool
+
+    plan = plan or {}
+    ents = [str(e).strip() for e in (plan.get("entities") or []) if str(e).strip()]
+    if not ents:
+        return ""
+    # Primary term: most discriminating token of the first entity
+    ptoks = [t for t in _re.split(r"[,\s]+", ents[0]) if len(t) >= 3]
+    primary = max(ptoks, key=len, default=ents[0])
+    # OR-group: distinctive non-entity tokens from the records rewrite + anchors,
+    # falling back to generic record vocabulary
+    vocab = []
+    for q in (plan.get("records_queries") or []):
+        for t in _re.split(r"\s+", str(q)):
+            tl = t.strip().lower()
+            if len(tl) >= 5 and tl not in {x.lower() for x in ptoks} and tl not in vocab:
+                vocab.append(tl)
+    for a in (plan.get("anchors") or []):
+        al = str(a).strip().lower()
+        if len(al) >= 5 and al != primary.lower() and al not in vocab:
+            vocab.append(al)
+    if not vocab:
+        vocab = ["statement", "report", "memorandum", "letter", "interview"]
+    or_group = vocab[:6]
+    bq = f"{primary} AND ({' OR '.join(or_group)})"
+
+    sess = getattr(workspace, "_search_session", None) or {}
+    bres = boolean_search(conn, bq, scope=workspace.scope,
+                          session_id=sess.get("session_id"),
+                          user_sub=sess.get("user_sub") or "chat-engine",
+                          origin_query=question, max_hits_returned=150)
+    pool = [h["chunk_id"] for h in (bres.get("hits") or [])]
+    if not pool:
+        return ""
+    if verbose:
+        print(f"  [V14] insufficiency mine: pool '{bq}' -> {bres.get('total_hits')} hits, "
+              f"mining {len(pool)}", file=sys.stderr)
+    spec = (f"Every explicit statement relevant to answering: {question}. Extract the "
+            f"verbatim sentence, any date it contains, and note in role whether it is a "
+            f"first-hand record, a report, or a recollection.")
+    mres = mine_pool(conn, pool, spec, question, max_chunks=120, verbose=verbose)
+    entries = mres.get("entries") or []
+    if not entries:
+        return ""
+
+    # Fetch the top-cited chunks into the workspace so citations ground-check downstream
+    top_cids = list(dict.fromkeys(
+        c["chunk_id"] for e in entries[:8] for c in e["citations"]))[:10]
+    try:
+        fetched = fetch_chunks(conn, chunk_ids=top_cids)
+        merge_fetched_chunks(workspace, fetched)
+    except Exception:
+        pass
+
+    lines = [f"POOL MINE RESULTS — exhaustive read of {mres.get('mined')} pages matching "
+             f"[{bq}] (explicit records outrank recollections; cite the chunk_ids):"]
+    for e in entries[:8]:
+        for c in e["citations"][:2]:
+            d = f" (date: {c['date']})" if c.get("date") else ""
+            q_txt = (c.get("quote") or "")[:260]
+            lines.append(f'- [chunk {c["chunk_id"]}]{d} "{q_txt}"')
+    lines.append("Use these VERBATIM findings to answer with citations now.")
+    return "\n".join(lines)
+
+
 def _lookup_quote_page(conn, chunk_id: int, quote: str) -> Optional[int]:
     """Find which of a chunk's PDF pages contains the quote, by matching the quote
     against each page's raw_text (chunk_pages char offsets are unpopulated, so text
@@ -1383,14 +1454,28 @@ def run_v11_query(
             # it" final with unused budget gets sent back to search, not shipped.
             if finalize_retries < 2:
                 finalize_retries += 1
-                messages.append({
-                    "role": "user",
-                    "content": (
-                        "Your finalization was rejected: " + " | ".join(issues[:3]) +
-                        " Address these now — continue investigating with tools if needed, "
-                        "then finalize."
-                    ),
-                })
+                pushback = (
+                    "Your finalization was rejected: " + " | ".join(issues[:3]) +
+                    " Address these now — continue investigating with tools if needed, "
+                    "then finalize."
+                )
+                # Insufficiency mine: a rejected "couldn't find it" with budget left
+                # gets a POOL WALK, not just exhortation — a boolean pool from the
+                # question's entities x record vocabulary, every page read.
+                # FRIDAY_INSUFFICIENCY_MINE=0 disables.
+                if (finalize_retries == 1
+                        and os.getenv("FRIDAY_INSUFFICIENCY_MINE", "1") == "1"
+                        and any("do not give up" in i for i in issues)):
+                    try:
+                        mine_msg = _run_insufficiency_mine(
+                            conn, workspace, _v13_plan, clean_question, verbose=verbose)
+                        if mine_msg:
+                            pushback += chr(10) + chr(10) + mine_msg
+                    except Exception as _im_err:
+                        if verbose:
+                            print(f"  [V14] insufficiency mine failed: {_im_err}",
+                                  file=sys.stderr)
+                messages.append({"role": "user", "content": pushback})
                 synthesis = None
                 prev_counts = _snapshot_counts(workspace)
                 continue
