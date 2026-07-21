@@ -1014,6 +1014,17 @@ def run_v11_query(
                 verbose=verbose, progress_callback=progress_callback,
                 coverage=_v14,
             )
+            # Enumeration questions: steer the agent to the deterministic boolean
+            # engine (the researcher's instrument) instead of leaving tool choice
+            # to habit — semantic sampling misses roster members that whole-word
+            # boolean intersection cannot.
+            if (_v13_plan.get("intent") or "").lower() in ("roster", "count"):
+                append_note(workspace,
+                    "Enumeration question: use boolean_search (AND/OR/NOT, whole-word, "
+                    "exhaustive page hits with per-collection counts) to expand and verify "
+                    "the roster — e.g. probe the group/agency name, read total_hits, narrow "
+                    "with AND until <=120, then walk ALL hits. Do not rely on semantic "
+                    "top-k sampling alone for membership lists.")
         except Exception as _pe:
             if verbose:
                 print(f"  [V13] priming failed (continuing as V11): {_pe}", file=sys.stderr)

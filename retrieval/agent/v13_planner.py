@@ -469,6 +469,44 @@ def prime_workspace(
             result_sets.append(inter); rare_flags.append(True)
             labels.append(f"intersect:{len(inter)}")
 
+    # Boolean-engine intersection (deterministic, the researcher's move): for roster/count
+    # questions with >=2 content anchors, run the Search tab's boolean engine on
+    # "a1 AND a2" — word-boundary matching + alias expansion over EVERY page, so the
+    # enumeration pool is exhaustive rather than top-k sampled (this is how Halperin's
+    # 295 OSS chunks stop being missable). The result set persists as a session search
+    # (origin='chat') the researcher can open and continue.
+    if intent in _COVERAGE_INTENTS or len(content_anchors) >= 2:
+        ba = [a for a in content_anchors if len(str(a)) >= 3][:3]
+        if len(ba) >= 2:
+            try:
+                from retrieval.agent.v11_tools import boolean_search
+                sess = getattr(workspace, "_search_session", None) or {}
+                bq = " AND ".join(f'"{a}"' if " " in str(a) else str(a) for a in ba[:2])
+                bres = boolean_search(
+                    conn, bq, scope=scope,
+                    session_id=sess.get("session_id"),
+                    user_sub=sess.get("user_sub") or "chat-engine",
+                    origin_query=workspace.question or "",
+                    max_hits_returned=250,
+                )
+                bids = [h["chunk_id"] for h in (bres.get("hits") or []) if h.get("chunk_id")]
+                if bids:
+                    result_sets.append(bids); rare_flags.append(True)
+                    labels.append(f"bool:{bq[:40]}({bres.get('total_hits', 0)})")
+                    try:
+                        workspace._boolean_result_sets.append({
+                            "result_set_id": bres.get("result_set_id"),
+                            "query": bq, "total_hits": bres.get("total_hits", 0),
+                        })
+                    except AttributeError:
+                        workspace._boolean_result_sets = [{
+                            "result_set_id": bres.get("result_set_id"),
+                            "query": bq, "total_hits": bres.get("total_hits", 0),
+                        }]
+            except Exception as _be:
+                if verbose:
+                    print(f"  [V14] boolean priming failed: {_be}", file=sys.stderr)
+
     # Entity sweep: for a user-named entity that isn't too common, keep ALL its exact hits
     # for fetching — the target passage is sometimes the lowest-ranked hit of that entity
     # (e.g. the Bentley/Waldo deposition is the last of ~40 'Waldo' hits).
