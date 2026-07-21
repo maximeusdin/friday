@@ -1210,8 +1210,11 @@ function RichAnswerText({
     if (!onEvidenceClick || !detail.document_id) return;
     onEvidenceClick({
       document_id: detail.document_id,
-      pdf_page: detail.page || 1,
+      // Open the quote's exact page when known (mined citations on multi-page chunks)
+      pdf_page: detail.quote_page ?? detail.page ?? 1,
       chunk_id: detail.chunk_id,
+      quote: detail.quote,
+      quote_page: detail.quote_page ?? undefined,
     });
   };
 

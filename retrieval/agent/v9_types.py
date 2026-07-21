@@ -977,11 +977,21 @@ class V9Result:
                     m = _re.search(r'(\d+)', c.page)
                     if m:
                         page_num = int(m.group(1))
-                detail_map[label] = {
+                entry = {
                     "chunk_id": c.chunk_id,
                     "document_id": c.doc_id,
                     "page": page_num,
                 }
+                # Mined roster citations carry a verbatim, chunk-validated quote —
+                # attach it (+ its exact page) so clicking the chip highlights the
+                # passage instead of just opening the page.
+                mq = getattr(self.workspace, "_mined_quotes", None) or {}
+                info = mq.get(c.chunk_id)
+                if info and info.get("quote"):
+                    entry["quote"] = info["quote"]
+                    if info.get("quote_page"):
+                        entry["quote_page"] = info["quote_page"]
+                detail_map[label] = entry
         return detail_map
 
     def _format_chunk_citations(

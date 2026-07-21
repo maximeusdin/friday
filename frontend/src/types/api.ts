@@ -288,6 +288,10 @@ export interface CitationDetail {
   page?: number;
   /** Human-readable label (e.g. "Vassiliev p4") when citation is keyed by chunk id */
   label?: string;
+  /** Verbatim supporting passage (mined citations) — enables on-page highlighting. */
+  quote?: string;
+  /** Exact PDF page the quote sits on (multi-page chunks). */
+  quote_page?: number;
 }
 
 /**

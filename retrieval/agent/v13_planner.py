@@ -1529,6 +1529,40 @@ def assemble_roster(conn, workspace, target: str, *, question: str = "", plan=No
                     for _c in _me.get("citations", []):
                         if _c["chunk_id"] not in _e["cids"]:
                             _e["cids"].append(_c["chunk_id"])
+                # Make mined citations first-class: record verbatim quotes (+ exact
+                # page) and FETCH the cited chunks into the workspace, so citation
+                # labels resolve to chips and clicks highlight the quote on the page.
+                try:
+                    from retrieval.agent.v11_runner import _lookup_quote_page
+                    from retrieval.agent.v11_tools import fetch_chunks as _fc
+                    from retrieval.agent.v9_workspace import merge_fetched_chunks as _mfc
+                    _mq = getattr(workspace, "_mined_quotes", None)
+                    if _mq is None:
+                        _mq = {}
+                        workspace._mined_quotes = _mq
+                    _fetch_cids = []
+                    for _me in _mres.get("entries", []):
+                        for _c in _me.get("citations", [])[:3]:
+                            _cid = _c.get("chunk_id")
+                            _q = (_c.get("quote") or "").strip()
+                            if not _cid or not _q:
+                                continue
+                            if _cid not in _mq:
+                                _qp = _lookup_quote_page(conn, _cid, _q)
+                                _mq[_cid] = {"quote": _q[:350], "quote_page": _qp}
+                            if _cid not in _fetch_cids:
+                                _fetch_cids.append(_cid)
+                    _have = set(workspace.fulltext_chunk_ids())
+                    _need = [c for c in _fetch_cids if c not in _have][:30]
+                    if _need:
+                        _mfc(workspace, _fc(conn, chunk_ids=_need, include_neighbors=False))
+                        if verbose:
+                            print(f"  [V14] fetched {len(_need)} mined-cited chunks into "
+                                  f"workspace (citation chips + highlights)", file=sys.stderr)
+                except Exception as _mq_err:
+                    if verbose:
+                        print(f"  [V14] mined-citation enrich failed: {_mq_err}",
+                              file=sys.stderr)
                 if verbose:
                     print(f"  [V14] pool-mine merged: {len(_mres.get('entries', []))} candidates "
                           f"from {_mres.get('mined')}/{_mres.get('total_pool')} pool chunks "
