@@ -54,40 +54,28 @@ function locate(nodes: TextNodeEntry[], offset: number): { node: Text; off: numb
 // Evidence-quote matching (semantic-search support quotes → text-layer ranges)
 // ---------------------------------------------------------------------------
 
-/** Normalize text for OCR-tolerant matching while keeping a map back to the
- * original string indices, so matched spans can become DOM Ranges. */
-function normalizeWithMap(src: string): { norm: string; map: number[] } {
+/** Normalize text for matching while keeping a map back to the original string
+ * indices, so matched spans can become DOM Ranges.
+ *
+ * ALL whitespace is dropped (not collapsed): the PDF.js text layer glues words
+ * together at line breaks (no space/newline between line-end and line-start
+ * items), while quotes come from OCR text with real line breaks. Any quote
+ * spanning >1 line can therefore never match space-normalized text — matching
+ * must be space-insensitive. */
+function normalizeSpaceFree(src: string): { norm: string; map: number[] } {
   let norm = '';
   const map: number[] = [];
-  let lastWasSpace = true; // leading whitespace is dropped
   for (let i = 0; i < src.length; i++) {
     let ch = src[i];
     if (ch === '­') continue; // soft hyphen
+    if (/\s/.test(ch)) continue;
     if (/[‘’‚′']/.test(ch)) ch = "'";
     else if (/[“”„″"]/.test(ch)) ch = '"';
     else if (/[–—−-]/.test(ch)) ch = '-';
-    if (/\s/.test(ch)) {
-      if (lastWasSpace) continue;
-      norm += ' ';
-      map.push(i);
-      lastWasSpace = true;
-      continue;
-    }
     norm += ch.toLowerCase();
     map.push(i);
-    lastWasSpace = false;
-  }
-  // trim trailing space
-  if (norm.endsWith(' ')) {
-    norm = norm.slice(0, -1);
-    map.pop();
   }
   return { norm, map };
-}
-
-/** Plain normalization (no index map) for the quote side. */
-function normalizePlain(src: string): string {
-  return normalizeWithMap(src).norm;
 }
 
 interface QuoteMatch {
@@ -96,64 +84,67 @@ interface QuoteMatch {
   tier: 'exact' | 'fuzzy';
 }
 
+// Calibrated against sampled corpus pages: correct fuzzy windows score >= 0.66,
+// wrong windows <= 0.53. 0.65 accepts the former and rejects the latter.
+const FUZZY_TRIGRAM_THRESHOLD = 0.65;
+const MIN_FUZZY_QUOTE_CHARS = 20; // space-free chars; shorter quotes are exact-only
+
 /**
- * Locate a (possibly OCR-divergent) verbatim quote inside a page's text.
- * Tier 1: normalized exact substring.
- * Tier 2: fuzzy token window — best window of ~quote length by token-overlap
- *         score, accepted only above a strict threshold so we never paint a
- *         wrong highlight.
+ * Locate a (possibly OCR-divergent) verbatim quote inside a page's text layer.
+ * Tier 1: space-free normalized exact substring (immune to PDF.js line-break
+ *         gluing and whitespace differences between OCR sources).
+ * Tier 2: character-trigram rolling window over the space-free text — robust to
+ *         a different OCR engine's character errors, and hard to fool with
+ *         common-word soup (trigrams encode local ordering). Accepted only
+ *         above a strict threshold so we never paint a wrong highlight.
  */
 function matchQuoteInText(pageText: string, quote: string): QuoteMatch | null {
-  const { norm, map } = normalizeWithMap(pageText);
-  const q = normalizePlain(quote);
-  if (!q || q.length < 8 || !norm) return null;
+  const { norm: pn, map } = normalizeSpaceFree(pageText);
+  // Search snippets arrive wrapped in '...'/'…' truncation markers — strip them so
+  // the core text can exact-match the page.
+  const coreQuote = quote.trim().replace(/^[.…\s]+/, '').replace(/[.…\s]+$/, '');
+  const { norm: qn } = normalizeSpaceFree(coreQuote);
+  if (qn.length < 12 || !pn) return null;
 
-  // Tier 1 — exact (normalized)
-  const idx = norm.indexOf(q);
+  // Tier 1 — exact (space-free normalized)
+  const idx = pn.indexOf(qn);
   if (idx !== -1) {
-    return { start: map[idx], end: map[idx + q.length - 1] + 1, tier: 'exact' };
+    return { start: map[idx], end: map[idx + qn.length - 1] + 1, tier: 'exact' };
   }
 
-  // Tier 2 — token window. Tokenize with offsets into `norm`.
-  const tokens: { t: string; s: number; e: number }[] = [];
-  const re = /[^ ]+/g;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(norm)) !== null) tokens.push({ t: m[0], s: m.index, e: m.index + m[0].length });
-  const qTokens = q.split(' ').filter(Boolean);
-  if (qTokens.length < 3 || tokens.length < 3) return null;
-
-  const qFreq = new Map<string, number>();
-  for (const t of qTokens) qFreq.set(t, (qFreq.get(t) ?? 0) + 1);
-
-  let best: { score: number; s: number; e: number } | null = null;
-  const win = qTokens.length;
-  const widths = [win, Math.max(3, Math.round(win * 0.8)), Math.round(win * 1.2)];
-  for (const w of widths) {
-    if (w > tokens.length) continue;
-    // rolling multiset-overlap over windows of width w
-    const freq = new Map<string, number>();
-    let overlap = 0;
-    for (let i = 0; i < tokens.length; i++) {
-      const t = tokens[i].t;
-      const c = (freq.get(t) ?? 0) + 1;
-      freq.set(t, c);
-      if (c <= (qFreq.get(t) ?? 0)) overlap++;
-      if (i >= w) {
-        const old = tokens[i - w].t;
-        const oc = freq.get(old)!;
-        if (oc <= (qFreq.get(old) ?? 0)) overlap--;
-        freq.set(old, oc - 1);
-      }
-      if (i >= w - 1) {
-        const score = overlap / Math.max(w, qTokens.length);
-        if (!best || score > best.score) {
-          best = { score, s: tokens[i - w + 1].s, e: tokens[i].e };
-        }
-      }
+  // Tier 2 — trigram rolling window of the quote's length
+  if (qn.length < MIN_FUZZY_QUOTE_CHARS || pn.length < qn.length) return null;
+  const qt = new Map<string, number>();
+  for (let i = 0; i + 3 <= qn.length; i++) {
+    const t = qn.slice(i, i + 3);
+    qt.set(t, (qt.get(t) ?? 0) + 1);
+  }
+  const total = qn.length - 2; // trigram count in the quote
+  const w = qn.length;         // window width in chars
+  const freq = new Map<string, number>();
+  let overlap = 0;
+  let best = { score: -1, s: 0 };
+  for (let i = 0; i + 3 <= pn.length; i++) {
+    const t = pn.slice(i, i + 3);
+    const c = (freq.get(t) ?? 0) + 1;
+    freq.set(t, c);
+    if (c <= (qt.get(t) ?? 0)) overlap++;
+    const j = i - (w - 2); // trigram start leaving the window
+    if (j >= 0) {
+      const old = pn.slice(j, j + 3);
+      const oc = freq.get(old)!;
+      if (oc <= (qt.get(old) ?? 0)) overlap--;
+      freq.set(old, oc - 1);
+    }
+    if (i >= w - 3) {
+      const score = overlap / total;
+      if (score > best.score) best = { score, s: i - w + 3 };
     }
   }
-  if (best && best.score >= 0.6) {
-    return { start: map[best.s], end: map[best.e - 1] + 1, tier: 'fuzzy' };
+  if (best.score >= FUZZY_TRIGRAM_THRESHOLD) {
+    const s = best.s;
+    const e = Math.min(s + w, pn.length);
+    return { start: map[s], end: map[e - 1] + 1, tier: 'fuzzy' };
   }
   return null;
 }
@@ -444,6 +435,34 @@ export function EvidenceViewer({ evidence, onClose, backLabel = 'Back to Chat' }
   }
 
   const pdfUrl = `${resolvedBaseUrl}#page=${currentPage}`;
+  // Download just the CURRENT page as a high-res PNG, rendered from the
+  // already-loaded PDF (no extra deps; a scanned page is an image anyway).
+  const handleDownloadPage = async () => {
+    const pdf = pdfRef.current;
+    if (!pdf) return;
+    try {
+      const page = await pdf.getPage(currentPage);
+      const viewport = page.getViewport({ scale: 2 });
+      const canvas = window.document.createElement('canvas');
+      canvas.width = Math.ceil(viewport.width);
+      canvas.height = Math.ceil(viewport.height);
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return;
+      await page.render({ canvasContext: ctx, viewport }).promise;
+      canvas.toBlob((blob) => {
+        if (!blob) return;
+        const a = window.document.createElement('a');
+        const base = (document?.source_name || 'document').replace(/\.pdf$/i, '');
+        a.href = URL.createObjectURL(blob);
+        a.download = `${base}_page${currentPage}.png`;
+        a.click();
+        setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+      }, 'image/png');
+    } catch {
+      /* page render failed — full-document download remains available */
+    }
+  };
+
   const handleOpenNewTab = () => {
     window.open(pdfUrl, '_blank', 'noopener,noreferrer');
     onClose(); // Return to chat
@@ -514,14 +533,23 @@ export function EvidenceViewer({ evidence, onClose, backLabel = 'Back to Chat' }
 
         <div className="flex-1" />
 
+        <button
+          className="btn-secondary"
+          onClick={handleDownloadPage}
+          disabled={!numPages}
+          title="Download the current page as a high-resolution image"
+        >
+          ↓ Page
+        </button>
+
         <a
           href={resolvedBaseUrl}
           download
           className="btn-secondary"
           style={{ textDecoration: 'none' }}
-          title="Download PDF"
+          title="Download the entire document (PDF)"
         >
-          ↓ Download
+          ↓ Document
         </a>
 
         <button
