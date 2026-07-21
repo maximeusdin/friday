@@ -1126,6 +1126,19 @@ textarea:focus {
   margin: 0 2px;
 }
 
+/* Anchors styled as buttons (e.g. "↓ Document") must match real <button> sizing —
+   the global `button` rule doesn't apply to <a>, which left them visibly smaller. */
+.pdf-toolbar a.btn-secondary {
+  display: inline-flex;
+  align-items: center;
+  border-radius: var(--radius-sm);
+  padding: var(--spacing-sm) var(--spacing-md);
+  font-size: 14px;
+  font-weight: 500;
+  line-height: normal;
+  transition: background-color 0.15s ease;
+}
+
 .pdf-container {
   flex: 1;
   overflow: auto;
