@@ -1242,9 +1242,25 @@ def run_v11_query(
                     "Synthesizing answer from evidence...", {"reason": "budget_exhausted"})
                 if verbose:
                     print(f"  [V11] Tool budget exhausted ({tool_calls_executed}/{max_tool_calls}). Requesting synthesis.", file=sys.stderr)
-                # Use minimal context to avoid truncation (full history can exceed 20k tokens)
-                minimal_ctx = _build_minimal_synthesis_context(workspace, clean_question, scope_note)
-                synth_prompt = "Tool budget exhausted. " + minimal_ctx
+                # The FINAL synthesis call happens once — no per-turn resend multiplier —
+                # so it gets a rich evidence pack (all bullets + key chunks) instead of the
+                # loop-sized squeeze. Falls back to the minimal context on failure.
+                _synth_budget = int(os.getenv("V9_SYNTHESIS_CONTEXT_TOKENS", "25000"))
+                try:
+                    rich_ctx = build_context_pack(
+                        workspace, delta,
+                        token_budget=_synth_budget,
+                        max_fulltext=24,
+                        findings_brief=_findings_brief,
+                    )
+                    synth_prompt = (
+                        "Tool budget exhausted. Synthesize the FINAL answer now from the "
+                        "evidence below. Set final=true, fill sufficiency and responsiveness.\n\n"
+                        + rich_ctx
+                    )
+                except Exception:
+                    minimal_ctx = _build_minimal_synthesis_context(workspace, clean_question, scope_note)
+                    synth_prompt = "Tool budget exhausted. " + minimal_ctx
                 system_msgs = [m for m in messages if m["role"] == "system"]
                 synth_messages = system_msgs + [{"role": "user", "content": synth_prompt}]
                 try:

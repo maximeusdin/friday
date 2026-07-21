@@ -85,7 +85,10 @@ _SUMMARIZER_PROMPT = """\
 You are a research assistant summarizing newly-retrieved archival evidence.
 
 Given the research question and a set of document chunks, produce:
-- bullets (max 6): concise factual findings, each referencing which chunk_ids support it.
+- bullets (max 10): concise factual findings, each referencing which chunk_ids support it.
+  COVER EVERY CHUNK: any provided chunk containing question-relevant content must
+  contribute at least one bullet — do not let a famous or question-echoing passage
+  crowd out a dry passage that states a specific fact, name, or date.
   Each bullet MUST have at least one supporting_chunk_id from the provided chunks.
   Tags (max 3 per bullet): short category labels like "identity", "alias", "roster",
   "timeline", "contradiction", "warning", "codename", etc.
@@ -110,7 +113,7 @@ Only reference chunk_ids that appear in the provided chunks below."""
 _MAX_BULLET_TEXT = 220
 _MAX_TAGS_PER_BULLET = 3
 _MAX_TAG_LEN = 20
-_MAX_BULLETS = 6
+_MAX_BULLETS = int(os.getenv("V9_SUMMARIZER_MAX_BULLETS", "10"))
 _MAX_OPEN_QUESTIONS = 4
 _MAX_LEADS = 6
 _MAX_WARNINGS = 3
@@ -304,7 +307,11 @@ def _normalize_summary(
 # Main entry point
 # =============================================================================
 
-_CHUNK_INPUT_BUDGET = 4000  # chars total across all chunks fed to summarizer
+# Chars of chunk text fed to the summarizer per pass. Was 4000 (~1.5 pages) —
+# which silently starved evidence: a 15-chunk fetch got its first 2-3 chunks
+# read and the rest never reached the model's eyes (bullets can only cite
+# chunks actually fed in). 16k chars ≈ 4k tokens — trivial for the mini model.
+_CHUNK_INPUT_BUDGET = int(os.getenv("V9_SUMMARIZER_INPUT_CHARS", "16000"))
 
 
 def summarize_delta_chunks(
@@ -313,7 +320,7 @@ def summarize_delta_chunks(
     *,
     alias_context: str = "",
     model: str = "gpt-4.1-mini-2025-04-14",
-    max_completion_tokens: int = 1400,  # room for verbatim support_quotes (6 × ~350 chars)
+    max_completion_tokens: int = 2600,  # 10 bullets × (220 text + 350 quote); truncation under strict schema returns null
 ) -> EvidenceSummaryUpdate:
     """Summarize newly-fetched chunks into an EvidenceSummaryUpdate.
 

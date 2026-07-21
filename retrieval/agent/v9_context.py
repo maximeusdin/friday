@@ -11,6 +11,7 @@ V9.5 additions:
 V9+PEM: two-section catalog (Primary vs Alias-Scoped), PEM mapping injection on fulltext.
 """
 import logging
+import os
 import re
 import sys
 from typing import List, Optional, Set, Any
@@ -37,7 +38,9 @@ def _estimate_tokens(text: str) -> int:
 # Defaults
 # =============================================================================
 
-DEFAULT_TOKEN_BUDGET = 6000    # lowered: structured-output schema adds ~1000 token overhead
+# Loop-turn context budget. The pack is RE-SENT every turn (~25×/query), so it
+# stays disciplined — but 6000 was rate-limit-era tight; the model has a 1M window.
+DEFAULT_TOKEN_BUDGET = int(os.getenv("V9_CONTEXT_TOKEN_BUDGET", "10000"))
 DEFAULT_CHUNK_CHAR_CAP = 1200
 DEFAULT_SNIPPET_LEN = 120
 DEFAULT_MAX_CATALOG_ROWS = 15
