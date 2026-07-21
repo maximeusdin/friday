@@ -2361,6 +2361,8 @@ def _call_with_retry(
         try:
             kwargs: Dict[str, Any] = {
                 "model": model,
+                "messages": messages,  # dropped by accident in 613ded1 — without it every
+                                       # retry-path call raised "Missing required arguments"
                 # Temperature 0 was tried to cut run-to-run variance but the 18-probe re-grade
                 # showed it INCREASED tunneling (greedy locks the agent into narrow single-
                 # collection retrieval) and net-worsened the grades — so default stays 0.2.
