@@ -64,6 +64,7 @@ from retrieval.agent.v11_tools import (
     fetch_diverse_from_catalog,
     expand_query,
     expand_from_evidence,
+    boolean_search,
 )
 from retrieval.agent.tools import ToolResult
 from retrieval.agent.v9_summarize import summarize_delta_chunks
@@ -174,6 +175,31 @@ V11_TOOLS_DEF = [
                     "top_k_per_term": {"type": "integer", "description": "Max hits per term (default 20)", "default": 20},
                 },
                 "required": ["terms"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "boolean_search",
+            "description": (
+                "Deterministic whole-word boolean search over EVERY page (the same engine the "
+                "researcher's Search tab uses). Syntax: AND, OR, NOT, parentheses, \"quoted phrases\". "
+                "Returns total_hits, per-collection counts, and the hit pages in reading order — "
+                "exhaustive, not a sample. Aliases/codenames auto-expand.\n\n"
+                "Work like a researcher: probe broad, READ THE COUNTS, then narrow. "
+                "Example: OSS -> 693 hits; (OSS OR \"Office of Strategic Services\") AND (Soviet OR NKVD) "
+                "-> 222; AND agent -> readable. When a count is <=120 the hit list you see IS complete — "
+                "ideal for rosters/enumerations (\"names of X in Y\"): walk ALL hits so no member is "
+                "missed, then fetch_chunks the relevant ones. Prefer this over semantic search whenever "
+                "exact terms are known; prefer semantic search for conceptual/paraphrased questions."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Boolean query, e.g. (OSS OR \"Office of Strategic Services\") AND (agent OR informant) NOT rumor"},
+                },
+                "required": ["query"],
             },
         },
     },
@@ -371,6 +397,60 @@ def _execute_tool(
             if result.metadata.get("collections_seen_in_top_k"):
                 out["collections_seen_in_top_k"] = result.metadata["collections_seen_in_top_k"]
             return out, f"query='{query[:60]}' {name} -> {len(catalog)} hits"
+
+        if name == "boolean_search":
+            query = arguments.get("query", "")
+            sess = getattr(workspace, "_search_session", None) or {}
+            res = boolean_search(
+                conn, query, scope=scope,
+                session_id=sess.get("session_id"),
+                user_sub=sess.get("user_sub") or "chat-engine",
+                origin_query=workspace.question or "",
+            )
+            if res.get("error"):
+                return ({"tool": name, "error": res["error"], "success": False},
+                        f"boolean_search error: {res['error'][:80]}")
+            # Merge hit pages into the catalog so fetch_chunks can read them.
+            # Deterministic whole-word hits outrank sampled semantic hits.
+            hits = res.get("hits") or []
+            catalog = [
+                CatalogHit(
+                    chunk_id=h["chunk_id"], score=0.9, doc_id=h.get("document_id"),
+                    page=str(h.get("pdf_page") or ""), collection=h.get("collection"),
+                    snippet=h.get("snippet") or "",
+                )
+                for h in hits if h.get("chunk_id")
+            ]
+            merge_catalog_hits(workspace, catalog)
+            if query.strip():
+                workspace._search_queries.append(query.strip())
+            # Track chat-run result sets so the response can surface them as Search tabs
+            try:
+                workspace._boolean_result_sets.append({
+                    "result_set_id": res.get("result_set_id"),
+                    "query": query, "total_hits": res.get("total_hits", 0),
+                })
+            except AttributeError:
+                workspace._boolean_result_sets = [{
+                    "result_set_id": res.get("result_set_id"),
+                    "query": query, "total_hits": res.get("total_hits", 0),
+                }]
+            out = {
+                "tool": name,
+                "query": query,
+                "total_hits": res.get("total_hits", 0),
+                "per_collection": res.get("per_collection", {}),
+                "complete_list_shown": not res.get("truncated"),
+                "hits": [
+                    {"chunk_id": h["chunk_id"], "collection": h.get("collection"),
+                     "page": h.get("pdf_page"), "snippet": (h.get("snippet") or "")[:220]}
+                    for h in hits
+                ],
+                "success": True,
+            }
+            note = (f"boolean '{query[:50]}' -> {res.get('total_hits', 0)} page hits "
+                    f"({'complete' if not res.get('truncated') else f'{len(hits)} shown'})")
+            return out, note
 
         if name == "search_broad":
             query = arguments.get("query", "")
@@ -579,16 +659,32 @@ def _execute_tool(
         return {"error": str(e), "tool": name}, f"error: {str(e)[:80]}"
 
 
+# Common words carry no signal for deciding which page a quote sits on; a page
+# can share dozens of these with any quote. Only distinctive tokens vote.
+_QUOTE_PAGE_STOPWORDS = frozenset(
+    "the a an and or of to in on at by for with from as is was were are be been "
+    "that this these those it its he she his her they them their we you i not no "
+    "but if than then so all any who whom which what when where would could "
+    "should has have had will may can do did does".split()
+)
+
+
 def _lookup_quote_page(conn, chunk_id: int, quote: str) -> Optional[int]:
     """Find which of a chunk's PDF pages contains the quote, by matching the quote
     against each page's raw_text (chunk_pages char offsets are unpopulated, so text
     matching is the reliable mapping). Chunks span 1-6 pages, so this is cheap.
-    Returns None when the quote can't be placed (viewer falls back to first page)."""
+    Matching is space-insensitive (line wrapping can differ between chunk text and
+    page raw_text). Returns None when the quote can't be placed (viewer falls back
+    to first page)."""
     from retrieval.agent.v9_summarize import _norm_with_map
     q_norm, _ = _norm_with_map(quote or "")
     if len(q_norm) < 15:
         return None
-    q_tokens = set(q_norm.split(" "))
+    q_sf = q_norm.replace(" ", "")  # space-free form
+    q_tokens = {
+        t for t in q_norm.split(" ")
+        if len(t) >= 3 and t not in _QUOTE_PAGE_STOPWORDS
+    }
     try:
         with conn.cursor() as cur:
             cur.execute(
@@ -614,7 +710,7 @@ def _lookup_quote_page(conn, chunk_id: int, quote: str) -> Optional[int]:
         if pdf_page is None or not raw_text:
             continue
         p_norm, _ = _norm_with_map(raw_text)
-        if q_norm in p_norm:
+        if q_sf in p_norm.replace(" ", ""):
             return int(pdf_page)
         p_tokens = set(p_norm.split(" "))
         score = len(q_tokens & p_tokens) / max(len(q_tokens), 1)
@@ -845,6 +941,7 @@ def run_v11_query(
     seed_entity_candidates: Optional[List[Any]] = None,
     clarification_notes: Optional[List[str]] = None,
     engine_profile: str = "v11",
+    search_session: Optional[Dict[str, Any]] = None,
 ) -> V9Result:
     """
     Run the V11 Investigation Loop (stripped V9).
@@ -898,6 +995,10 @@ def run_v11_query(
     else:
         workspace = V11ResearchWorkspace(question=clean_question, scope=detected_scope)
         workspace.investigation.goal = "Research the topic thoroughly and provide a comprehensive answer."
+
+    # Session identity for boolean_search persistence (chat-run searches become
+    # session result sets the researcher can open from the Search tab).
+    workspace._search_session = search_session or {}
 
     # V13: plan the query + prime the workspace with agreement-ranked evidence before the loop.
     _v13_plan = None

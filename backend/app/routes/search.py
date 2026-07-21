@@ -115,6 +115,10 @@ class SearchResultSetSummary(BaseModel):
     status: str = "complete"
     total_hits: Optional[int] = None
     is_exhaustive: bool = True
+    # 'user' (researcher-run) | 'chat' (run by the chat engine during an investigation)
+    origin: str = "user"
+    # For chat-origin searches: the question that spawned them
+    origin_query: Optional[str] = None
 
 
 class SearchPageHitItem(BaseModel):
@@ -330,7 +334,7 @@ def list_search_result_sets(
             cur.execute(
                 """
                 SELECT id, created_at, query_display, query_raw, mode, status,
-                       total_hits, is_exhaustive
+                       total_hits, is_exhaustive, origin, origin_query
                 FROM search_result_sets
                 WHERE session_id = %s AND user_sub = %s
                 ORDER BY created_at ASC
@@ -348,6 +352,8 @@ def list_search_result_sets(
                 status=r[5] or "complete",
                 total_hits=r[6],
                 is_exhaustive=r[7] if r[7] is not None else True,
+                origin=r[8] or "user",
+                origin_query=r[9],
             )
             for r in rows
         ]

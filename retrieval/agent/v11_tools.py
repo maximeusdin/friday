@@ -384,3 +384,112 @@ def fetch_chunks(
         neighbor_before=neighbor_before,
         neighbor_after=neighbor_after,
     )
+
+
+# =============================================================================
+# Boolean search — the agent's access to the SAME deterministic concordance
+# engine the Search tab uses (word-boundary matching, AND/OR/NOT + quoted
+# phrases, alias expansion, exhaustive page hits, per-collection coverage).
+# Chat-run searches persist as session result sets (origin='chat') so
+# researchers can open, prune, and continue them from the Search tab.
+# =============================================================================
+
+def boolean_search(
+    conn,
+    query: str,
+    scope: Optional[ScopeFilter] = None,
+    *,
+    session_id: Optional[int] = None,
+    user_sub: str = "chat-engine",
+    origin_query: str = "",
+    max_hits_returned: int = 120,
+) -> Dict[str, Any]:
+    """Run the deterministic Search engine and return counts + coverage + hits.
+
+    Returns {result_set_id, total_hits, per_collection, hits:[{chunk_id,
+    document_id, pdf_page, snippet}], error}. Hits are page-level, in canonical
+    (document, page) order — exhaustive up to max_hits_returned, with total_hits
+    always the full count so the model can judge whether to narrow.
+    """
+    import json as _json
+    import uuid as _uuid
+    from retrieval.search_executor import run_search
+
+    query = (query or "").strip()
+    if not query:
+        return {"error": "empty query", "total_hits": 0, "hits": []}
+
+    # ScopeFilter -> the Search engine's scope_json. The executor resolves
+    # included_collection_ids (numeric), so slugs must be mapped to ids here.
+    scope_json: Dict[str, Any] = {"mode": "full_archive"}
+    if scope and not scope.is_empty():
+        scope_json = {"mode": "custom"}
+        if scope.collections:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id FROM collections WHERE slug = ANY(%s)",
+                    (list(scope.collections),),
+                )
+                scope_json["included_collection_ids"] = [r[0] for r in cur.fetchall()]
+        if getattr(scope, "document_ids", None):
+            scope_json["included_document_ids"] = list(scope.document_ids)
+
+    result_set_id = str(_uuid.uuid4())
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO search_result_sets
+                (id, user_sub, session_id, scope_json, query_raw, mode, unit,
+                 sort_order, alias_expand, is_exhaustive, status, origin, origin_query)
+                VALUES (%s, %s, %s, %s, %s, 'exact', 'page', 'canonical', true, true,
+                        'running', 'chat', %s)
+                """,
+                (result_set_id, user_sub, session_id, _json.dumps(scope_json),
+                 query, origin_query[:500] or None),
+            )
+        conn.commit()
+        res = run_search(conn, result_set_id, query, scope_json,
+                         alias_expand=True, mode="exact")
+        total_hits = int(res.get("total_hits") or 0)
+        coverage = res.get("coverage_json") or {}
+
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT h.chunk_id, h.document_id, h.pdf_page_number,
+                       LEFT(COALESCE(h.snippet, ''), 300), col.slug
+                FROM search_result_page_hits h
+                JOIN collections col ON col.id = h.collection_id
+                WHERE h.result_set_id = %s
+                ORDER BY h.collection_id, h.document_id, h.page_seq
+                LIMIT %s
+                """,
+                (result_set_id, max_hits_returned),
+            )
+            hits = [
+                {"chunk_id": r[0], "document_id": r[1], "pdf_page": r[2],
+                 "snippet": r[3], "collection": r[4]}
+                for r in cur.fetchall()
+            ]
+
+        per_collection = {}
+        for c in (coverage.get("collections") or []):
+            if c.get("hits"):
+                per_collection[c.get("title") or str(c.get("id"))] = c["hits"]
+
+        return {
+            "result_set_id": result_set_id,
+            "query": query,
+            "total_hits": total_hits,
+            "per_collection": per_collection,
+            "hits": hits,
+            "truncated": total_hits > len(hits),
+        }
+    except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return {"error": str(e)[:300], "total_hits": 0, "hits": [],
+                "result_set_id": result_set_id}

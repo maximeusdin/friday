@@ -856,6 +856,10 @@ export interface SearchResultSetSummary {
   status: string;
   total_hits?: number;
   is_exhaustive?: boolean;
+  /** 'user' (researcher-run) | 'chat' (run by the chat engine during an investigation) */
+  origin?: 'user' | 'chat';
+  /** For chat-origin searches: the question that spawned them */
+  origin_query?: string | null;
 }
 
 async function createSearchResultSet(req: SearchCreateRequest): Promise<SearchCreateResponse> {

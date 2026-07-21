@@ -19,6 +19,8 @@ export interface SearchResultBlock {
   isFetchingMore?: boolean;
   notice?: string | null;  // e.g. sentence relaxed to keywords
   showHidden?: boolean;    // "Show removed" toggle state for this search
+  origin?: 'user' | 'chat';       // who ran this search
+  originQuery?: string | null;    // chat-origin: the question that spawned it
 }
 
 interface SearchTabProps {
@@ -49,6 +51,7 @@ export function SearchTab({ activeScope, sessionId, onOpenPage, externalResultSe
   const [activeResultSetId, setActiveResultSetId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [showInstructions, setShowInstructions] = useState(true);
+  const [showChatTabs, setShowChatTabs] = useState(false);
 
   const scopeForRequest = useCallback((): SearchCreateRequest['scope'] => {
     if (!activeScope) return { mode: 'full_archive' };
@@ -174,6 +177,8 @@ export function SearchTab({ activeScope, sessionId, onOpenPage, externalResultSe
                 items: data.items,
                 totalHits: meta.total_hits ?? s.total_hits ?? 0,
                 nextCursor: data.next_cursor ?? null,
+                origin: s.origin ?? 'user',
+                originQuery: s.origin_query ?? null,
               };
             } catch {
               return null;
@@ -183,8 +188,11 @@ export function SearchTab({ activeScope, sessionId, onOpenPage, externalResultSe
         if (cancelled) return;
         const loaded = blocks.filter((b): b is SearchResultBlock => b !== null);
         setSearchHistory(loaded);
-        // Most recent search is the active tab on reload
-        if (loaded.length > 0) setActiveResultSetId(loaded[loaded.length - 1].resultSetId);
+        // Most recent search is the active tab on reload — preferring the
+        // researcher's own searches over Chat's so chat sets don't steal focus.
+        const lastUser = [...loaded].reverse().find((b) => b.origin !== 'chat');
+        const fallback = loaded[loaded.length - 1];
+        if (fallback) setActiveResultSetId((lastUser ?? fallback).resultSetId);
       } catch (e) {
         if (!cancelled) setError(e instanceof Error ? e.message : 'Failed to load saved searches');
       }
@@ -480,37 +488,67 @@ export function SearchTab({ activeScope, sessionId, onOpenPage, externalResultSe
         <div className="search-error">{error}</div>
       )}
 
-      {/* Search tabs — one per search in this session; wraps to multiple rows so full names stay visible */}
-      {searchHistory.length > 0 && (
-        <div className="search-tabs" role="tablist" aria-label="Searches in this session">
-          {searchHistory.map((block) => (
-            <div
-              key={block.resultSetId}
-              className={`search-tab-chip${block.resultSetId === activeResultSetId ? ' search-tab-chip-active' : ''}`}
+      {/* Search tabs — researcher searches and Chat's searches, separated but equal:
+          clicking a Chat chip opens it exactly like your own, so you can pick up
+          where the investigation left off. */}
+      {searchHistory.length > 0 && (() => {
+        const userBlocks = searchHistory.filter((b) => b.origin !== 'chat');
+        const chatBlocks = searchHistory.filter((b) => b.origin === 'chat');
+        const activeIsChat = chatBlocks.some((b) => b.resultSetId === activeResultSetId);
+        const renderChip = (block: SearchResultBlock, isChat: boolean) => (
+          <div
+            key={block.resultSetId}
+            className={
+              `search-tab-chip${isChat ? ' search-tab-chip-chat' : ''}` +
+              `${block.resultSetId === activeResultSetId ? ' search-tab-chip-active' : ''}`
+            }
+          >
+            <button
+              type="button"
+              role="tab"
+              aria-selected={block.resultSetId === activeResultSetId}
+              className="search-tab-chip-label"
+              onClick={() => setActiveResultSetId(block.resultSetId)}
+              title={
+                isChat
+                  ? `Chat ran this search${block.originQuery ? ` while answering: “${block.originQuery}”` : ''} — ${block.totalHits} hits`
+                  : `${block.query} — ${block.totalHits} hits`
+              }
             >
-              <button
-                type="button"
-                role="tab"
-                aria-selected={block.resultSetId === activeResultSetId}
-                className="search-tab-chip-label"
-                onClick={() => setActiveResultSetId(block.resultSetId)}
-                title={`${block.query} — ${block.totalHits} hits`}
-              >
-                {block.query}
-              </button>
-              <button
-                type="button"
-                className="search-tab-chip-close"
-                onClick={() => handleCloseTab(block.resultSetId)}
-                title="Delete this search"
-                aria-label={`Delete search: ${block.query}`}
-              >
-                ✕
-              </button>
-            </div>
-          ))}
-        </div>
-      )}
+              {isChat && <span className="search-tab-chip-spark" aria-hidden>⚡</span>}
+              {block.query}
+            </button>
+            <button
+              type="button"
+              className="search-tab-chip-close"
+              onClick={() => handleCloseTab(block.resultSetId)}
+              title="Delete this search"
+              aria-label={`Delete search: ${block.query}`}
+            >
+              ✕
+            </button>
+          </div>
+        );
+        return (
+          <div className="search-tabs" role="tablist" aria-label="Searches in this session">
+            {userBlocks.map((b) => renderChip(b, false))}
+            {chatBlocks.length > 0 && (
+              <>
+                <button
+                  type="button"
+                  className={`search-tabs-chat-toggle${activeIsChat ? ' search-tabs-chat-toggle-active' : ''}`}
+                  onClick={() => setShowChatTabs((v) => !v)}
+                  aria-expanded={showChatTabs || activeIsChat}
+                  title="Searches the Chat assistant ran while answering your questions — open any of them to continue where it left off"
+                >
+                  {showChatTabs || activeIsChat ? '▾' : '▸'} ⚡ Chat&apos;s searches ({chatBlocks.length})
+                </button>
+                {(showChatTabs || activeIsChat) && chatBlocks.map((b) => renderChip(b, true))}
+              </>
+            )}
+          </div>
+        );
+      })()}
 
       <div className="search-results-container">
         {searchHistory.filter((block) => block.resultSetId === activeResultSetId).map((block) => (

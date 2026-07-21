@@ -359,6 +359,43 @@ html, body {
   color: #c62828;
 }
 
+/* Chat-origin search chips: violet accent + spark, researcher chips stay blue */
+.search-tab-chip-chat {
+  border-style: dashed;
+  border-color: #8e6cc7;
+  background: rgba(142, 108, 199, 0.06);
+}
+
+.search-tab-chip-chat.search-tab-chip-active {
+  border-style: solid;
+  border-color: #6d3fbf;
+  background: rgba(142, 108, 199, 0.14);
+}
+
+.search-tab-chip-chat .search-tab-chip-label {
+  color: #5b3a99;
+}
+
+.search-tab-chip-spark {
+  margin-right: 4px;
+  font-size: 11px;
+}
+
+.search-tabs-chat-toggle {
+  background: none;
+  border: 1px dashed #8e6cc7;
+  border-radius: 6px;
+  padding: 4px 10px;
+  font-size: 12px;
+  color: #5b3a99;
+  cursor: pointer;
+}
+
+.search-tabs-chat-toggle:hover,
+.search-tabs-chat-toggle-active {
+  background: rgba(142, 108, 199, 0.08);
+}
+
 .search-result-remove {
   background: none;
   border: none;

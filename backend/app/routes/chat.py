@@ -1719,6 +1719,7 @@ async def v9_message_stream(session_id: int, req: V9ChatRequest, user=Depends(re
                 selected_scope=selected_scope_filter,
                 verbose=True,
                 progress_callback=progress_callback,
+                user_sub=user["sub"],
             )
             progress_queue.put({"type": "done", "result": result})
         except Exception as e:
@@ -2146,6 +2147,7 @@ def v9_message(session_id: int, req: V9ChatRequest, user=Depends(require_user)):
             explicit_action=explicit_action,
             carry_context=carry_context,
             verbose=True,
+            user_sub=user["sub"],
         )
 
         # --- V12: clarification needed -> return questions instead of an answer ---

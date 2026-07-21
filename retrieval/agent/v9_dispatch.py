@@ -653,6 +653,7 @@ def _run_new_retrieval(
     verbose: bool = True,
     progress_callback: Optional[Callable] = None,
     carry_context: Optional[Dict[str, Any]] = None,
+    user_sub: Optional[str] = None,
 ) -> DispatchResult:
     """Execute a new retrieval run with evidence set population.
 
@@ -739,6 +740,7 @@ def _run_new_retrieval(
                     progress_callback=progress_callback,
                     use_lightweight_pem=os.getenv("V11_USE_LIGHTWEIGHT_PEM", "0").strip().lower() in ("1", "true", "yes"),
                     engine_profile=_profile,
+                    search_session={"session_id": session_id, "user_sub": user_sub},
                 )
             if isinstance(v12, V12ClarificationPending):
                 update_run_status(conn, run.run_id, "paused")  # 'paused' is a valid v9_runs.status
@@ -769,6 +771,7 @@ def _run_new_retrieval(
                 progress_callback=progress_callback,
                 use_lightweight_pem=os.getenv("V11_USE_LIGHTWEIGHT_PEM", "0").strip().lower() in ("1", "true", "yes"),
                 engine_profile=_profile,
+                search_session={"session_id": session_id, "user_sub": user_sub},
             )
     except Exception as e:
         update_run_status(conn, run.run_id, "failed")
@@ -1676,6 +1679,7 @@ def dispatch_message(
     selected_scope: Optional[ScopeFilter] = None,
     verbose: bool = True,
     progress_callback: Optional[Callable] = None,
+    user_sub: Optional[str] = None,
 ) -> DispatchResult:
     """Main entry point: route a user message and execute the appropriate path.
 
@@ -1856,6 +1860,7 @@ def dispatch_message(
             verbose=verbose,
             progress_callback=progress_callback,
             carry_context=carry_context,
+            user_sub=user_sub,
         )
 
     result.router_decision = decision
