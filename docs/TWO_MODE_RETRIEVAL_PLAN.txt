@@ -1,0 +1,1487 @@
+================================================================================
+TWO-MODE RETRIEVAL SYSTEM IMPLEMENTATION PLAN
+================================================================================
+
+Overview: Implement dual retrieval modes (thorough/conversational) with evidence
+bundles, match traces, threshold-based vector search, cursor pagination, and new
+entity primitives. Includes explicit vector semantics, hot/cold trace storage,
+and mode precedence logic. Each phase includes specific test requirements.
+
+================================================================================
+TODOS
+================================================================================
+
+Phase 1: Migrations 0042-0044 with hot columns, vector semantics, UNIQUE(rank),
+         applied_filters at run level [PENDING]
+
+Phase 1 Tests: test_schema_phase1.py - 10 tests for tables, indexes, constraints
+               [PENDING]
+
+Phase 2: retrieval/config.py - VectorMetricConfig, mode configs,
+         resolve_retrieval_mode() [PENDING]
+
+Phase 2 Tests: 9 tests for mode detection, precedence, vector semantics [PENDING]
+
+Phase 3: Add 5 primitives (2 scope, 1 analysis, 2 control) with NOT EXISTS
+         pattern [PENDING]
+
+Phase 3: Update compile_primitives_to_scope() - NOT EXISTS for EXCEPT_ENTITIES
+         [PENDING]
+
+Phase 3 Tests: 10 unit + 6 integration tests for new primitives [PENDING]
+
+Phase 4: Threshold search + CORRECT RRF (explicit ranks from SQL, NOT
+         set.index()) [PENDING]
+
+Phase 4 Tests: test_search_layer.py - 24 tests including RRF correctness
+               [PENDING]
+
+Phase 5: Tiered enrichment (Tier 0/1/2/3), lazy phrase positions, run-level
+         filters [PENDING]
+
+Phase 5 Tests: test_match_traces.py - 22 tests for tiered enrichment [PENDING]
+
+Phase 6: Mode-aware execution with rerun semantics (idempotent by default)
+         [PENDING]
+
+Phase 6 Tests: 13 tests for modes + 4 smoke tests for rerun semantics [PENDING]
+
+Phase 7: 5 endpoints (chunks, traces, entities, co-mentions, highlights) with
+         cursor pagination [PENDING]
+
+Phase 7 Tests: test_api_endpoints.py - 26 tests including on-demand highlights
+               [PENDING]
+
+Phase 8: Planner prompts respecting mode precedence, evidence bundle synthesis
+         [PENDING]
+
+Phase 8 Tests: 10 tests for mode precedence, new primitives, synthesis format
+               [PENDING]
+
+================================================================================
+ARCHITECTURE OVERVIEW
+================================================================================
+
+User Intent Detection:
+  - User Input
+  - UI Toggle (highest precedence)
+  - Primitive Override (second)
+  - Trigger Phrase (third)
+  - Default (lowest)
+
+Two Retrieval Modes:
+  - Conversational Mode: fast + explainable
+  - Thorough Mode: exhaustive
+
+Conversational Flow:
+  - Threshold + answer_k
+  - Score-based Ranking
+  - LLM Summary
+
+Thorough Flow:
+  - Threshold Only
+  - Deterministic Order
+  - Cursor Pagination
+
+Evidence Layer:
+  - Hot Columns (Fast Queries)
+  - JSONB Audit Log
+  - Evidence Bundles
+
+================================================================================
+KEY DESIGN DECISIONS
+================================================================================
+
+MODE PRECEDENCE (highest to lowest)
+-----------------------------------
+1. UI toggle - explicit user selection in interface
+2. Primitive override - SET_RETRIEVAL_MODE in plan
+3. Trigger phrase detection - "exhaustive", "everything", etc.
+4. Default - conversational
+
+VECTOR SIMILARITY SEMANTICS
+---------------------------
+Store explicit metric configuration to avoid formula breakage:
+- vector_metric: "cosine" | "l2" | "ip"
+- vector_operator: "<=>" | "<->" | "<#>"
+- similarity_transform: e.g., "1 - cosine_distance" for cosine
+
+Note: pgvector's <=> is cosine distance. Similarity = 1 - distance, range
+[-1, 1]. Thresholds must account for possible negative similarity with
+opposite-direction embeddings.
+
+UI/Mental Model Alignment:
+- Internal: threshold in actual similarity space [-1, 1]
+- UI option: present as "precision slider" (0-100%) or "strictness"
+- Alternative: accept [0,1] in UI, transform internally via (2x - 1)
+- Store both raw_threshold (user-facing) and effective_threshold (internal)
+- Primitive SET_SIMILARITY_THRESHOLD accepts internal scale [-1, 1]
+
+PAGINATION STRATEGY
+-------------------
+- Offset pagination: Simple, fine for small result sets
+- Cursor pagination: Required for thorough mode scalability (after_rank param)
+- Both supported; cursor is the scalable path for large result sets
+
+AUDIT TRAIL INTEGRITY
+---------------------
+Critical invariant: every result_set has exactly one retrieval_run receipt.
+- result_sets.retrieval_run_id is NOT NULL (enforced in schema)
+- Never create result_set without a run
+- Optional: include retrieval_run_id as redundant column in traces for direct
+  run queries (simplifies debugging, not required for correctness)
+
+MATCH TRACE STORAGE
+-------------------
+Split into "hot" columns for fast queries + JSONB audit log:
+- Hot: matched_entity_ids int[], matched_phrases text[], scope_passed boolean
+- Cold: primitive_matches JSONB (full audit detail)
+- Compact filter traces: applied_filters[] list at RUN level, not per-chunk
+
+Note on scope_passed: Any chunk in the result set has passed scope filters
+(otherwise it wouldn't be included). So scope_passed is always TRUE for
+included results. Only store failed_filters if you explicitly compute
+exclusion analysis ("why didn't X appear?"). For now, scope_passed is
+redundant but kept for schema clarity; may remove later.
+
+RANKING POLICIES (Precise Definition)
+-------------------------------------
+Conversational mode:
+  - Rank = final ordering after hybrid scoring + tie-breakers
+  - ORDER BY: score_hybrid DESC, chunk_id ASC
+  - Rank assigned after RRF fusion, before cap
+
+Thorough mode:
+  - Rank = deterministic ordering by (document_id, chunk_id)
+  - No score-based ranking - keeps exhaustive results neutral
+  - Requires: every chunk has document_id (from chunk metadata)
+
+Handling NULL document_id:
+  - Chunks without document_id: sort LAST using sentinel
+  - SQL: ORDER BY COALESCE(document_id, 2147483647), chunk_id
+  - Do NOT exclude them from thorough results
+  - Investigate and fix any chunks missing document_id (data quality issue)
+
+RERUN SEMANTICS
+---------------
+- Idempotent by default: reuse existing result_set unless force_rerun=True
+- New execution creates new result_set (audit trail preserved)
+- PKs prevent duplicate rows
+
+INDEX STRATEGY (Deferred vs Immediate)
+--------------------------------------
+Immediate indexes:
+- (result_set_id, chunk_id) PK on traces - required
+- (result_set_id, rank) on result_set_chunks - required for cursor pagination
+- (entity_id, chunk_id) on entity_mentions - required for NOT EXISTS
+
+Deferred indexes (create when needed):
+- GIN on matched_entity_ids - only if you need "find traces where entity X
+  surfaced" queries; entity aggregation uses entity_mentions, not traces
+- GIN on primitive_matches JSONB - defer until audit queries are common
+
+RRF IMPLEMENTATION STRATEGY
+---------------------------
+Default: SQL CTE approach (not Python dict)
+- Deterministic
+- Faster (no large set pulls into Python)
+- Works for both conversational and thorough candidate pools
+- Python fallback only for special cases or debugging
+
+TIERED ENRICHMENT HARD RULES
+----------------------------
+| Tier | When         | What                                     |
+|------|--------------|------------------------------------------|
+| 0    | All results  | Hot columns from search (scores, ranks)  |
+| 1    | All results  | Entity IDs from entity_mentions (batch)  |
+| 2    | Top N only   | Full entity details for LLM synthesis    |
+| 3    | On-demand    | Phrase positions, full text highlights   |
+
+HARD RULE: Never load full chunk text for more than summarization_limit
+chunks during execution, even in thorough mode. Thorough mode returns all
+chunk IDs but does NOT do LLM prep work for all of them.
+
+================================================================================
+PHASE 1: DATABASE SCHEMA (Days 1-2)
+================================================================================
+
+1.1 MIGRATION FILES
+-------------------
+
+migrations/0042_match_traces.sql - First-class "why surfaced" storage:
+
+Table: result_set_match_traces
+  Columns:
+    - result_set_id, chunk_id (composite key) - keyed by result_set for API joins
+    - retrieval_run_id BIGINT (optional, redundant) - for direct run queries
+      (Can be derived via result_sets.retrieval_run_id, but simplifies debugging)
+    
+    Hot columns (fast queries):
+      - matched_entity_ids INT[] - entity IDs that matched
+      - matched_phrases TEXT[] - phrases that matched
+      - scope_passed BOOLEAN DEFAULT TRUE - always TRUE for included results
+        (Renamed from filters_passed; kept for schema clarity, may remove later)
+      - in_lexical BOOLEAN - appeared in lexical candidate set
+      - in_vector BOOLEAN - appeared in vector candidate set
+    
+    Score columns:
+      - score_lexical FLOAT, score_vector FLOAT, score_hybrid FLOAT
+      - vector_distance FLOAT - raw distance value
+      - vector_similarity FLOAT - transformed similarity
+    
+    Rank info (conversational only):
+      - rank INTEGER
+      - rank_trace JSONB - position and explanation
+    
+    Audit log (cold storage):
+      - primitive_matches JSONB - full primitive hit details
+      - (applied_filters stored at RUN level, not per-chunk)
+    
+    Cap tracking:
+      - was_capped BOOLEAN, cap_reason VARCHAR(100)
+  
+  Indexes:
+    - Primary: (result_set_id, chunk_id)
+    - (result_set_id, rank) for pagination
+    - DEFERRED: GIN on matched_entity_ids (only if "find traces where entity X
+      surfaced" queries become common; entity aggregation uses entity_mentions)
+    - DEFERRED: GIN on primitive_matches (defer until audit queries are common)
+
+Constraint on result_sets table:
+  - retrieval_run_id BIGINT NOT NULL REFERENCES retrieval_runs(id)
+  - Add NOT NULL if not already enforced
+  - Invariant: every result_set has exactly one retrieval_run receipt
+
+--------------------------------------------------------------------------------
+
+migrations/0043_retrieval_modes.sql - Mode + vector semantics on retrieval_runs:
+
+Add columns to retrieval_runs:
+  
+  Mode tracking:
+    - retrieval_mode VARCHAR(20) DEFAULT 'conversational'
+    - mode_source VARCHAR(20) - 'ui_toggle'|'primitive'|'trigger_phrase'|'default'
+  
+  Vector semantics (explicit, debuggable):
+    - vector_metric VARCHAR(10) DEFAULT 'cosine' - 'cosine' | 'l2' | 'ip'
+    - vector_operator VARCHAR(5) DEFAULT '<=>' - '<=>' | '<->' | '<#>'
+    - similarity_transform VARCHAR(50) - e.g., '1 - cosine_distance'
+    - similarity_threshold FLOAT
+  
+  Cap tracking:
+    - total_hits_before_cap INTEGER
+    - max_hits_cap INTEGER
+    - cap_applied BOOLEAN DEFAULT FALSE
+
+--------------------------------------------------------------------------------
+
+migrations/0044_paginated_results.sql - Normalized chunk storage for pagination:
+
+Table: result_set_chunks
+  - result_set_id BIGINT REFERENCES result_sets(id) ON DELETE CASCADE
+  - chunk_id BIGINT REFERENCES chunks(id) ON DELETE CASCADE
+  - rank INTEGER NOT NULL
+  - Primary key: (result_set_id, chunk_id)
+
+Deterministic ordering rules:
+  Conversational mode:
+    - rank = final ordering after RRF hybrid scoring + tie-break
+    - ORDER BY: score_hybrid DESC, chunk_id ASC
+    - Rank assigned after fusion, before cap
+    
+  Thorough mode:
+    - rank = deterministic ordering by (document_id, chunk_id)
+    - No score-based ranking - keeps exhaustive results neutral
+    - Requires document_id lookup from chunk metadata
+    
+  NULL document_id handling:
+    - Chunks without document_id: sort LAST using sentinel value
+    - SQL: ORDER BY COALESCE(c.document_id, 2147483647), c.id
+    - Do NOT exclude them from thorough results
+    - Log warning if NULL document_ids found (data quality issue to fix)
+
+Indexes:
+  - (result_set_id, rank) for cursor pagination (WHERE rank > after_rank)
+  - Unique constraint on (result_set_id, rank) to ensure no ties
+
+--------------------------------------------------------------------------------
+
+1.2 PHASE 1 TESTS
+-----------------
+
+Create tests/test_schema_phase1.py:
+
+  1. test_match_traces_table_exists - verify table created
+  2. test_match_traces_hot_columns - verify int[] and text[] columns
+  3. test_match_traces_indexes - verify all indexes exist
+  4. test_retrieval_runs_vector_columns - verify metric/operator/transform columns
+  5. test_retrieval_runs_mode_columns - verify mode tracking columns
+  6. test_result_set_chunks_table - verify pagination table
+  7. test_result_set_chunks_unique_rank - verify no duplicate ranks
+  8. test_gin_index_on_entity_ids - verify GIN index works for int[]
+  9. test_foreign_key_cascades - verify ON DELETE CASCADE works
+  10. test_cursor_pagination_query - verify WHERE rank > X is efficient
+
+Exit Criteria: All schema tests pass, python scripts/run_migrations.py --plan
+shows clean state.
+
+================================================================================
+PHASE 2: CONFIGURATION LAYER (Day 2)
+================================================================================
+
+2.1 NEW FILE: retrieval/config.py
+---------------------------------
+
+from dataclasses import dataclass
+from typing import Literal
+
+# Vector metric configuration (explicit, debuggable)
+@dataclass(frozen=True)
+class VectorMetricConfig:
+    metric: str = "cosine"           # "cosine" | "l2" | "ip"
+    operator: str = "<=>"            # "<=>" | "<->" | "<#>"
+    similarity_transform: str = "1 - distance"  # formula
+    similarity_range: tuple[float, float] = (-1.0, 1.0)  # possible range
+
+DEFAULT_VECTOR_CONFIG = VectorMetricConfig()
+
+@dataclass(frozen=True)
+class ConversationalModeConfig:
+    answer_k: int = 20               # the "answer set" size
+    max_hits_soft_cap: int = 2000    # safety cap for UX
+    similarity_threshold: float = 0.35
+    enable_rank_trace: bool = True
+    rank_weights: tuple[float, float] = (0.5, 0.5)  # (lexical, vector)
+
+@dataclass(frozen=True)  
+class ThoroughModeConfig:
+    similarity_threshold: float = 0.25  # lower threshold for recall
+    max_hits_hard_cap: int | None = None  # no cap by default
+    pagination_default_limit: int = 100
+    pagination_max_limit: int = 500
+    # Ranking: deterministic by (document_id, chunk_id)
+
+THOROUGH_MODE_TRIGGERS = frozenset([
+    "thorough", "exhaustive", "everything", "all", "complete",
+    "don't miss", "comprehensive", "full search", "every mention",
+    "all occurrences", "entire corpus", "nothing missed"
+])
+
+def detect_retrieval_mode(utterance: str) -> Literal["conversational", "thorough"]:
+    """Detect mode from utterance. Lowest precedence in mode resolution."""
+    ...
+
+def resolve_retrieval_mode(
+    ui_toggle: str | None,
+    primitive_mode: str | None, 
+    utterance: str
+) -> tuple[Literal["conversational", "thorough"], str]:
+    """
+    Resolve final mode with precedence: ui_toggle > primitive > trigger > default.
+    Returns (mode, source) where source is 'ui_toggle'|'primitive'|'trigger_phrase'|'default'.
+    """
+    if ui_toggle:
+        return ui_toggle, "ui_toggle"
+    if primitive_mode:
+        return primitive_mode, "primitive"
+    detected = detect_retrieval_mode(utterance)
+    if detected == "thorough":
+        return "thorough", "trigger_phrase"
+    return "conversational", "default"
+
+--------------------------------------------------------------------------------
+
+2.2 PHASE 2 TESTS
+-----------------
+
+Add to tests/test_primitives_compilation.py:
+
+  1. test_detect_mode_conversational_default - empty/normal queries
+  2. test_detect_mode_thorough_triggers - "exhaustive", "everything", etc.
+  3. test_resolve_mode_precedence_ui_toggle - UI toggle wins over all
+  4. test_resolve_mode_precedence_primitive - primitive beats trigger phrase
+  5. test_resolve_mode_precedence_trigger - trigger phrase beats default
+  6. test_resolve_mode_returns_source - source field is correct
+  7. test_config_defaults_immutable - frozen dataclass behavior
+  8. test_threshold_ranges_valid - thresholds appropriate for similarity range
+  9. test_vector_config_cosine_semantics - similarity transform correct
+
+Exit Criteria: All config tests pass, mode detection works for 10+ test phrases,
+precedence logic verified.
+
+================================================================================
+PHASE 3: NEW PRIMITIVES (Days 3-4)
+================================================================================
+
+3.1 PRIMITIVE CATEGORIES
+------------------------
+
+Important distinction:
+- Scope primitives: Constrain retrieval (filter chunks) - EXCEPT_ENTITIES, ENTITY_ROLE
+- Analysis primitives: Operate on result sets, don't constrain retrieval - RELATED_ENTITIES
+- Control primitives: Configure execution behavior - SET_RETRIEVAL_MODE, SET_SIMILARITY_THRESHOLD
+
+--------------------------------------------------------------------------------
+
+3.2 ADD PRIMITIVES TO retrieval/primitives.py
+---------------------------------------------
+
+CONTROL PRIMITIVES:
+
+@dataclass
+class SetRetrievalModePrimitive:
+    """Control: Sets retrieval mode for the query."""
+    type: Literal["SET_RETRIEVAL_MODE"] = "SET_RETRIEVAL_MODE"
+    mode: str = "conversational"  # "conversational" | "thorough"
+    
+    def __post_init__(self):
+        if self.mode not in ("conversational", "thorough"):
+            raise ValueError(f"Invalid mode: {self.mode}")
+
+@dataclass
+class SetSimilarityThresholdPrimitive:
+    """Control: Sets minimum similarity for vector results."""
+    type: Literal["SET_SIMILARITY_THRESHOLD"] = "SET_SIMILARITY_THRESHOLD"
+    threshold: float = 0.35
+    
+    def __post_init__(self):
+        # Note: range is [-1, 1] for cosine similarity, not [0, 1]
+        if not -1.0 <= self.threshold <= 1.0:
+            raise ValueError(f"Threshold must be in [-1.0, 1.0], got {self.threshold}")
+
+--------------------------------------------------------------------------------
+
+SCOPE PRIMITIVES:
+
+@dataclass
+class EntityRolePrimitive:
+    """Scope: Filter to chunks mentioning entities of a specific type."""
+    type: Literal["ENTITY_ROLE"] = "ENTITY_ROLE"
+    role: str = ""  # "person" | "org" | "place"
+    entity_id: Optional[int] = None  # if provided, asserts entity has this role
+    
+    def __post_init__(self):
+        valid_roles = ("person", "org", "place", "event", "document")
+        if self.role not in valid_roles:
+            raise ValueError(f"Invalid role: {self.role}")
+
+@dataclass
+class ExceptEntitiesPrimitive:
+    """Scope: Exclude chunks mentioning any of the specified entities."""
+    type: Literal["EXCEPT_ENTITIES"] = "EXCEPT_ENTITIES"
+    entity_ids: List[int] = field(default_factory=list)
+    
+    def __post_init__(self):
+        if not self.entity_ids:
+            raise ValueError("EXCEPT_ENTITIES requires at least one entity_id")
+        if any(eid <= 0 for eid in self.entity_ids):
+            raise ValueError("All entity_ids must be positive integers")
+
+--------------------------------------------------------------------------------
+
+ANALYSIS PRIMITIVES (operate on result sets, not retrieval scope):
+
+@dataclass
+class RelatedEntitiesPrimitive:
+    """
+    Analysis: Find entities that co-occur with a target entity.
+    
+    NOTE: This is an ANALYSIS primitive, not a scope primitive.
+    It doesn't constrain retrieval - it asks for an aggregation over
+    the result set or a specified scope.
+    """
+    type: Literal["RELATED_ENTITIES"] = "RELATED_ENTITIES"
+    entity_id: int = 0
+    window: str = "document"  # "chunk" | "document"
+    top_n: int = 20
+    result_set_id: Optional[int] = None  # if provided, scope to this result set
+    
+    def __post_init__(self):
+        if self.entity_id <= 0:
+            raise ValueError("RELATED_ENTITIES requires positive entity_id")
+        if self.window not in ("chunk", "document"):
+            raise ValueError(f"Invalid window: {self.window}")
+
+--------------------------------------------------------------------------------
+
+3.3 UPDATE COMPILATION
+----------------------
+
+In compile_primitives_to_scope() add handling for:
+
+ExceptEntitiesPrimitive - Use NOT EXISTS for performance and null-safety:
+
+  # WRONG (slower, null-unsafe):
+  # c.id NOT IN (SELECT chunk_id FROM entity_mentions WHERE entity_id = ANY(%s))
+
+  # CORRECT:
+  WHERE NOT EXISTS (
+      SELECT 1 FROM entity_mentions em 
+      WHERE em.chunk_id = c.id 
+      AND em.entity_id = ANY(%(except_entity_ids)s)
+  )
+
+Ensure index exists: (entity_id, chunk_id) order is likely better since we're
+filtering by entity_id first.
+
+EntityRolePrimitive:
+
+  WHERE EXISTS (
+      SELECT 1 FROM entity_mentions em
+      JOIN entities e ON em.entity_id = e.id
+      WHERE em.chunk_id = c.id
+      AND e.entity_type = %(entity_role)s
+  )
+
+RelatedEntitiesPrimitive - Not compiled to scope; handled separately in execution
+as an aggregation query.
+
+--------------------------------------------------------------------------------
+
+3.4 PHASE 3 TESTS
+-----------------
+
+Extend tests/test_primitives_compilation.py:
+
+  1. test_set_retrieval_mode_validation - valid/invalid modes
+  2. test_set_similarity_threshold_validation - range [-1.0, 1.0] (cosine)
+  3. test_related_entities_validation - positive entity_id, valid window
+  4. test_related_entities_is_analysis_primitive - not in scope compilation
+  5. test_entity_role_validation - valid roles
+  6. test_except_entities_validation - non-empty list, positive ids
+  7. test_except_entities_uses_not_exists - SQL uses NOT EXISTS pattern
+  8. test_entity_role_compilation - SQL with JOIN correct
+  9. test_primitive_serialization_roundtrip - dict -> primitive -> dict
+  10. test_canonical_ordering_new_primitives - deterministic order
+
+Create tests/test_new_primitives_integration.py (requires DB):
+
+  1. test_except_entities_excludes_chunks - actual exclusion works
+  2. test_except_entities_performance - NOT EXISTS is efficient
+  3. test_entity_role_filters_by_type - person/org/place filtering
+  4. test_related_entities_returns_cooccurring - aggregation correct
+  5. test_related_entities_respects_window - chunk vs document scope
+  6. test_related_entities_with_result_set - scoped to existing results
+
+Exit Criteria: All primitive tests pass, serialization roundtrip works, SQL
+compiles correctly, NOT EXISTS pattern verified.
+
+================================================================================
+PHASE 4: SEARCH LAYER REFACTORING (Days 5-7)
+================================================================================
+
+4.1 NEW FUNCTION: vector_search_threshold()
+-------------------------------------------
+
+Add to retrieval/ops.py:
+
+def vector_search_threshold(
+    embedding: list[float],
+    threshold: float,
+    max_hits: int | None = None,
+    scope_sql: str | None = None,
+    scope_params: dict | None = None,
+    vector_config: VectorMetricConfig = DEFAULT_VECTOR_CONFIG,
+) -> tuple[list[dict], int, dict]:
+    """
+    Threshold-based vector search with explicit metric semantics.
+    
+    Args:
+        embedding: Query embedding
+        threshold: Minimum similarity (in transformed space, e.g., [-1, 1])
+        max_hits: Optional cap on results
+        scope_sql: WHERE clause from scope primitives
+        scope_params: Parameters for scope SQL
+        vector_config: Metric configuration for similarity calculation
+        
+    Returns:
+        (results, total_above_threshold, metadata)
+        
+    Note: For cosine distance (<=>) with similarity = 1 - distance:
+        - similarity range is [-1, 1] (can be negative)
+        - threshold of 0.3 means distance <= 0.7
+    """
+    # SQL uses: WHERE (1 - (embedding <=> query)) >= threshold
+    # which is equivalent to: WHERE (embedding <=> query) <= (1 - threshold)
+    max_distance = 1.0 - threshold
+    ...
+
+--------------------------------------------------------------------------------
+
+4.2 RANKING POLICY
+------------------
+
+Critical: Union/intersection yields sets; ranking policy determines order.
+
+IMPORTANT BUG TO AVOID: Never use list(set).index(chunk_id) to compute ranks.
+Converting a set to a list destroys ordering and produces random-ish ranks.
+Always carry ranks explicitly from SQL queries.
+
+Conversational Mode Ranking:
+
+def compute_conversational_rank(
+    score_lex: float | None,
+    score_vec: float | None,
+    chunk_id: int,
+    weights: tuple[float, float] = (0.5, 0.5),
+) -> tuple[float, int]:
+    """
+    Returns (score, tiebreaker) for ORDER BY score DESC, chunk_id ASC.
+    """
+    norm_lex = normalize_lexical_score(score_lex) if score_lex else 0.0
+    norm_vec = normalize_vector_score(score_vec) if score_vec else 0.0
+    combined = weights[0] * norm_lex + weights[1] * norm_vec
+    return (combined, chunk_id)  # chunk_id for deterministic tie-break
+
+Thorough Mode Ranking:
+
+def compute_thorough_rank(document_id: int, chunk_id: int) -> tuple[int, int]:
+    """
+    Deterministic ordering: (document_id, chunk_id).
+    No score-based ranking - keeps exhaustive results neutral.
+    """
+    return (document_id, chunk_id)
+
+--------------------------------------------------------------------------------
+
+4.3 HYBRID RRF IMPLEMENTATION (Critical Correctness)
+----------------------------------------------------
+
+BUG WARNING: The naive approach of using Python list(lex_ids).index(chunk_id)
+is WRONG because sets have no ordering. This produces random ranks and breaks
+RRF.
+
+DEFAULT IMPLEMENTATION: SQL CTE (not Python)
+
+Reasons to prefer SQL CTE:
+- Deterministic (same query = same results)
+- Faster (no large set pulls into Python)
+- Works for both conversational and thorough candidate pools
+- Memory-efficient for large result sets
+
+PRIMARY IMPLEMENTATION: SQL CTE for RRF
+
+WITH lex_ranked AS (
+    SELECT chunk_id, 
+           ROW_NUMBER() OVER (ORDER BY ts_rank_cd(tsv, query) DESC, chunk_id) as rank
+    FROM chunks c, websearch_to_tsquery(%(query)s) query
+    WHERE c.tsv @@ query
+    LIMIT %(lex_limit)s
+),
+vec_ranked AS (
+    SELECT chunk_id,
+           ROW_NUMBER() OVER (ORDER BY embedding <=> %(embedding)s::vector, chunk_id) as rank
+    FROM chunks
+    WHERE (1 - (embedding <=> %(embedding)s::vector)) >= %(threshold)s
+    LIMIT %(vec_limit)s
+),
+combined AS (
+    SELECT COALESCE(l.chunk_id, v.chunk_id) as chunk_id,
+           l.rank as rank_lex,
+           v.rank as rank_vec,
+           1.0 / (%(rrf_k)s + COALESCE(l.rank, 100000)) + 
+           1.0 / (%(rrf_k)s + COALESCE(v.rank, 100000)) as rrf_score
+    FROM lex_ranked l
+    FULL OUTER JOIN vec_ranked v ON l.chunk_id = v.chunk_id
+)
+SELECT *, ROW_NUMBER() OVER (ORDER BY rrf_score DESC, chunk_id) as final_rank
+FROM combined
+ORDER BY rrf_score DESC, chunk_id
+LIMIT %(max_hits)s;
+
+For intersection mode, replace FULL OUTER JOIN with INNER JOIN.
+
+FALLBACK: Python implementation (for debugging or special cases only)
+
+If needed for debugging, a Python fallback exists that:
+- Executes two SQL queries with explicit ROW_NUMBER() ranks
+- Builds rank dicts from SQL results (NOT from set.index())
+- Computes RRF scores in Python
+- Verifies SQL CTE matches Python output in tests
+
+The Python fallback must NEVER use list(set).index() - always carry ranks
+explicitly from the SQL queries.
+
+--------------------------------------------------------------------------------
+
+4.5 PHASE 4 TESTS
+-----------------
+
+Create tests/test_search_layer.py:
+
+Unit tests (mocked embedding):
+  1. test_threshold_filtering - results below threshold excluded
+  2. test_threshold_total_count - count reflects pre-cap total
+  3. test_max_hits_cap_applied - cap limits results
+  4. test_hybrid_union_mode - union combines both sets
+  5. test_hybrid_intersection_mode - intersection requires both
+  6. test_scope_sql_applied - scope filters work with threshold
+
+RRF correctness tests (CRITICAL):
+  7. test_rrf_uses_explicit_ranks - ranks from SQL, NOT set.index()
+  8. test_rrf_rank_stability - same query, same ranks every time
+  9. test_rrf_ranks_from_sql_row_number - ROW_NUMBER() used in queries
+  10. test_rrf_not_found_rank_large - chunks not in list get large rank
+  11. test_rrf_formula_correct - 1/(k+rank_lex) + 1/(k+rank_vec)
+  12. test_rrf_tiebreak_by_chunk_id - deterministic when scores equal
+
+Ranking policy tests:
+  13. test_conversational_ranking_weighted - weights applied correctly
+  14. test_conversational_ranking_tiebreak - chunk_id breaks ties
+  15. test_thorough_ranking_deterministic - document_id, chunk_id order
+  16. test_thorough_ranking_no_scores - ranking ignores scores
+
+Vector semantics tests:
+  17. test_cosine_similarity_transform - 1 - distance formula
+  18. test_negative_similarity_threshold - handles negative similarities
+  19. test_vector_config_logged_in_metadata - metric info in output
+
+Integration tests (requires DB + embeddings):
+  20. test_vector_threshold_real_embeddings - actual similarity search
+  21. test_hybrid_real_query - end-to-end hybrid search
+  22. test_no_cap_thorough_mode - all results returned when cap=None
+  23. test_ranking_stability_integration - same query, same order in DB
+  24. test_sql_rrf_matches_python_rrf - SQL CTE matches Python impl
+
+Exit Criteria: Search functions return correct results, RRF uses explicit ranks
+(NOT set operations), threshold filtering verified, cap behavior correct,
+ranking policies verified for both modes.
+
+================================================================================
+PHASE 5: MATCH TRACE CONSTRUCTION (Days 7-8)
+================================================================================
+
+5.1 LAZY VS EAGER ENRICHMENT STRATEGY
+-------------------------------------
+
+CRITICAL PERFORMANCE ISSUE: Eager enrichment (loading chunk text, scanning for
+phrases in Python, adding filter-pass entries for every chunk) will melt at
+scale.
+
+Solution: Tiered Enrichment
+
+| Tier | When         | What                                     | Cost              |
+|------|--------------|------------------------------------------|-------------------|
+| 0    | All results  | Hot columns from search (scores, ranks)  | O(1) per chunk    |
+| 1    | All results  | Entity IDs from entity_mentions (batch)  | O(N) single query |
+| 2    | Top N only   | Full entity details for LLM synthesis    | N = summ_limit    |
+| 3    | On-demand    | Phrase positions, full text highlights   | Only when expanded|
+
+Filter pass handling: Store once at run level, NOT per-chunk:
+- retrieval_runs.applied_filters JSONB - list of filters applied to query
+- Per-chunk traces only store scope_passed: bool (always TRUE for included)
+- Only store failed_filters if explicitly computing exclusion analysis
+
+HARD RULE: Never load full chunk text for more than summarization_limit chunks
+during execution, even in thorough mode. Thorough mode returns all chunk IDs
+but does NOT do LLM prep work for all of them.
+
+--------------------------------------------------------------------------------
+
+5.2 NEW FILE: retrieval/match_trace.py
+--------------------------------------
+
+Design principle: Split hot (fast query) vs cold (audit) storage. Lazy
+enrichment for expensive details.
+
+@dataclass
+class PositiveHit:
+    """Detail for actual matches (entities, phrases) - stored with positions."""
+    primitive: str
+    hit_type: str  # 'entity_mention', 'phrase_match', 'term_match'
+    details: dict  # positions, entity_id, surface form, etc.
+
+@dataclass
+class MatchTrace:
+    chunk_id: int
+    
+    # Tier 0: Hot columns (always populated, from search results)
+    scope_passed: bool = True       # always TRUE for included results
+    in_lexical: bool
+    in_vector: bool
+    score_lexical: float | None
+    score_vector: float | None
+    score_hybrid: float | None
+    vector_distance: float | None
+    vector_similarity: float | None
+    rank: int | None
+    rank_trace: dict | None
+    
+    # Tier 1: Entity IDs (cheap batch query, always populated)
+    matched_entity_ids: list[int]
+    
+    # Tier 2: Summarization details (only for top N chunks)
+    matched_phrases: list[str] | None
+    entity_details: list[dict] | None
+    
+    # Tier 3: On-demand details (NOT stored, computed on request)
+    # phrase_positions, full_highlight, context_window
+    
+    # Cap info
+    was_capped: bool
+    cap_reason: str | None
+    
+    def to_hot_columns(self) -> dict:
+        """Extract typed columns for fast queries (Tier 0 + Tier 1)."""
+        ...
+    
+    def to_audit_jsonb(self) -> dict:
+        """Full details for audit log (if enriched)."""
+        ...
+
+--------------------------------------------------------------------------------
+
+5.3 ENRICHMENT FUNCTIONS
+------------------------
+
+def build_base_traces(results, search_metadata, mode) -> list[MatchTrace]:
+    """Tier 0: Build traces from search results only. No DB queries."""
+    ...
+
+def enrich_tier1_entity_ids(traces, entity_primitive_ids, conn) -> list[MatchTrace]:
+    """Tier 1: Add matched entity IDs from entity_mentions. Single batch query."""
+    chunk_ids = [t.chunk_id for t in traces]
+    
+    query = """
+        SELECT chunk_id, array_agg(DISTINCT entity_id) as entity_ids
+        FROM entity_mentions
+        WHERE chunk_id = ANY(%(chunk_ids)s)
+          AND entity_id = ANY(%(entity_ids)s)
+        GROUP BY chunk_id
+    """
+    ...
+
+def enrich_tier2_for_summarization(traces, primitives, conn, limit) -> list[MatchTrace]:
+    """Tier 2: Full enrichment for top N chunks only (for LLM summarization)."""
+    top_traces = sorted(traces, key=lambda t: t.rank or float('inf'))[:limit]
+    ...
+
+def get_phrase_positions_on_demand(chunk_id, phrases, conn) -> list[dict]:
+    """Tier 3: Compute phrase positions on-demand when UI requests."""
+    # Called via API: GET /chunks/{chunk_id}/highlights?phrases=...
+    # NOT called during execution.
+    ...
+
+--------------------------------------------------------------------------------
+
+5.4 FILTER PASS STORAGE
+-----------------------
+
+Problem: Storing "pass" for every filter on every chunk is repetitive and heavy.
+
+Solution: Store applied filters at the retrieval_run level, not per-chunk.
+
+  ALTER TABLE retrieval_runs ADD COLUMN applied_filters JSONB;
+  -- Example: ["FILTER_DATE_RANGE(1945-01-01,1950-12-31)", "FILTER_COLLECTION(silvermaster)"]
+
+Per-chunk traces only store:
+- scope_passed: bool DEFAULT TRUE - always TRUE for included results
+  (Renamed from filters_passed to clarify semantics)
+- failed_filters: list[str] - only populated if explicitly computing exclusion
+  analysis ("why didn't X appear?"), which is a separate feature
+
+Note: Any chunk in the result set has passed scope filters by definition.
+So scope_passed is redundant but kept for schema clarity. Consider removing
+later if it adds no value.
+
+--------------------------------------------------------------------------------
+
+5.5 PAGE RANGE STABILITY
+------------------------
+
+Issue: string_agg() for page ranges needs deterministic ordering.
+
+  -- WRONG (ambiguous ordering):
+  SELECT string_agg(p.logical_page_label, '-') as page_range ...
+
+  -- CORRECT (explicit ordering by span_order):
+  SELECT string_agg(p.logical_page_label, '-' ORDER BY cp.span_order) as page_range
+  FROM chunk_pages cp
+  JOIN pages p ON cp.page_id = p.id
+  WHERE cp.chunk_id = %(chunk_id)s
+  GROUP BY cp.chunk_id
+
+Ensure span_order exists and is populated correctly in chunk_pages.
+
+--------------------------------------------------------------------------------
+
+5.6 PHASE 5 TESTS
+-----------------
+
+Create tests/test_match_traces.py:
+
+Tier 0 tests (base traces from search results):
+  1. test_build_base_traces_no_db - construction without DB calls
+  2. test_base_traces_have_scores - scores populated from search
+  3. test_base_traces_have_ranks - ranks populated correctly
+  4. test_base_traces_have_membership - in_lexical, in_vector flags
+
+Tier 1 tests (entity ID enrichment):
+  5. test_enrich_tier1_single_query - batch query, not N+1
+  6. test_enrich_tier1_only_matching_entities - filters by primitive entity_ids
+  7. test_enrich_tier1_empty_result - handles chunks with no entity matches
+
+Tier 2 tests (summarization enrichment):
+  8. test_enrich_tier2_respects_limit - only top N chunks enriched
+  9. test_enrich_tier2_loads_entity_details - names, types populated
+  10. test_enrich_tier2_checks_phrases - matched_phrases populated
+  11. test_enrich_tier2_no_positions - phrase positions NOT computed
+
+Tier 3 tests (on-demand):
+  12. test_phrase_positions_on_demand - computed only when requested
+  13. test_phrase_positions_api_endpoint - accessible via API
+  14. test_phrase_positions_multiple_matches - finds all occurrences
+
+Filter storage tests:
+  15. test_filters_at_run_level - applied_filters in retrieval_runs
+  16. test_scope_passed_boolean - per-chunk only has bool (always TRUE)
+
+Performance tests:
+  17. test_tier0_tier1_fast - <100ms for 1000 chunks
+  18. test_tier2_only_top_n - doesn't load all chunk text
+  19. test_tier3_single_chunk - loads only requested chunk
+
+Integration tests (requires DB):
+  20. test_persist_and_retrieve_traces - roundtrip to DB
+  21. test_hot_columns_queryable - int[] indexed correctly
+  22. test_page_range_ordering - span_order used in string_agg
+
+Exit Criteria: Tiered enrichment works correctly, Tier 0+1 fast for large result
+sets, Tier 2 respects limit, Tier 3 computes on-demand only.
+
+================================================================================
+PHASE 6: EXECUTION LAYER UPDATES (Days 9-10)
+================================================================================
+
+6.1 UPDATE scripts/execute_plan.py
+----------------------------------
+
+Modify execute_plan_retrieval() to:
+  1. Resolve retrieval mode with precedence (UI toggle > primitive > trigger > default)
+  2. Load mode-specific config
+  3. Call threshold-based search functions with vector semantics
+  4. Build and persist match traces (keyed by result_set_id)
+  5. Create paginated result set for thorough mode, array for conversational
+
+--------------------------------------------------------------------------------
+
+6.2 RERUN SEMANTICS POLICY
+--------------------------
+
+Critical: Define behavior when execute_plan.py is rerun on same plan.
+
+Policy: Idempotent execution with existing result reuse
+
+def execute_plan_retrieval(plan, conn, mode=None, force_rerun=False) -> dict:
+    """
+    Execute plan retrieval with idempotency.
+    
+    Rerun semantics:
+        1. If plan already has result_set_id and force_rerun=False:
+           - Return existing result_set_id (no new retrieval_run)
+           - Log "reusing existing result set"
+        2. If force_rerun=True:
+           - Create NEW retrieval_run
+           - Create NEW result_set (do not overwrite old)
+           - Old result_set remains for audit trail
+        3. Never duplicate result_set_chunks rows:
+           - Composite PK prevents duplicates
+           - New result_set = new rows, not updates
+    
+    Returns:
+        {
+            "result_set_id": int,
+            "retrieval_run_id": int,
+            "mode": str,
+            "mode_source": str,
+            "total_results": int,
+            "total_before_cap": int,
+            "cap_applied": bool,
+            "threshold_used": float,
+            "vector_metric": str,
+            "traces_count": int,
+            "was_reused": bool,
+        }
+    """
+
+Database constraints ensure safety:
+- result_set_chunks PK prevents duplicate rows
+- result_set_match_traces PK prevents duplicate traces
+- retrieval_runs is append-only (immutable receipt)
+
+--------------------------------------------------------------------------------
+
+6.3 MODE RESOLUTION IN EXECUTION
+--------------------------------
+
+def execute_plan_retrieval(plan, conn, ui_toggle_mode=None, force_rerun=False):
+    # 1. Extract primitive mode if present
+    primitive_mode = extract_set_retrieval_mode(plan["plan_json"]["query"]["primitives"])
+    
+    # 2. Get utterance for trigger detection
+    utterance = plan.get("raw_utterance", "")
+    
+    # 3. Resolve with precedence
+    mode, mode_source = resolve_retrieval_mode(ui_toggle_mode, primitive_mode, utterance)
+    
+    # 4. Load config
+    config = ConversationalModeConfig() if mode == "conversational" else ThoroughModeConfig()
+    vector_config = DEFAULT_VECTOR_CONFIG
+    
+    # 5. Execute search with explicit semantics
+    results, metadata = hybrid_search_scope_intersection(
+        ...,
+        retrieval_mode=mode,
+        vector_config=vector_config,
+    )
+    
+    # 6. Log retrieval_run with full metadata
+    retrieval_run_id = log_retrieval_run(
+        conn=conn,
+        plan_id=plan["id"],
+        mode=mode,
+        mode_source=mode_source,
+        vector_metric=vector_config.metric,
+        vector_operator=vector_config.operator,
+        similarity_transform=vector_config.similarity_transform,
+        similarity_threshold=config.similarity_threshold,
+        total_hits_before_cap=metadata["total_before_cap"],
+        cap_applied=metadata["cap_applied"],
+        ...
+    )
+    ...
+
+--------------------------------------------------------------------------------
+
+6.4 PHASE 6 TESTS
+-----------------
+
+Extend tests/test_plan_execution_e2e.py:
+
+Mode-aware execution tests:
+  1. test_conversational_mode_applies_cap - soft cap respected
+  2. test_thorough_mode_no_cap - all results returned
+  3. test_mode_detection_from_utterance - trigger phrases work
+  4. test_mode_override_from_primitive - SET_RETRIEVAL_MODE works
+  5. test_mode_override_from_ui_toggle - UI toggle beats primitive
+  6. test_mode_source_logged - mode_source field correct
+  7. test_traces_persisted_on_execution - traces in DB after run
+  8. test_paginated_result_set_created - thorough mode uses chunks table
+  9. test_execution_returns_full_metadata - all fields present
+
+Rerun semantics tests:
+  10. test_rerun_reuses_existing_result - idempotent by default
+  11. test_rerun_with_force_creates_new - force_rerun creates new result_set
+  12. test_rerun_no_duplicate_rows - PK constraints enforced
+  13. test_multiple_executions_audit_trail - old result_sets preserved
+
+Create tests/test_execution_smoke.py:
+
+End-to-end smoke tests:
+  1. test_conversational_full_flow - plan -> execute -> result with traces
+  2. test_thorough_full_flow - plan -> execute -> paginated results
+  3. test_mode_switch_within_session - both modes in same session
+  4. test_rerun_idempotency - same plan, same result
+
+Exit Criteria: Both modes execute correctly, traces persisted, metadata accurate,
+rerun semantics verified.
+
+================================================================================
+PHASE 7: API LAYER (Days 11-12)
+================================================================================
+
+7.1 STANDARD METADATA IN ALL RESPONSES
+--------------------------------------
+
+Every endpoint must include execution context so UI never has to infer:
+
+class ResultSetMetadata(BaseModel):
+    """Standard metadata included in all result set responses."""
+    result_set_id: int
+    retrieval_run_id: int
+    mode: str  # "conversational" | "thorough"
+    mode_source: str  # "ui_toggle" | "primitive" | "trigger_phrase" | "default"
+    total_hits: int
+    total_hits_before_cap: int
+    cap_applied: bool
+    threshold_used: float
+    vector_metric: str  # "cosine" | "l2" | "ip"
+
+--------------------------------------------------------------------------------
+
+7.2 NEW ENDPOINTS IN backend/app/routes/results.py
+--------------------------------------------------
+
+PAGINATION ENDPOINT WITH CURSOR SUPPORT:
+
+@router.get("/result-sets/{result_set_id}/chunks")
+async def get_result_set_chunks_paginated(
+    result_set_id: int,
+    offset: int = Query(None, ge=0),        # Offset pagination
+    limit: int = Query(100, ge=1, le=500),
+    after_rank: int = Query(None, ge=0),    # Cursor pagination
+) -> ChunksResponse:
+    """
+    Paginated chunk retrieval with dual pagination modes.
+    
+    Offset pagination: ?offset=0&limit=100
+        - Simple, familiar
+        - Slows down as offset grows (O(offset) scan)
+        - Fine for small result sets
+        
+    Cursor pagination: ?after_rank=500&limit=100
+        - Scalable for large result sets
+        - Uses (result_set_id, rank) index efficiently
+        - Required for thorough mode with 10k+ results
+        
+    If both offset and after_rank provided, after_rank takes precedence.
+    """
+
+class ChunksResponse(BaseModel):
+    meta: ResultSetMetadata
+    chunks: list[ChunkItem]
+    pagination: PaginationInfo
+
+class PaginationInfo(BaseModel):
+    offset: int | None
+    after_rank: int | None
+    limit: int
+    has_more: bool
+    next_cursor: int | None  # rank of last item, use as after_rank
+
+--------------------------------------------------------------------------------
+
+MATCH TRACES ENDPOINT:
+
+@router.get("/result-sets/{result_set_id}/match-traces")
+async def get_match_traces(
+    result_set_id: int,
+    chunk_ids: list[int] = Query(None),
+    include_audit: bool = Query(False),
+) -> MatchTracesResponse:
+    """
+    Get match traces explaining why chunks surfaced.
+    
+    Default: returns hot columns only (fast).
+    With include_audit=True: returns full primitive_matches JSONB.
+    """
+
+class MatchTraceItem(BaseModel):
+    chunk_id: int
+    matched_entity_ids: list[int]
+    matched_phrases: list[str]
+    scope_passed: bool              # always TRUE for included results
+    in_lexical: bool
+    in_vector: bool
+    scores: ScoreBreakdown
+    rank: int | None
+    rank_explanation: str | None
+    primitive_matches: list[dict] | None  # only if include_audit=True
+    # Note: applied_filters is at run level, not per-chunk
+
+--------------------------------------------------------------------------------
+
+TIER 3: ON-DEMAND HIGHLIGHTS ENDPOINT:
+
+@router.get("/chunks/{chunk_id}/highlights")
+async def get_chunk_highlights(
+    chunk_id: int,
+    phrases: list[str] = Query(...),        # required
+    context_chars: int = Query(50, ge=0, le=200),
+    case_sensitive: bool = Query(False),    # default case-insensitive
+) -> HighlightsResponse:
+    """
+    Tier 3: Compute phrase positions on-demand.
+    
+    Called when user expands a chunk in the UI, NOT during retrieval.
+    Loads single chunk text and finds all phrase occurrences.
+    
+    This is the ONLY place phrase positions are computed.
+    
+    Behavior specifications:
+    - Case-insensitive by default (case_sensitive=False)
+    - Returns ALL occurrences of each phrase, not just first
+    - Overlapping matches: each phrase matched independently, overlaps allowed
+    - Multiple phrases: matches ordered by position (start ASC), not by phrase
+    - Context window: context_chars before and after match, capped at chunk bounds
+    - Context never exceeds 200 chars to prevent massive responses
+    """
+
+class HighlightMatch(BaseModel):
+    phrase: str
+    start: int          # character offset in chunk text
+    end: int            # character offset (exclusive)
+    context: str        # snippet with context_chars before/after
+
+class HighlightsResponse(BaseModel):
+    chunk_id: int
+    text_length: int
+    matches: list[HighlightMatch]  # ordered by start position
+
+--------------------------------------------------------------------------------
+
+ENTITY AGGREGATION ENDPOINTS:
+
+@router.get("/result-sets/{result_set_id}/entities")
+async def get_result_set_entities(
+    result_set_id: int,
+    limit: int = Query(50, ge=1, le=200),
+    entity_type: str = Query(None),
+) -> EntitiesResponse:
+    """Top entities mentioned in this result set."""
+
+@router.get("/result-sets/{result_set_id}/co-mentions")
+async def get_co_mentioned_entities(
+    result_set_id: int,
+    entity_id: int,
+    window: str = Query("document", regex="^(chunk|document)$"),
+    limit: int = Query(20, ge=1, le=100),
+) -> CoMentionsResponse:
+    """Entities that co-occur with target entity within result set."""
+
+--------------------------------------------------------------------------------
+
+7.3 PHASE 7 TESTS
+-----------------
+
+Create tests/test_api_endpoints.py:
+
+Pagination tests:
+  1. test_offset_pagination_works - offset/limit params work
+  2. test_cursor_pagination_works - after_rank param works
+  3. test_cursor_beats_offset - after_rank takes precedence
+  4. test_cursor_pagination_scalable - efficient at high offsets
+  5. test_has_more_flag_correct - true when more results exist
+  6. test_next_cursor_returned - next_cursor for continuation
+
+Metadata tests:
+  7. test_all_responses_have_meta - ResultSetMetadata present
+  8. test_meta_includes_mode - mode field populated
+  9. test_meta_includes_cap_info - cap_applied, total_before_cap
+  10. test_meta_includes_threshold - threshold_used field
+
+Match trace tests:
+  11. test_traces_hot_columns_default - fast response without audit
+  12. test_traces_with_audit - include_audit=True returns JSONB
+  13. test_traces_filter_by_chunk - chunk_ids filter works
+  14. test_rank_explanation_readable - human-readable string
+
+On-demand highlights tests (Tier 3):
+  15. test_highlights_computes_positions - phrase positions returned
+  16. test_highlights_multiple_matches - finds all occurrences
+  17. test_highlights_context_window - context_chars respected
+  18. test_highlights_case_insensitive - matches regardless of case
+  19. test_highlights_single_chunk_load - only loads one chunk
+
+Entity tests:
+  20. test_entities_aggregation - top entities returned
+  21. test_entities_type_filter - entity_type filter works
+  22. test_co_mentions_chunk_window - chunk-level co-occurrence
+  23. test_co_mentions_document_window - document-level co-occurrence
+
+Error handling:
+  24. test_404_on_missing_result_set - error handling
+  25. test_400_on_invalid_params - validation errors
+  26. test_404_on_missing_chunk - highlights endpoint
+
+Exit Criteria: All endpoints return correct data with standard metadata, both
+pagination modes work, cursor pagination efficient at scale, on-demand
+highlights computed correctly.
+
+================================================================================
+PHASE 8: PLANNER INTEGRATION (Days 13-14)
+================================================================================
+
+8.1 MODE RESOLUTION IN PLANNER
+------------------------------
+
+Important: Planner should NOT override explicit UI toggle. Mode precedence:
+
+  1. UI toggle (user clicked "Thorough" button) -> highest priority
+  2. SET_RETRIEVAL_MODE primitive in plan -> second priority  
+  3. Trigger phrase detection -> third priority
+  4. Default (conversational) -> lowest priority
+
+Planner behavior:
+- Planner can emit SET_RETRIEVAL_MODE primitive based on query analysis
+- But if UI toggle is set, execution layer ignores planner's primitive
+- Planner should NOT decide mode purely from triggers if UI toggle exists
+
+--------------------------------------------------------------------------------
+
+8.2 UPDATE PLANNER PROMPTS
+--------------------------
+
+Add retrieval mode guidance to backend/app/services/planner.py:
+
+PLANNER_MODE_GUIDANCE = """
+## Retrieval Modes
+
+You may emit SET_RETRIEVAL_MODE("conversational" | "thorough") to suggest a mode.
+However, if the user has explicitly selected a mode via UI, that takes precedence.
+
+### When to suggest "thorough":
+- User says "everything", "exhaustive", "all mentions", "don't miss anything"
+- User explicitly asks for comprehensive results
+- Query is about gathering complete evidence
+
+### When to suggest "conversational" (or omit primitive):
+- Typical questions: "tell me about X", "what happened when Y"
+- User wants quick answers with explanations
+- Query is exploratory rather than exhaustive
+
+### New Primitives Available:
+
+RELATED_ENTITIES(entity_id, window="document", top_n=20)
+  - Analysis primitive: finds entities co-occurring with target
+  - Use for: "who else appears with X", "related people"
+  
+ENTITY_ROLE(role="person|org|place", entity_id=None)
+  - Scope primitive: filter to entities of a type
+  - Use for: "organizations mentioned", "places in these documents"
+  
+EXCEPT_ENTITIES([entity_ids])
+  - Scope primitive: exclude chunks mentioning these entities
+  - Use for: "show me X but not Y", "exclude mentions of Z"
+
+SET_SIMILARITY_THRESHOLD(threshold)
+  - Control primitive: set minimum vector similarity
+  - Default: 0.35 (conversational), 0.25 (thorough)
+  - Use for: tuning precision/recall tradeoff
+"""
+
+--------------------------------------------------------------------------------
+
+8.3 EVIDENCE BUNDLE RESPONSE FORMAT
+-----------------------------------
+
+Update synthesis prompts to use evidence bundles with match trace context:
+
+SYNTHESIS_PROMPT = """
+You are synthesizing an answer based on retrieved evidence bundles.
+
+## Evidence Bundle Format
+Each bundle contains:
+- chunk_id: Unique identifier for citation
+- page_range: Source pages (e.g., "pp. 23-25")
+- snippet: Relevant text excerpt
+- matched_entities: Entities that matched in this chunk
+- matched_phrases: Phrases that matched
+- why_surfaced: Brief explanation (from rank_trace)
+
+## Response Requirements
+1. Answer the question directly
+2. Cite evidence inline using [chunk_id] format
+3. For each major claim, reference supporting bundles
+4. Include "Sources" section with:
+   - [chunk_id]: document, pages - brief description
+
+## Example
+Based on the evidence, Silvermaster coordinated operations [c_12345].
+The network included Treasury employees [c_12346, c_12347].
+
+**Why these sources surfaced:**
+- [c_12345]: Matched entity "Silvermaster" + phrase "coordination"
+- [c_12346]: Matched entities "Silvermaster", "White" in same document
+
+**Sources:**
+- [c_12345]: Silvermaster file, pp. 23-25 - describes coordination role
+- [c_12346]: Treasury memo, pp. 1-2 - names department members
+"""
+
+--------------------------------------------------------------------------------
+
+8.4 PHASE 8 TESTS
+-----------------
+
+Extend tests/test_plan_query_llm_provenance.py:
+
+Mode precedence tests:
+  1. test_ui_toggle_beats_planner_primitive - UI wins
+  2. test_planner_primitive_used_without_toggle - primitive respected
+  3. test_trigger_detection_without_primitive - fallback works
+
+New primitive generation:
+  4. test_planner_emits_related_entities - analysis primitive used
+  5. test_planner_emits_except_entities - negative filter used
+  6. test_planner_emits_entity_role - type filter used
+
+Evidence bundle synthesis:
+  7. test_synthesis_includes_citations - [chunk_id] format
+  8. test_synthesis_includes_why_surfaced - match context included
+  9. test_synthesis_sources_section - sources listed correctly
+  10. test_synthesis_uses_match_traces - trace info in output
+
+Exit Criteria: Planner respects mode precedence, generates new primitives
+correctly, synthesis uses evidence bundles with match trace context.
+
+================================================================================
+FILE CHANGES SUMMARY
+================================================================================
+
+| File                                  | Action | Description                          |
+|---------------------------------------|--------|--------------------------------------|
+| migrations/0042_match_traces.sql      | Create | Match traces with hot columns + JSONB|
+| migrations/0043_retrieval_modes.sql   | Create | Mode + vector semantics + applied_filters |
+| migrations/0044_paginated_results.sql | Create | result_set_chunks + UNIQUE(rank)     |
+| retrieval/config.py                   | Create | Mode configs, vector semantics       |
+| retrieval/primitives.py               | Modify | Add 5 new primitives                 |
+| retrieval/ops.py                      | Modify | Threshold search, correct RRF        |
+| retrieval/match_trace.py              | Create | Tiered enrichment (0/1/2/3)          |
+| scripts/execute_plan.py               | Modify | Mode-aware execution + rerun         |
+| backend/app/routes/results.py         | Modify | 5 endpoints with cursor pagination   |
+| backend/app/services/planner.py       | Modify | Mode guidance, new primitives        |
+| tests/test_schema_phase1.py           | Create | Schema tests (10 cases)              |
+| tests/test_search_layer.py            | Create | Search + RRF tests (24 cases)        |
+| tests/test_match_traces.py            | Create | Tiered enrichment tests (22 cases)   |
+| tests/test_new_primitives_integration.py | Create | Primitive tests (6 integration)   |
+| tests/test_api_endpoints.py           | Create | API tests + highlights (26 cases)    |
+| tests/test_primitives_compilation.py  | Modify | New primitive unit tests (10 cases)  |
+| tests/test_plan_execution_e2e.py      | Modify | Mode + rerun tests (13 cases)        |
+| tests/test_execution_smoke.py         | Create | End-to-end smoke tests (4 cases)     |
+
+================================================================================
+RISK MITIGATION
+================================================================================
+
+1.  Large result sets: Cursor pagination (after_rank) efficient at any offset
+2.  Vector semantics: Explicit metric/operator/transform stored and logged
+3.  Negative similarity: Thresholds account for [-1, 1] cosine range
+4.  JSONB bloat: Hot columns for fast queries; GIN index deferred if write-heavy
+5.  Offset pagination slowdown: Cursor is the scalable path
+6.  Threshold tuning: Conservative defaults (0.35/0.25), exposed as primitives
+7.  Migration safety: All migrations idempotent with IF NOT EXISTS checks
+8.  Backward compatibility: Existing plans default to conversational mode
+9.  Rerun idempotency: Explicit policy - reuse existing unless force_rerun=True
+10. Mode precedence bugs: Clear 4-level precedence, logged as mode_source
+11. Index strategy: (entity_id, chunk_id) for NOT EXISTS; (result_set_id, rank) for cursor
+12. Filter trace bloat: Compact format at run level, not per-chunk
+13. RRF correctness: SQL CTE is default impl; ranks never from Python set.index()
+14. Eager enrichment: Tiered approach - only load chunk text for top N or on-demand
+15. Page range ordering: Explicit ORDER BY span_order in string_agg()
+16. Audit trail integrity: result_sets.retrieval_run_id is NOT NULL; never
+    create result_set without a run; optional redundant column in traces
+17. NULL document_id: Sort LAST with sentinel (2147483647), log warning, don't
+    exclude from thorough results; investigate as data quality issue
+18. UI threshold confusion: Internal [-1,1], but UI can present as slider with
+    transform; store both raw_threshold and effective_threshold
+
+================================================================================
+TEST SUMMARY BY PHASE
+================================================================================
+
+| Phase | New Test File                      | Count | Focus                        |
+|-------|------------------------------------|-------|------------------------------|
+| 1     | test_schema_phase1.py              | 10    | Tables, indexes, constraints |
+| 2     | (extends test_primitives_comp...)  | 9     | Mode detection, precedence   |
+| 3     | test_new_primitives_integration.py | 16    | Primitives unit + integration|
+| 4     | test_search_layer.py               | 24    | Search, RRF correctness      |
+| 5     | test_match_traces.py               | 22    | Tiered enrichment, lazy load |
+| 6     | test_execution_smoke.py            | 17    | Mode execution, rerun        |
+| 7     | test_api_endpoints.py              | 26    | Pagination, metadata, highlights |
+| 8     | (extends test_plan_query_llm...)   | 10    | Precedence, synthesis        |
+| TOTAL |                                    | 134   |                              |
+
+================================================================================
+END OF PLAN
+================================================================================

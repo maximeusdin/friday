@@ -103,6 +103,22 @@ log.info(
     COGNITO_CLIENT_ID or "EMPTY",
 )
 
+# --- Startup validation: catch redirect_uri misconfig early ---
+_EXPECTED_PROD_REDIRECT = "https://api.fridayarchive.org/auth/oauth/cognito/callback"
+if REDIRECT_URI and ("localhost" in REDIRECT_URI or "127.0.0.1" in REDIRECT_URI):
+    if COOKIE_DOMAIN and "fridayarchive" in COOKIE_DOMAIN:
+        log.warning(
+            "AUTH_MISCONFIG: REDIRECT_URI=%r looks like localhost but COOKIE_DOMAIN=%r suggests prod. "
+            "Prod must use COGNITO_REDIRECT_URI=%r",
+            REDIRECT_URI, COOKIE_DOMAIN, _EXPECTED_PROD_REDIRECT,
+        )
+elif REDIRECT_URI and REDIRECT_URI.rstrip("/") != _EXPECTED_PROD_REDIRECT.rstrip("/"):
+    log.warning(
+        "AUTH_MISCONFIG: COGNITO_REDIRECT_URI=%r differs from expected prod %r. "
+        "Ensure it matches Cognito app client allowed callback URLs.",
+        REDIRECT_URI, _EXPECTED_PROD_REDIRECT,
+    )
+
 _JWKS: dict | None = None
 _JWKS_FETCHED_AT = 0.0
 _JWKS_TTL_SECONDS = 3600
@@ -142,14 +158,16 @@ async def _get_jwks() -> dict:
         return _JWKS
 
 
-def _set_state_cookie(resp: Response, state: str, cookie_domain: str | None = None) -> None:
+def _set_state_cookie(
+    resp: Response, state: str, cookie_domain: str | None = None, secure: bool | None = None
+) -> None:
     domain = cookie_domain if cookie_domain else COOKIE_DOMAIN
-    # For localhost, omit domain so cookie works for the host
+    secure_val = secure if secure is not None else COOKIE_SECURE
     kwargs = {
         "max_age": STATE_COOKIE_MAX_AGE,
         "httponly": True,
-        "secure": COOKIE_SECURE,
-        "samesite": COOKIE_SAMESITE,
+        "secure": secure_val,
+        "samesite": "lax" if not secure_val else COOKIE_SAMESITE,
         "path": "/",
     }
     if domain and domain != "localhost":
@@ -159,7 +177,9 @@ def _set_state_cookie(resp: Response, state: str, cookie_domain: str | None = No
 
 def _pop_state_cookie(resp: Response, cookie_domain: str | None = None) -> None:
     domain = cookie_domain if cookie_domain is not None else COOKIE_DOMAIN
-    resp.delete_cookie("oauth_state", domain=domain or None, path="/")
+    # For localhost we set host-only cookie (no domain); delete without domain to match
+    delete_domain = None if domain == "localhost" else (domain or None)
+    resp.delete_cookie("oauth_state", domain=delete_domain, path="/")
 
 
 def _create_app_session(sub: str, email: str | None, exp_seconds: int = SESSION_TTL_SECONDS) -> str:
@@ -183,13 +203,16 @@ def _set_session_cookie(
         "samesite": "lax" if not secure_val else COOKIE_SAMESITE,
         "path": "/",
     }
-    if domain:
+    # Omit domain for localhost (host-only cookie) so it works reliably on dev
+    if domain and domain != "localhost":
         kwargs["domain"] = domain
     resp.set_cookie(SESSION_COOKIE_NAME, session_jwt, **kwargs)
 
 
-def _clear_session_cookie(resp: Response) -> None:
-    resp.delete_cookie(SESSION_COOKIE_NAME, domain=COOKIE_DOMAIN, path="/")
+def _clear_session_cookie(resp: Response, cookie_domain: str | None = None) -> None:
+    domain = cookie_domain if cookie_domain is not None else COOKIE_DOMAIN
+    delete_domain = None if domain == "localhost" else (domain or None)
+    resp.delete_cookie(SESSION_COOKIE_NAME, domain=delete_domain, path="/")
 
 
 def _read_app_session(request: Request) -> dict | None:
@@ -300,7 +323,13 @@ async def auth_oauth_cognito_login(
             detail="Auth not configured." + _auth_config_hint(),
         )
 
-    effective_redirect_uri = (redirect_uri or "").strip() or REDIRECT_URI
+    # Production: ignore query param, always use env — guarantees authorize/token match.
+    host = (request.url.hostname or "").lower()
+    is_prod = host not in ("localhost", "127.0.0.1")
+    if is_prod:
+        effective_redirect_uri = REDIRECT_URI
+    else:
+        effective_redirect_uri = (redirect_uri or "").strip() or REDIRECT_URI
     state = secrets.token_urlsafe(32)
 
     params = {
@@ -313,11 +342,10 @@ async def auth_oauth_cognito_login(
     url = f"{COGNITO_DOMAIN}/oauth2/authorize?{urlencode(params)}"
     resp = RedirectResponse(url=url, status_code=302)
 
-    # For localhost callback, use cookie domain that works (omit or localhost)
-    cookie_domain = COOKIE_DOMAIN
-    if "localhost" in effective_redirect_uri or "127.0.0.1" in effective_redirect_uri:
-        cookie_domain = "localhost"  # Ensures cookie is sent when frontend calls backend
-    _set_state_cookie(resp, state, cookie_domain)
+    # For localhost: use host-only cookie with secure=False (HTTP)
+    is_localhost = "localhost" in effective_redirect_uri or "127.0.0.1" in effective_redirect_uri
+    cookie_domain = "localhost" if is_localhost else COOKIE_DOMAIN
+    _set_state_cookie(resp, state, cookie_domain, secure=False if is_localhost else None)
 
     log.info("OAuth login: redirect_uri=%s state=%s…%s",
              effective_redirect_uri, state[:8], state[-4:])
@@ -430,22 +458,24 @@ async def auth_oauth_cognito_callback(request: Request, code: str | None = None,
         )
         raise HTTPException(status_code=400, detail="State mismatch — see server logs")
 
-    # Token exchange: form-encoded body, Basic auth with raw client secret (no hash).
-    # Secret must be exactly what Cognito has; strip whitespace / parse JSON if from Secrets Manager.
-    token_url = f"{COGNITO_DOMAIN}/oauth2/token"
+    # Token exchange: use env redirect_uri so it matches authorize (prod ignores query param).
+    redirect_uri = os.environ.get("COGNITO_REDIRECT_URI") or REDIRECT_URI
+    client_id = os.environ.get("COGNITO_CLIENT_ID") or COGNITO_CLIENT_ID
     client_secret = _get_cognito_client_secret()
+    log.warning("TOKEN_EXCHANGE using redirect_uri=%r client_id=%s", redirect_uri, client_id)
+
+    token_url = f"{COGNITO_DOMAIN}/oauth2/token"
     data = {
         "grant_type": "authorization_code",
-        "client_id": COGNITO_CLIENT_ID,
+        "client_id": client_id,
         "code": code,
-        "redirect_uri": REDIRECT_URI,
+        "redirect_uri": redirect_uri,
     }
-    # Cognito accepts either Basic auth (client_id:client_secret) or client_id+client_secret in body.
-    # We use Basic auth; do not send client_secret in body.
     headers = {"Content-Type": "application/x-www-form-urlencoded"}
-    auth = (COGNITO_CLIENT_ID, client_secret) if client_secret else None
+    auth = (client_id, client_secret) if client_secret else None
 
-    log.info("OAuth callback: exchanging code at %s (client_secret present=%s)", token_url, bool(client_secret))
+    log.info("OAuth callback: exchanging code at %s (client_secret present=%s)",
+             token_url, bool(client_secret))
     async with httpx.AsyncClient(timeout=10) as client:
         r = await client.post(token_url, data=data, headers=headers, auth=auth)
         if r.status_code != 200:
@@ -463,14 +493,24 @@ async def auth_oauth_cognito_callback(request: Request, code: str | None = None,
     email = claims.get("email")
 
     session_jwt = _create_app_session(sub=sub, email=email)
-    resp = RedirectResponse(url=UI_REDIRECT_AFTER_LOGIN, status_code=302)
-    _pop_state_cookie(resp)
-    _set_session_cookie(resp, session_jwt)
+    host = (request.url.hostname or "").lower()
+    is_localhost = host in ("localhost", "127.0.0.1")
+    if is_localhost:
+        redirect_url = os.environ.get("UI_REDIRECT_AFTER_LOGIN", "http://localhost:3000/")
+        if not redirect_url.startswith(("http://localhost", "http://127.0.0.1")):
+            redirect_url = "http://localhost:3000/"
+        cookie_domain, cookie_secure = "localhost", False
+    else:
+        redirect_url = UI_REDIRECT_AFTER_LOGIN
+        cookie_domain, cookie_secure = COOKIE_DOMAIN, COOKIE_SECURE
+    resp = RedirectResponse(url=redirect_url, status_code=302)
+    _pop_state_cookie(resp, cookie_domain="localhost" if is_localhost else None)
+    _set_session_cookie(resp, session_jwt, cookie_domain="localhost" if is_localhost else None, secure=False if is_localhost else None)
     log.info(
         "OAuth callback SUCCESS: sub=%s email=%s → redirect to %s  "
-        "session cookie domain=%s secure=%s samesite=%s",
-        sub, email, UI_REDIRECT_AFTER_LOGIN,
-        COOKIE_DOMAIN, COOKIE_SECURE, COOKIE_SAMESITE,
+        "session cookie domain=%s secure=%s",
+        sub, email, redirect_url,
+        cookie_domain, cookie_secure,
     )
     return resp
 
@@ -496,14 +536,18 @@ async def auth_me(request: Request):
 
 
 @router.post("/logout")
-async def auth_logout_post():
+async def auth_logout_post(request: Request):
     resp = JSONResponse({"ok": True})
-    _clear_session_cookie(resp)
+    host = (request.url.hostname or "").lower()
+    domain = "localhost" if host in ("localhost", "127.0.0.1") else None
+    _clear_session_cookie(resp, cookie_domain=domain)
     return resp
 
 
 @router.get("/logout")
-async def auth_logout_get():
+async def auth_logout_get(request: Request):
     resp = RedirectResponse(url=UI_REDIRECT_AFTER_LOGIN.rstrip("/") or "/", status_code=302)
-    _clear_session_cookie(resp)
+    host = (request.url.hostname or "").lower()
+    domain = "localhost" if host in ("localhost", "127.0.0.1") else None
+    _clear_session_cookie(resp, cookie_domain=domain)
     return resp

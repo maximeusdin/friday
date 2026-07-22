@@ -18,6 +18,59 @@ pdfjs.GlobalWorkerOptions.workerSrc =
 
 const ZOOM_LEVELS = [50, 75, 100, 125, 150, 200];
 
+/**
+ * Wrap a JPEG in a minimal single-page PDF (PDF 1.4, one image XObject drawn
+ * to fill the page). Hand-built so the "Download Page" button needs no PDF
+ * writer dependency. imgW/imgH are the JPEG's pixel dimensions; ptW/ptH the
+ * page size in PDF points (viewport at scale 1).
+ */
+function jpegToSinglePagePdf(jpeg: Uint8Array, imgW: number, imgH: number, ptW: number, ptH: number): Blob {
+  const enc = new TextEncoder();
+  const parts: Uint8Array[] = [];
+  let offset = 0;
+  const offsets: number[] = [];
+  const push = (chunk: string | Uint8Array) => {
+    const bytes = typeof chunk === 'string' ? enc.encode(chunk) : chunk;
+    parts.push(bytes);
+    offset += bytes.length;
+  };
+  const beginObj = (n: number) => {
+    offsets[n] = offset;
+    push(`${n} 0 obj\n`);
+  };
+  const w = ptW.toFixed(2);
+  const h = ptH.toFixed(2);
+
+  push('%PDF-1.4\n');
+  beginObj(1);
+  push('<< /Type /Catalog /Pages 2 0 R >>\nendobj\n');
+  beginObj(2);
+  push('<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n');
+  beginObj(3);
+  push(
+    `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${w} ${h}] ` +
+    '/Contents 4 0 R /Resources << /XObject << /Im0 5 0 R >> >> >>\nendobj\n'
+  );
+  const content = `q ${w} 0 0 ${h} 0 0 cm /Im0 Do Q`;
+  beginObj(4);
+  push(`<< /Length ${content.length} >>\nstream\n${content}\nendstream\nendobj\n`);
+  beginObj(5);
+  push(
+    `<< /Type /XObject /Subtype /Image /Width ${imgW} /Height ${imgH} ` +
+    `/ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length ${jpeg.length} >>\nstream\n`
+  );
+  push(jpeg);
+  push('\nendstream\nendobj\n');
+
+  const xrefStart = offset;
+  push(
+    'xref\n0 6\n0000000000 65535 f \n' +
+    [1, 2, 3, 4, 5].map((n) => `${String(offsets[n]).padStart(10, '0')} 00000 n \n`).join('')
+  );
+  push(`trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n${xrefStart}\n%%EOF`);
+  return new Blob(parts as BlobPart[], { type: 'application/pdf' });
+}
+
 // CSS Custom Highlight API — modern browsers (Chrome/Edge/Safari) let us paint
 // search highlights over the text layer without mutating the DOM.
 const HIGHLIGHT_SUPPORTED =
@@ -435,8 +488,9 @@ export function EvidenceViewer({ evidence, onClose, backLabel = 'Back to Chat' }
   }
 
   const pdfUrl = `${resolvedBaseUrl}#page=${currentPage}`;
-  // Download just the CURRENT page as a high-res PNG, rendered from the
-  // already-loaded PDF (no extra deps; a scanned page is an image anyway).
+  // Download just the CURRENT page as a single-page PDF, rendered from the
+  // already-loaded PDF (no extra deps; a scanned page is an image anyway, so we
+  // wrap a high-res JPEG render in a minimal hand-built PDF container).
   const handleDownloadPage = async () => {
     const pdf = pdfRef.current;
     if (!pdf) return;
@@ -449,15 +503,19 @@ export function EvidenceViewer({ evidence, onClose, backLabel = 'Back to Chat' }
       const ctx = canvas.getContext('2d');
       if (!ctx) return;
       await page.render({ canvasContext: ctx, viewport }).promise;
-      canvas.toBlob((blob) => {
+      // Page size in PDF points = viewport at scale 1
+      const pt = page.getViewport({ scale: 1 });
+      canvas.toBlob(async (blob) => {
         if (!blob) return;
+        const jpeg = new Uint8Array(await blob.arrayBuffer());
+        const pdfBlob = jpegToSinglePagePdf(jpeg, canvas.width, canvas.height, pt.width, pt.height);
         const a = window.document.createElement('a');
         const base = (document?.source_name || 'document').replace(/\.pdf$/i, '');
-        a.href = URL.createObjectURL(blob);
-        a.download = `${base}_page${currentPage}.png`;
+        a.href = URL.createObjectURL(pdfBlob);
+        a.download = `${base}_page${currentPage}.pdf`;
         a.click();
         setTimeout(() => URL.revokeObjectURL(a.href), 5000);
-      }, 'image/png');
+      }, 'image/jpeg', 0.92);
     } catch {
       /* page render failed — full-document download remains available */
     }
@@ -537,7 +595,7 @@ export function EvidenceViewer({ evidence, onClose, backLabel = 'Back to Chat' }
           className="btn-secondary"
           onClick={handleDownloadPage}
           disabled={!numPages}
-          title="Download the current page as a high-resolution image"
+          title="Download the current page as a PDF"
         >
           ↓ Page
         </button>

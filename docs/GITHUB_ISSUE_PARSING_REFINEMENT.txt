@@ -1,0 +1,169 @@
+---
+title: "Enhancement: Refine Concordance Parsing Logic"
+labels: ["enhancement", "parsing", "data-quality"]
+assignees: []
+---
+
+## Summary
+
+Refine the parsing logic in `concordance/ingest_concordance_tab_aware.py` to improve accuracy of entity referent extraction, alias splitting, and text normalization. This enhancement addresses malformed entries in the generated `entity_links.csv` and `entity_aliases.csv` files.
+
+## Background
+
+The concordance ingestion system parses expert-curated concordance index PDFs and extracts structured data into PostgreSQL tables. The current parsing logic handles many edge cases but still produces malformed entries in some scenarios, particularly:
+
+- Referent extraction from cover name entries (extracting person names)
+- Alias splitting for "and" patterns
+- Quote cleanup and normalization
+- Temporal qualifier removal
+- Citation text interference
+
+## Current Issues
+
+### 1. Referent Extraction Problems
+
+**Issue**: Referents contain extra text or incorrect extraction
+
+Examples from `entity_links.csv`:
+- Line 119-120: `"pseudonym Andrey Shevchenko in the United States Soviet intelligence officer Andrey Raina"` → Should be `"Andrey Raina"`
+- Line 126-127: `"KGB officer A. Slavyagin"` → Should be `"A. Slavyagin"`
+- Line 157-158: `"pseudonym Anatoly Gromov Anatoly Gorsky"` → Should be `"Anatoly Gorsky"` (with "Anatoly Gromov" as alias)
+- Line 188-189: `"Frank Oppenheimer circa 1943–1944"` → Should be `"Frank Oppenheimer"`
+- Line 229-230: `"133–34; Vassiliev Yellow Notebook... Vasily Zarubin"` → Should be `"Vasily Zarubin"`
+- Line 121-122: `"Raina in Alexander Vassiliev"` → Should be `"Alexander Raina"` (or "Andrey Raina" based on source)
+
+### 2. Alias Splitting Problems
+
+**Issue**: "And" patterns not split into separate aliases
+
+Examples:
+- Line 177-178: `"then METER and METRE"` → Should be two separate aliases: `"METER"` and `"METRE"`
+- Line 204-205: `"BELKA [SQUIRREL]"` → Should be two separate aliases: `"BELKA"` and `"SQUIRREL"`
+
+### 3. Quote Cleanup Problems
+
+**Issue**: Incomplete or malformed quotes not properly cleaned
+
+Examples:
+- Line 173-174: `"""Glan"` → Should be `"Glan"` (or just `Glan`)
+- Line 217-218: `"then ""Myrna""` → Should be `"Myrna"`
+- Line 229-230: `"""Sonya"` → Should be `"Sonya"`
+
+### 4. Other Normalization Issues
+
+- Line 100-101: `"Leopol or Leopolo Arenal"` → Should separate into `"Leopol Arenal"` and `"Leopolo Arenal"`
+- Line 160-161: `"BAL..."` → Should be `"BAL"` (ellipsis removal)
+- Line 168-170: Entry key `"BARCH (cover name in Venona) Semen Kremer"` → Should extract `"Semen Kremer"` as referent, `"BARCH"` as alias
+- Line 193-194: `"Beigel, Rose. Also know as Rose Arenal..."` → Should extract `"Rose Biegel Arenal"` as canonical name, `"ROSE"` and `"ROZA"` as aliases
+
+## Proposed Solution
+
+### 1. Enhance Referent Extraction Logic
+
+Improve `infer_referent_from_body_start()` function:
+
+- **Better prefix stripping**: Handle job titles after commas (e.g., "A. Slavyagin, KGB officer")
+- **Improved temporal qualifier removal**: Expand patterns to catch all temporal references
+- **Enhanced citation handling**: Better detection and extraction of names from citation-heavy text
+- **"In [Name]" pattern refinement**: Only remove if single word before "in", preserve multi-word names
+- **"Also know as" extraction**: Better handling of malformed entry keys containing "Also know as"
+
+### 2. Improve Alias Splitting
+
+- **"And" pattern detection**: Split "and" patterns before bracket processing
+- **Bracket handling**: Ensure bracket content is properly extracted when splitting
+- **"Then" qualifier**: Strip "then" prefix before processing aliases
+
+### 3. Quote Normalization
+
+- **Multiple quote cleanup patterns**: Handle various combinations of straight quotes, curly quotes, and mixed types
+- **Incomplete quote detection**: Better detection and cleanup of malformed quotes
+
+### 4. Additional Normalization
+
+- **Ellipsis removal**: Strip trailing ellipses from cover names
+- **"Or" pattern handling**: Consider splitting "or" patterns (may require manual review flag)
+- **Entry key parsing**: Better extraction from malformed entry keys
+
+## Testing
+
+### Smoke Test
+
+A comprehensive smoke test has been created at `concordance/test_ingest_smoke.py` that validates all the fixes mentioned above.
+
+**Run the smoke test:**
+```bash
+python concordance/test_ingest_smoke.py
+```
+
+The smoke test includes 17 test cases covering:
+- Referent extraction (prefix stripping, temporal qualifiers, citations)
+- Alias splitting ("and" patterns, brackets)
+- Quote cleanup
+- Ellipsis removal
+- Entity inversion
+
+### Acceptance Criteria
+
+1. ✅ **All smoke test cases pass**: The smoke test should validate that all malformed entries are fixed
+2. ✅ **No regressions**: Existing correctly parsed entries should continue to parse correctly
+3. ✅ **Documentation updated**: The ingestion guide (`docs/concordance_ingestion_guide.md`) should reflect any new parsing logic
+
+## Implementation Notes
+
+### Key Functions to Modify
+
+- `infer_referent_from_body_start()`: Main referent extraction logic
+- Alias processing loop (around line 1954-2020): Handle "and" splitting and quote cleanup
+- `strip_outer_quotes()`: Improve quote normalization
+- Entry key parsing logic: Better handling of malformed keys
+
+### Reference Documentation
+
+- **Ingestion Guide**: `docs/concordance_ingestion_guide.md` - Comprehensive documentation of the ingestion process
+- **Source Data**: `concordance_export/concordance_entries.csv` - Source entries for validation
+- **Current Output**: `concordance_export/entity_links.csv` - Current output showing malformed entries
+
+## Example Test Cases
+
+The smoke test includes these specific examples:
+
+1. **Andrey Raina** - Extract from first sentence, not "was identified as"
+2. **A. Slavyagin** - Strip "KGB officer" prefix
+3. **Anatoly Gorsky** - Extract from pseudonym pattern (last two words)
+4. **Semen Kremer** - Extract from entry key
+5. **Glan** - Strip incomplete quotes
+6. **METER and METRE** - Split into separate aliases
+7. **Frank Oppenheimer** - Strip temporal qualifier
+8. **Ann Sidorovich** - BELKA and SQUIRREL as separate aliases
+9. **Myrna** - Strip "then" qualifier and quotes
+10. **Vasily Zarubin** - Extract from citation text
+11. **Harold Smeltzer** - Strip "starting in" qualifier
+12. **Raina** - Remove "in Alexander Vassiliev" pattern
+13. **Rose Arenal** - Extract from "Also know as"
+14. **BAL** - Strip ellipsis
+15. **Sonya** - Strip incomplete quotes
+
+## Priority
+
+**High** - These issues affect data quality and downstream analysis. The malformed entries make it difficult to:
+- Link entities correctly
+- Search for entities by their aliases
+- Understand entity relationships
+
+## Related Files
+
+- `concordance/ingest_concordance_tab_aware.py` - Main ingestion script
+- `concordance/test_ingest_smoke.py` - Smoke test for validation
+- `docs/concordance_ingestion_guide.md` - Documentation
+- `concordance_export/concordance_entries.csv` - Source data
+- `concordance_export/entity_links.csv` - Current output (shows issues)
+
+## Next Steps
+
+1. Review the smoke test to understand expected behavior
+2. Examine source entries in `concordance_export/concordance_entries.csv` for the problematic cases
+3. Implement fixes incrementally, testing each change
+4. Run smoke test after each fix to validate
+5. Update documentation as needed
+6. Consider adding more test cases if new edge cases are discovered

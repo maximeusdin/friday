@@ -13,6 +13,7 @@ import { scopeFingerprint } from '@/lib/scope';
 import { ClarificationCard } from './ClarificationCard';
 import { ConcordanceCard } from './ConcordanceIndex';
 import { InfoModal, INFO_SECTIONS, type InfoSection } from './InfoModal';
+import { AddToClaudeButton } from './AddToClaude';
 
 const PROGRESS_PHRASES = [
   'Searching archives...',
@@ -274,6 +275,15 @@ export function Conversation({
               </button>
             ))}
           </div>
+        </div>
+
+        <div className="splash-section">
+          <h3 className="splash-section-title">Use Friday inside Claude</h3>
+          <p className="splash-claude-blurb">
+            Add the Friday connector to Claude and research the archives straight from
+            claude.ai — Claude searches Friday, resolves codenames, and cites the documents.
+          </p>
+          <AddToClaudeButton onShowInstructions={() => setSplashInfo('claude')} />
         </div>
 
         <div className="splash-section">

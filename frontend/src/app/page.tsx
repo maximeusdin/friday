@@ -28,6 +28,9 @@ export default function Home() {
   const [authChecked, setAuthChecked] = useState(false);
   const [activeSession, setActiveSession] = useState<Session | null>(null);
   const [activeEvidence, setActiveEvidence] = useState<EvidenceRef | null>(null);
+  // True when the page was opened as a document deep link (/?document_id=…&pdf_page=…)
+  // — the URLs emitted by the MCP connector, search exports, and share links.
+  const [deepLinkedDoc, setDeepLinkedDoc] = useState(false);
 
   // The active session's chat run comes from the shared store (per-session, so runs
   // continue when you switch sessions and several can be in flight at once).
@@ -55,6 +58,24 @@ export default function Home() {
   const SCOPE_DEFAULT = 480;
   const [scopeWidth, setScopeWidth] = useState(SCOPE_DEFAULT);
   const [scopeCollapsed, setScopeCollapsed] = useState(false);
+
+  // Deep link: open the Document Viewer directly from /?document_id=…&pdf_page=….
+  // Plain window.location (not useSearchParams) so the static export needs no
+  // Suspense boundary. Runs once on mount.
+  useEffect(() => {
+    try {
+      const params = new URLSearchParams(window.location.search);
+      const docId = Number(params.get('document_id'));
+      if (Number.isFinite(docId) && docId > 0) {
+        const page = Number(params.get('pdf_page'));
+        setActiveEvidence({
+          document_id: docId,
+          pdf_page: Number.isFinite(page) && page > 0 ? page : 1,
+        });
+        setDeepLinkedDoc(true);
+      }
+    } catch { /* ignore */ }
+  }, []);
 
   // Load collections cache once on mount (retry once after 2s on failure)
   useEffect(() => {
@@ -266,8 +287,11 @@ export default function Home() {
         className="app-container"
         style={{ ['--scope-w' as string]: scopeCollapsed ? '40px' : `${scopeWidth}px` } as React.CSSProperties}
       >
-        {/* Auth gate overlay – blocks interaction when unauthenticated */}
-        {authChecked && !isAuthenticated && (
+        {/* Auth gate overlay – blocks interaction when unauthenticated.
+            Suppressed while a deep-linked document is open: the archive documents
+            are public, and citation links from Claude/exports must render for
+            visitors without an account. Closing the viewer restores the gate. */}
+        {authChecked && !isAuthenticated && !(deepLinkedDoc && showingEvidence) && (
           <div className="auth-overlay">
             <div className="auth-overlay-card">
               <h2>Sign in required</h2>

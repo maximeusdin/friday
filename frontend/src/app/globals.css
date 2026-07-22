@@ -251,6 +251,87 @@ html, body {
   color: #fff;
 }
 
+/* "Add to Claude" connector CTA + instructions */
+.splash-claude-blurb {
+  margin: 0 0 12px;
+  font-size: 14px;
+  color: var(--color-text-secondary, #5f6368);
+  max-width: 560px;
+}
+
+.claude-cta-wrap {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin: 8px 0;
+}
+
+.claude-cta {
+  background: var(--color-accent, #1a73e8);
+  border: 1.5px solid var(--color-accent, #1a73e8);
+  border-radius: 8px;
+  padding: 12px 26px;
+  font-size: 15px;
+  font-weight: 700;
+  color: #fff;
+  cursor: pointer;
+}
+
+.claude-cta:hover {
+  filter: brightness(1.1);
+}
+
+.claude-cta-copied {
+  font-size: 13px;
+  color: var(--color-text-secondary, #5f6368);
+}
+
+.claude-url-box {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 8px 0;
+  padding: 6px 10px;
+  background: var(--color-bg-secondary, #f1f3f4);
+  border: 1px solid var(--color-border, #dadce0);
+  border-radius: 6px;
+  max-width: 560px;
+}
+
+.claude-url-box code {
+  flex: 1;
+  font-size: 13px;
+  overflow-x: auto;
+  white-space: nowrap;
+}
+
+.claude-url-box-inline {
+  display: flex;
+  margin-top: 6px;
+}
+
+.claude-copy-btn {
+  background: var(--color-bg);
+  border: 1px solid var(--color-accent, #1a73e8);
+  border-radius: 5px;
+  padding: 3px 10px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--color-accent, #1a73e8);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.claude-copy-btn:hover {
+  background: var(--color-accent, #1a73e8);
+  color: #fff;
+}
+
+.claude-steps li {
+  margin-bottom: 6px;
+}
+
 .about-overlay {
   position: fixed;
   inset: 0;

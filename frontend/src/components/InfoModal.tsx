@@ -3,19 +3,22 @@
 import { useEffect, useState } from 'react';
 import { api } from '@/lib/api';
 import type { CollectionNode, DocumentNode } from '@/types/api';
+import { ClaudeConnectBody } from './AddToClaude';
 
-export type InfoSection = 'about' | 'howto' | 'chatsearch';
+export type InfoSection = 'about' | 'howto' | 'chatsearch' | 'claude';
 
 export const INFO_SECTIONS: { key: InfoSection; label: string }[] = [
   { key: 'about', label: 'About' },
   { key: 'howto', label: 'How to Use' },
   { key: 'chatsearch', label: 'Chat vs. Search' },
+  { key: 'claude', label: 'Use in Claude' },
 ];
 
 const TITLES: Record<InfoSection, string> = {
   about: 'About Friday',
   howto: 'How to Use Friday',
   chatsearch: 'Chat vs. Search',
+  claude: 'Use Friday in Claude',
 };
 
 /** Shared info modal — opened from the header buttons and the splash cards. */
@@ -33,6 +36,7 @@ export function InfoModal({ section, onClose }: { section: InfoSection; onClose:
           {section === 'about' && <AboutBody />}
           {section === 'howto' && <HowToBody />}
           {section === 'chatsearch' && <ChatVsSearchBody />}
+          {section === 'claude' && <ClaudeConnectBody />}
         </div>
       </div>
     </div>
@@ -85,6 +89,8 @@ function HowToBody() {
       <p><strong>What Friday doesn&apos;t do:</strong> it can&apos;t read text the OCR mangled beyond
         recognition (try Fuzzy in Search for near-miss spellings); it won&apos;t speculate beyond
         the documents; and it doesn&apos;t search outside the indexed collections.</p>
+      <h3>Using Friday in Claude</h3>
+      <ClaudeConnectBody />
     </>
   );
 }

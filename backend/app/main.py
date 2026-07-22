@@ -4,6 +4,7 @@ Friday Research Console - FastAPI Backend
 import os
 import logging
 import sys
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 # Add repo root to path for imports
@@ -52,10 +53,35 @@ if os.getenv("FRIDAY_LOAD_DOTENV") == "1" or _envenv.exists():
     except Exception:
         pass
 
+# MCP connector (optional — requires the `mcp` package; API must not die without it)
+try:
+    from app.mcp_server import mcp as friday_mcp
+
+    _mcp_import_error = None
+except Exception as _e:  # pragma: no cover - import guard
+    friday_mcp = None
+    _mcp_import_error = _e
+
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    # NOTE: with a lifespan set, @app.on_event handlers are ignored — startup
+    # work must be called from here.
+    _startup_env_check()
+    if friday_mcp is not None:
+        # The mounted MCP sub-app's lifespan is not propagated by Starlette;
+        # its session manager must be run from the parent lifespan.
+        async with friday_mcp.session_manager.run():
+            yield
+    else:
+        yield
+
+
 app = FastAPI(
     title="Friday Research Console",
     description="AI research assistant for Cold War archival materials",
     version="0.1.0",
+    lifespan=_lifespan,
 )
 
 log = logging.getLogger("friday")
@@ -69,8 +95,7 @@ def _mask_url(url: str) -> str:
     return re.sub(r"(postgres(?:ql)?://[^:]+:)([^@]+)@", r"\1***@", url)
 
 
-@app.on_event("startup")
-async def startup_event():
+def _startup_env_check():
     db_url = os.getenv("DATABASE_URL", "")
     db_host = os.getenv("DB_HOST", "")
     db_pass = os.getenv("DB_PASS", "")
@@ -175,6 +200,36 @@ app.add_middleware(
 # Register all routers (single place so ECS entrypoint can't miss auth)
 register_routers(app)
 
+# MCP connector: Streamable HTTP endpoint at exactly /mcp (path "/" inside the
+# mounted sub-app). Read-only public-archive tools; see app/mcp_server.py.
+if friday_mcp is not None:
+    friday_mcp.settings.streamable_http_path = "/"
+    app.mount("/mcp", friday_mcp.streamable_http_app())
+
+    class _McpTrailingSlashFix:
+        """Rewrite /mcp -> /mcp/ before routing.
+
+        The mounted MCP sub-app serves "/", so a bare /mcp would otherwise get a
+        307 slash-redirect. Behind the ALB (TLS terminated upstream) that
+        redirect is emitted as http://, which MCP clients follow to port 80 and
+        die with 421. Rewriting the path in-process avoids the redirect entirely.
+        """
+
+        def __init__(self, app):
+            self.app = app
+
+        async def __call__(self, scope, receive, send):
+            if scope["type"] == "http" and scope.get("path") == "/mcp":
+                scope = dict(scope)
+                scope["path"] = "/mcp/"
+                scope["raw_path"] = b"/mcp/"
+            await self.app(scope, receive, send)
+
+    app.add_middleware(_McpTrailingSlashFix)
+    log.info("MCP connector mounted at /mcp")
+else:
+    log.warning("MCP connector NOT mounted (mcp package missing?): %s", _mcp_import_error)
+
 
 @app.get("/health")
 def health():
@@ -201,7 +256,7 @@ def health():
     except Exception as e:
         db_error = str(e)
 
-    out = {"status": "ok", "build": build, "db": {"ok": db_ok}}
+    out = {"status": "ok", "build": build, "db": {"ok": db_ok}, "mcp": {"mounted": friday_mcp is not None}}
     if db_error and not db_ok:
         out["db"]["error"] = db_error[:200]
 
