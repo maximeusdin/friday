@@ -1,0 +1,27 @@
+# Build context hygiene for the root Dockerfile's `COPY . /app`.
+# Without this file the context includes data/ (31+ GB with collection zips),
+# which pushed the image past Fargate's 20 GB ephemeral storage and broke
+# deploys — and .env/.aws were being baked into every ECR image.
+
+# Secrets — never in the image
+.env
+.aws/
+
+# Corpora and derived artifacts — prod serves PDFs/zips from S3, not disk
+data/
+ocr_cache/
+
+# Version control: /health's build SHA comes from the GIT_SHA build arg
+.git/
+
+# Local tooling and caches
+.venv/
+.claude/
+**/__pycache__/
+*.pyc
+.DS_Store
+
+# Frontend build artifacts (deployed separately to S3; backend never reads them)
+frontend/node_modules/
+frontend/out/
+frontend/.next/
