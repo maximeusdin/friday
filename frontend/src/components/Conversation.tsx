@@ -18,6 +18,7 @@ import { ScopeControl } from './ScopeControl';
 import { Welcome } from './Welcome';
 import { Icon } from './ui/Icon';
 import { toast } from './ui/Toast';
+import { useLayout } from '@/lib/useLayout';
 
 /** Shown when the backend reports a step without saying what it is doing.
  *  One honest line beats a rotating set of invented ones: the elapsed timer
@@ -122,6 +123,7 @@ export function Conversation({
 }: ConversationProps) {
   const [input, setInput] = useState('');
   const queryClient = useQueryClient();
+  const layout = useLayout();
   const bottomRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
 
@@ -344,7 +346,9 @@ export function Conversation({
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={(e) => {
-                if (e.key === 'Enter' && !e.shiftKey) {
+                // Desktop: Enter sends, Shift+Enter breaks a line. On a touch keyboard
+                // Enter is "return" and the Ask button sends, as in any messaging app.
+                if (e.key === 'Enter' && !e.shiftKey && !layout.touch) {
                   e.preventDefault();
                   handleSubmit(e);
                 }
@@ -387,7 +391,7 @@ export function Conversation({
           <div className="composer-hint">
             {scopeEmpty
               ? 'No sources selected. Pick collections in the scope menu, or switch back to the entire archive.'
-              : 'Enter to send · Shift + Enter for a new line'}
+              : layout.touch ? '' : 'Enter to send · Shift + Enter for a new line'}
           </div>
         </div>
       </div>

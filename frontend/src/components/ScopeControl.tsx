@@ -341,7 +341,12 @@ function ScopePicker({
             const colDocs = docs[col.id];
             return (
               <div key={col.id}>
-                <div className="scope-row">
+                <div
+                  className="scope-row"
+                  // A finger lands anywhere on the row; only the bare row toggles here,
+                  // the checkbox and labels toggle themselves and the expander expands.
+                  onClick={(e) => { if (e.target === e.currentTarget) toggleCollection(col); }}
+                >
                   <input
                     type="checkbox"
                     checked={st === 'on'}
@@ -362,7 +367,9 @@ function ScopePicker({
                   <label className="scope-row-label" htmlFor={`scope-col-${col.id}`} title={col.title || col.slug}>
                     {col.title || col.slug || `Collection #${col.id}`}
                   </label>
-                  <span className="scope-row-count">{col.document_count}</span>
+                  <label className="scope-row-count" htmlFor={`scope-col-${col.id}`}>
+                    {col.document_count}
+                  </label>
                 </div>
 
                 {isOpen && (
@@ -370,7 +377,11 @@ function ScopePicker({
                     {colDocs == null && <div className="scope-doc-row">Loading…</div>}
                     {colDocs?.length === 0 && <div className="scope-doc-row">No files</div>}
                     {colDocs?.map((doc) => (
-                      <div className="scope-doc-row" key={doc.id}>
+                      <div
+                        className="scope-doc-row"
+                        key={doc.id}
+                        onClick={(e) => { if (e.target === e.currentTarget) toggleDocument(col, doc.id); }}
+                      >
                         <input
                           type="checkbox"
                           id={`scope-doc-${doc.id}`}

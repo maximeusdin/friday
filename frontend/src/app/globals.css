@@ -2862,34 +2862,34 @@ mark {
 
 /* The viewer handles pinch itself; the browser keeps one-finger panning and
    must not page-zoom under two fingers. */
-.app[data-touch='true'] .doc-canvas {
+html[data-touch='true'] .doc-canvas {
   touch-action: pan-x pan-y;
 }
 
-.app[data-touch='true'] .hit-actions,
-.app[data-touch='true'] .sb-item-actions,
-.app[data-touch='true'] .scope-doc-open {
+html[data-touch='true'] .hit-actions,
+html[data-touch='true'] .sb-item-actions,
+html[data-touch='true'] .scope-doc-open {
   opacity: 1;
 }
 
 /* Bigger targets where a finger has to land. */
-.app[data-touch='true'] .scope-row,
-.app[data-touch='true'] .scope-doc-row {
+html[data-touch='true'] .scope-row,
+html[data-touch='true'] .scope-doc-row {
   min-height: var(--control-h);
   padding-top: var(--s-1);
   padding-bottom: var(--s-1);
 }
 
-.app[data-touch='true'] .scope-expand {
+html[data-touch='true'] .scope-expand {
   width: var(--control-h);
   height: var(--control-h);
 }
 
-.app[data-touch='true'] .sb-item {
+html[data-touch='true'] .sb-item {
   min-height: var(--control-h);
 }
 
-.app[data-touch='true'] .cite {
+html[data-touch='true'] .cite {
   padding: 0.15em 0.5em;
 }
 
@@ -3188,9 +3188,11 @@ mark {
   }
 
   .search-tabs {
+    /* A scrolling flex item may shrink below its content; pin it. */
+    flex: 0 0 auto;
     flex-wrap: nowrap;
     overflow-x: auto;
-    padding: var(--s-2) var(--s-3) 0;
+    padding: var(--s-2) var(--s-3) var(--s-2);
     scrollbar-width: none;
   }
 

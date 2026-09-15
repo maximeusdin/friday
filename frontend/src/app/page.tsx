@@ -60,6 +60,14 @@ export default function Home() {
 
   const layout = useLayout();
 
+  // Stamp the layout on <html> as well as the shell: popovers and modals are
+  // portalled to <body>, and touch sizing has to reach them too.
+  useEffect(() => {
+    const root = document.documentElement;
+    root.dataset.layout = layout.mode;
+    root.dataset.touch = layout.touch ? 'true' : 'false';
+  }, [layout.mode, layout.touch]);
+
   // --- History-backed overlays ---------------------------------------------
   // On a phone, the document viewer and the sessions drawer cover the whole
   // screen, and people close full-screen things with the back gesture. Each

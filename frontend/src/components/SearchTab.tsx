@@ -471,7 +471,7 @@ export function SearchTab({
               disabled={isSearching || !query.trim() || scopeEmpty}
             >
               {isSearching ? <span className="spinner" /> : <Icon name="search" size={16} />}
-              {isSearching ? 'Searching…' : 'Search'}
+              <span className="btn-label">{isSearching ? 'Searching…' : 'Search'}</span>
             </button>
           </div>
 
