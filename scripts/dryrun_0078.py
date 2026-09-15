@@ -5,20 +5,25 @@ Runs every guard the migration asserts, as a plain SELECT, and reports exactly w
 the migration would delete. Executes no INSERT/UPDATE/DELETE and opens no write
 transaction, so it is safe against prod.
 
+Resolves the migration relative to this file, so it can be run from any directory.
+
 Usage:
   DATABASE_URL=... python scripts/dryrun_0078.py
 """
 import os
 import re
 import sys
+from pathlib import Path
 
 import psycopg2
+
+MIGRATION = Path(__file__).resolve().parent.parent / "migrations" / "0078_drop_duplicate_ingests.sql"
 
 PAIRS_RE = re.compile(r"^\s*\(\s*(\d+),\s*(\d+)\)[,;]?\s*--", re.M)
 
 
 def main():
-    sql = open("migrations/0078_drop_duplicate_ingests.sql", encoding="utf-8").read()
+    sql = MIGRATION.read_text(encoding="utf-8")
     pairs = [(int(a), int(b)) for a, b in PAIRS_RE.findall(sql)]
     drops = [p[0] for p in pairs]
     keeps = [p[1] for p in pairs]
