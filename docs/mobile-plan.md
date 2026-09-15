@@ -1,10 +1,9 @@
 # Building the mobile site
 
-Written 15 September 2026, against branch `v14-ui-overhaul`.
-
-The desktop redesign was built so the phone layout would be a set of decisions,
-not a rewrite. This is what is already in place, what is actually missing, and
-the order to build it in.
+Written 15 September 2026 against branch `v14-ui-overhaul`; built the same day
+on `v15-mobile`. All four stages below are implemented. The plan is kept as the
+record of what was decided and why, with a status note on each stage and a
+section at the end on what has and has not been verified.
 
 ---
 
@@ -66,6 +65,11 @@ Four stages. Each ends somewhere shippable.
 
 ### Stage 1 — Navigation model (the foundation)
 
+**Built** (`c7366c6`). `lib/useLayout.ts` decides phone / tablet / desktop by
+width and touch by pointer plus user agent; the shell stamps `data-layout`,
+`data-touch` and `data-view` on `<html>` and `.app`. Viewer and drawer push
+history entries on touch layouts. Phones get a bottom tab bar.
+
 Nothing else is worth doing until this exists.
 
 - Introduce a single `view` state: `chat | search | viewer`, replacing the
@@ -82,6 +86,10 @@ Nothing else is worth doing until this exists.
 gesture, and never lose your place.*
 
 ### Stage 2 — The document viewer
+
+**Built** (`0c512f7`). Fit-to-width on touch layouts, pinch with a live CSS
+preview and a sharp re-render on release, double-tap between fit and 2.2x,
+zoom in the overflow menu as the non-gesture path, collapsible quote strip.
 
 The hardest surface, and the one researchers spend the most time in.
 
@@ -101,6 +109,10 @@ The hardest surface, and the one researchers spend the most time in.
 
 ### Stage 3 — Search and scope
 
+**Built** (`22b09f3`). Single-column hits with visible remove controls,
+scrolling chip and option rows, whole-row scope targets at 44px, Enter as
+newline on touch keyboards.
+
 - `.hit` becomes a single column: collection and page on one line, document
   name on the second, snippet below. Remove-and-restore moves from hover into
   a swipe action or a persistent overflow button.
@@ -113,6 +125,9 @@ The hardest surface, and the one researchers spend the most time in.
 
 ### Stage 4 — The long tail
 
+**Built** (`4390627`), except real-device testing, which needs hardware or a
+simulator this Mac does not have (see below).
+
 - Bulk download: replace the file table with a list of rows, each with a
   checkbox and size. If that proves fiddly, gate it behind "open on a computer
   to download in bulk" and keep single-file download working.
@@ -121,7 +136,32 @@ The hardest surface, and the one researchers spend the most time in.
 - Test on a real device, not only an emulated viewport. Safari on iOS differs
   on `dvh`, safe areas and scroll anchoring.
 
-## 4. Things to decide before starting
+## 4. What has been verified, and what has not
+
+Verified in an emulated Chromium tab at 375x812 (touch user agent, five touch
+points), 768x1024, 320x568 and 1440x900:
+
+- Layout selection, bottom bar, drawer, history entries and the back gesture.
+- Fit-to-width, pinch (synthetic two-pointer events), double-tap, scroll
+  anchoring after zoom, the collapsed quote strip, the 320px toolbar.
+- Running a search, removing a hit, toggling scope from the sheet, opening a
+  hit into the viewer, the downloads and concordance sheets.
+- No horizontal overflow on any surface at 320px.
+
+Not verified, because it needs a real device or an iOS simulator (this Mac
+has only the Xcode command-line tools, and the simulator needs full Xcode):
+
+- iOS Safari specifics: `100dvh` with the toolbars, the software keyboard
+  resizing the visual viewport, safe-area insets on a notched phone, and
+  whether `touch-action: pan-x pan-y` fully suppresses page pinch inside the
+  viewer on iOS 16 and 17.
+- Real pinch feel: gesture inertia and the moment of the sharp re-render.
+- Android Chrome's URL bar collapsing during scroll.
+
+Do those on a phone before calling this done. Everything in the list is a
+known WebKit or Android behaviour with a known fix, not a design unknown.
+
+## 5. Things that were decided along the way
 
 1. **Is the phone for reading or for research?** If reading, Stage 1 and 2 are
    the whole job and Stage 3 can be a graceful degradation. If research, all
@@ -132,7 +172,7 @@ The hardest surface, and the one researchers spend the most time in.
 3. **Offline/PWA.** Not covered here. If researchers want documents on a phone
    in an archive with no signal, that is its own project.
 
-## 5. Notes for whoever builds it
+## 6. Notes for whoever extends it
 
 - Every structural dimension is a token in `app/tokens.css`. Change the value,
   not the rule.

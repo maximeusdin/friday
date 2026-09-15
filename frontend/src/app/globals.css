@@ -2872,6 +2872,15 @@ html[data-touch='true'] .scope-doc-open {
   opacity: 1;
 }
 
+/* iOS Safari zooms the whole page into any field smaller than 16px on focus.
+   Inputs on touch layouts are 16px, so typing never jolts the layout. */
+html[data-touch='true'] input,
+html[data-touch='true'] textarea,
+html[data-touch='true'] select,
+html[data-touch='true'] .composer-input {
+  font-size: 1rem;
+}
+
 /* Bigger targets where a finger has to land. */
 html[data-touch='true'] .scope-row,
 html[data-touch='true'] .scope-doc-row {
