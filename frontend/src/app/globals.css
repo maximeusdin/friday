@@ -3301,6 +3301,14 @@ html[data-touch='true'] .cite {
     padding-left: var(--s-2);
   }
 
+  .help-body .card.flex {
+    flex-wrap: wrap;
+  }
+
+  .help-body .card.flex .spacer {
+    display: none;
+  }
+
   .dl-bar {
     flex-wrap: wrap;
   }
@@ -3314,5 +3322,23 @@ html[data-touch='true'] .cite {
 
   .hit {
     grid-template-columns: 1.5rem minmax(0, 1fr) auto;
+  }
+
+  /* Viewer toolbar: back, a sliver of title, page number, find, more. The
+     "/ 108" total moves into the typed-page tooltip; the number itself stays. */
+  .doc-bar {
+    gap: 2px;
+  }
+
+  .doc-bar .doc-title {
+    min-width: 2rem;
+  }
+
+  .doc-page-total {
+    display: none;
+  }
+
+  .doc-group {
+    padding: 1px;
   }
 }
