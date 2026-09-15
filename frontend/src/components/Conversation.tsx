@@ -11,6 +11,7 @@ import type {
 } from '@/types/api';
 import { describeScope } from '@/lib/scope';
 import { duration, plural } from '@/lib/format';
+import { useDocumentName } from '@/lib/documentNames';
 import { AnswerText } from './AnswerText';
 import { ClarificationCard } from './ClarificationCard';
 import { ScopeControl } from './ScopeControl';
@@ -649,9 +650,9 @@ function Findings({
               <div className="finding-body">
                 <span>{sanitizeBulletText(bullet.text)}</span>
                 {bullet.doc_ids?.length > 0 && bullet.chunk_ids?.length > 0 && onEvidenceClick && (
-                  <button
-                    type="button"
-                    className="finding-source"
+                  <SourceLink
+                    documentId={bullet.doc_ids[0]}
+                    name={bullet.source_names?.[0]}
                     onClick={() => onEvidenceClick({
                       document_id: bullet.doc_ids[0],
                       // Open the quote's exact page when known (multi-page chunks).
@@ -660,10 +661,7 @@ function Findings({
                       quote: bullet.quote,
                       quote_page: bullet.quote_page ?? undefined,
                     })}
-                  >
-                    <Icon name="file" size={13} />
-                    {bullet.source_names?.[0] || 'View document'}
-                  </button>
+                  />
                 )}
               </div>
             </div>
@@ -671,6 +669,37 @@ function Findings({
         </div>
       )}
     </div>
+  );
+}
+
+/**
+ * A link to the document behind a finding or citation.
+ *
+ * Always shows the document's name: payloads carry one only sometimes, so when
+ * it is missing the name is looked up by id (cached process-wide) rather than
+ * falling back to an anonymous "View document".
+ */
+function SourceLink({
+  documentId, name, hint, onClick,
+}: {
+  documentId?: number;
+  name?: string | null;
+  hint?: string | null;
+  onClick: () => void;
+}) {
+  const resolved = useDocumentName(documentId, name);
+  const label = resolved ?? (documentId ? 'Opening document…' : 'Document');
+  return (
+    <button
+      type="button"
+      className="finding-source"
+      onClick={onClick}
+      disabled={!documentId}
+      title={hint ? `“${hint}”` : label}
+    >
+      <Icon name="file" size={13} />
+      <span className="finding-source-name">{label}</span>
+    </button>
   );
 }
 
@@ -874,17 +903,13 @@ function MembersList({
               {member.citations && member.citations.length > 0 && (
                 <span className="flex gap-sm">
                   {member.citations.slice(0, 2).map((cit, j) => (
-                    <button
+                    <SourceLink
                       key={j}
-                      type="button"
-                      className="finding-source"
+                      documentId={cit.document_id}
+                      name={cit.source_name}
+                      hint={cit.quote}
                       onClick={() => open(cit)}
-                      title={cit.quote || 'View document'}
-                      disabled={!cit.document_id}
-                    >
-                      <Icon name="file" size={13} />
-                      {cit.source_name ? cit.source_name.slice(0, 32) : 'Document'}
-                    </button>
+                    />
                   ))}
                 </span>
               )}
@@ -955,17 +980,13 @@ function ClaimsList({
                 {claim.citations.length > 0 && (
                   <span className="flex gap-sm" style={{ flexWrap: 'wrap' }}>
                     {claim.citations.map((cit, j) => (
-                      <button
+                      <SourceLink
                         key={j}
-                        type="button"
-                        className="finding-source"
+                        documentId={cit.document_id}
+                        name={cit.source_name}
+                        hint={cit.quote}
                         onClick={() => open(cit)}
-                        title={cit.quote ? `“${cit.quote}”` : 'View document'}
-                        disabled={!cit.document_id}
-                      >
-                        <Icon name="file" size={13} />
-                        {cit.source_name ? cit.source_name.slice(0, 32) : 'Document'}
-                      </button>
+                      />
                     ))}
                   </span>
                 )}

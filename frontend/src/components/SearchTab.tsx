@@ -8,6 +8,7 @@ import { ScopeControl } from './ScopeControl';
 import { Icon } from './ui/Icon';
 import { Popover } from './ui/Popover';
 import { plural } from '@/lib/format';
+import { toast } from './ui/Toast';
 
 const INITIAL_LIMIT = 100;
 const FETCH_MORE_BATCH = 100;
@@ -355,7 +356,11 @@ export function SearchTab({
     try {
       await api.deleteSearchResultSet(resultSetId);
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Failed to delete search');
+      // A toast, not just the inline notice: the chip staying put with a quiet
+      // red line elsewhere on the page reads as "nothing happened".
+      const why = e instanceof Error ? e.message : 'unknown error';
+      toast(`Could not delete that search — ${why}`);
+      setError(`Could not delete the search “${block?.query ?? ''}”: ${why}`);
       return;
     }
     setSearchHistory((prev) => {

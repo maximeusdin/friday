@@ -20,6 +20,8 @@ pdfjs.GlobalWorkerOptions.workerSrc =
   `https://unpkg.com/pdfjs-dist@${pdfjs.version}/build/pdf.worker.min.mjs`;
 
 const ZOOM_LEVELS = [50, 75, 100, 125, 150, 200];
+/** Pages kept mounted either side of the one being read. */
+const RENDER_WINDOW = 2;
 
 /**
  * Wrap a JPEG in a minimal single-page PDF (PDF 1.4, one image XObject drawn
@@ -255,6 +257,14 @@ export function EvidenceViewer({ evidence, onClose, backLabel = 'Back to Chat' }
   const pdfRef = useRef<Awaited<ReturnType<typeof pdfjs.getDocument>['promise']> | null>(null);
   const textCache = useRef<Map<number, string>>(new Map());
   const pageWrapRef = useRef<HTMLDivElement>(null);
+  // Continuous scroll: the scroller, one wrapper per page, and the page-1
+  // viewport used to size the wrappers that have not rendered yet.
+  const scrollerRef = useRef<HTMLDivElement>(null);
+  const pageEls = useRef<Map<number, HTMLDivElement>>(new Map());
+  const [baseSize, setBaseSize] = useState<{ w: number; h: number } | null>(null);
+  // True while we are scrolling the view ourselves, so the scroll handler does
+  // not fight the navigation that caused it.
+  const programmatic = useRef(false);
   const findInputRef = useRef<HTMLInputElement>(null);
 
   // react-pdf touches browser-only APIs; defer rendering until mounted so the
@@ -282,6 +292,39 @@ export function EvidenceViewer({ evidence, onClose, backLabel = 'Back to Chat' }
       setCurrentPage(evidence.pdf_page);
     }
   }, [evidence?.pdf_page]);
+
+  // …and bring it into view once the document has loaded and the page wrappers
+  // exist. Opening a citation must land on the cited page, not page 1.
+  useEffect(() => {
+    if (!numPages || !evidence?.pdf_page) return;
+    goToPage(evidence.pdf_page);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [numPages, evidence?.pdf_page]);
+
+  // Track the page under the viewport as the reader scrolls, so the toolbar,
+  // downloads and the witness index follow the page actually being read.
+  useEffect(() => {
+    const scroller = scrollerRef.current;
+    if (!scroller || !numPages) return;
+    let frame = 0;
+    const onScroll = () => {
+      if (programmatic.current || frame) return;
+      frame = requestAnimationFrame(() => {
+        frame = 0;
+        const mid = scroller.scrollTop + scroller.clientHeight * 0.35;
+        let best = 1;
+        for (const [n, el] of pageEls.current) {
+          if (el.offsetTop <= mid && n > best) best = n;
+        }
+        setCurrentPage((cur) => (cur === best ? cur : best));
+      });
+    };
+    scroller.addEventListener('scroll', onScroll, { passive: true });
+    return () => {
+      scroller.removeEventListener('scroll', onScroll);
+      if (frame) cancelAnimationFrame(frame);
+    };
+  }, [numPages]);
 
   // Reset per-document state when the source changes
   useEffect(() => {
@@ -316,12 +359,35 @@ export function EvidenceViewer({ evidence, onClose, backLabel = 'Back to Chat' }
   };
   const handleZoomReset = () => setZoom(100);
 
+  /** Scroll a page into view inside the document scroller. */
+  const scrollToPage = useCallback((n: number, behavior: ScrollBehavior = 'auto') => {
+    const scroller = scrollerRef.current;
+    const el = pageEls.current.get(n);
+    if (!scroller || !el) return;
+    programmatic.current = true;
+    const top = el.getBoundingClientRect().top
+      - scroller.getBoundingClientRect().top
+      + scroller.scrollTop;
+    scroller.scrollTo({ top: Math.max(0, top - 12), behavior });
+    window.setTimeout(() => { programmatic.current = false; }, 400);
+  }, []);
+
+  /** Explicit navigation (toolbar, typed page, find, witnesses, evidence link):
+   *  move the page *and* the viewport. Scrolling by hand only sets the page. */
+  const goToPage = useCallback((n: number) => {
+    const max = numPages ?? document?.page_count ?? Number.MAX_SAFE_INTEGER;
+    const target = Math.min(Math.max(1, Math.round(n)), max);
+    setCurrentPage(target);
+    // The wrapper may not be mounted yet on a fresh document; retry next frame.
+    if (pageEls.current.has(target)) scrollToPage(target);
+    else requestAnimationFrame(() => scrollToPage(target));
+  }, [numPages, document?.page_count, scrollToPage]);
+
   /** Jump to a typed page number, clamped to the document. */
   const commitPageInput = () => {
     if (pageInput == null) return;
     const n = Number(pageInput);
-    const max = numPages ?? document?.page_count ?? Number.MAX_SAFE_INTEGER;
-    if (Number.isFinite(n) && n >= 1) setCurrentPage(Math.min(Math.round(n), max));
+    if (Number.isFinite(n) && n >= 1) goToPage(n);
     setPageInput(null);
   };
 
@@ -359,7 +425,7 @@ export function EvidenceViewer({ evidence, onClose, backLabel = 'Back to Chat' }
     setMatches(out);
     if (out.length) {
       setActiveMatchIdx(0);
-      setCurrentPage(out[0].page);
+      goToPage(out[0].page);
     } else {
       setActiveMatchIdx(-1);
     }
@@ -378,50 +444,59 @@ export function EvidenceViewer({ evidence, onClose, backLabel = 'Back to Chat' }
     const css = CSS as unknown as { highlights: Map<string, unknown> };
     css.highlights.delete('pdf-find');
     css.highlights.delete('pdf-find-active');
-    const layer = pageWrapRef.current?.querySelector('.react-pdf__Page__textContent');
-    if (!layer || !query.trim()) return;
+    if (!query.trim()) return;
 
     const needle = query.toLowerCase();
-    const walker = window.document.createTreeWalker(layer, NodeFilter.SHOW_TEXT);
-    const nodes: TextNodeEntry[] = [];
-    let full = '';
-    for (let n = walker.nextNode(); n; n = walker.nextNode()) {
-      const text = n as Text;
-      nodes.push({ node: text, start: full.length });
-      full += text.nodeValue ?? '';
+    const all: Range[] = [];
+    let activeRange: Range | null = null;
+    const activePage = activeMatchIdx >= 0 ? matches[activeMatchIdx]?.page : undefined;
+
+    // Every mounted page is painted, so matches stay highlighted as they scroll
+    // past rather than only on the page the toolbar happens to name.
+    for (const [pageNum, wrapper] of pageEls.current) {
+      const layer = wrapper.querySelector('.react-pdf__Page__textContent');
+      if (!layer) continue;
+      const walker = window.document.createTreeWalker(layer, NodeFilter.SHOW_TEXT);
+      const nodes: TextNodeEntry[] = [];
+      let full = '';
+      for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+        const text = n as Text;
+        nodes.push({ node: text, start: full.length });
+        full += text.nodeValue ?? '';
+      }
+      if (!nodes.length) continue;
+
+      const lower = full.toLowerCase();
+      const ranges: Range[] = [];
+      let idx = lower.indexOf(needle);
+      while (idx !== -1) {
+        const a = locate(nodes, idx);
+        const b = locate(nodes, idx + needle.length);
+        const r = window.document.createRange();
+        r.setStart(a.node, a.off);
+        r.setEnd(b.node, b.off);
+        ranges.push(r);
+        idx = lower.indexOf(needle, idx + needle.length);
+      }
+      if (!ranges.length) continue;
+
+      // Which occurrence on this page is the active match?
+      if (pageNum === activePage) {
+        const ordinal = matches.slice(0, activeMatchIdx).filter((m) => m.page === pageNum).length;
+        activeRange = ranges[ordinal] ?? null;
+      }
+      all.push(...ranges);
     }
-    if (!nodes.length) return;
+    if (!all.length) return;
 
-    const lower = full.toLowerCase();
-    const ranges: Range[] = [];
-    let idx = lower.indexOf(needle);
-    while (idx !== -1) {
-      const a = locate(nodes, idx);
-      const b = locate(nodes, idx + needle.length);
-      const r = window.document.createRange();
-      r.setStart(a.node, a.off);
-      r.setEnd(b.node, b.off);
-      ranges.push(r);
-      idx = lower.indexOf(needle, idx + needle.length);
-    }
-    if (!ranges.length) return;
-
-    // Which on-page occurrence is the active match?
-    const activeOnPage = activeMatchIdx >= 0 && matches[activeMatchIdx]?.page === currentPage;
-    const ordinal = activeOnPage
-      ? matches.slice(0, activeMatchIdx).filter((m) => m.page === currentPage).length
-      : -1;
-    const activeRange = activeOnPage ? ranges[ordinal] : null;
-    const rest = activeRange ? ranges.filter((r) => r !== activeRange) : ranges;
-
+    const rest = activeRange ? all.filter((r) => r !== activeRange) : all;
     const HL = (window as unknown as { Highlight: new (...r: Range[]) => unknown }).Highlight;
     if (rest.length) css.highlights.set('pdf-find', new HL(...rest));
     if (activeRange) {
       css.highlights.set('pdf-find-active', new HL(activeRange));
-      const el = activeRange.startContainer.parentElement;
-      el?.scrollIntoView({ block: 'center', inline: 'nearest' });
+      activeRange.startContainer.parentElement?.scrollIntoView({ block: 'center', inline: 'nearest' });
     }
-  }, [query, activeMatchIdx, matches, currentPage]);
+  }, [query, activeMatchIdx, matches]);
 
   // --- Paint the evidence-quote highlight (amber) on the quote's page ---
   const applyEvidenceHighlight = useCallback(() => {
@@ -434,9 +509,10 @@ export function EvidenceViewer({ evidence, onClose, backLabel = 'Back to Chat' }
       return;
     }
     const quotePage = evidence?.quote_page ?? evidence?.pdf_page;
-    if (currentPage !== quotePage) return; // keep tier state; just don't paint here
-
-    const layer = pageWrapRef.current?.querySelector('.react-pdf__Page__textContent');
+    // Paint whenever the quote's page is mounted — with continuous scrolling it
+    // need not be the page the toolbar currently names.
+    const wrapper = quotePage != null ? pageEls.current.get(quotePage) : null;
+    const layer = wrapper?.querySelector('.react-pdf__Page__textContent');
     if (!layer) return;
     const walker = window.document.createTreeWalker(layer, NodeFilter.SHOW_TEXT);
     const nodes: TextNodeEntry[] = [];
@@ -468,6 +544,7 @@ export function EvidenceViewer({ evidence, onClose, backLabel = 'Back to Chat' }
     r.startContainer.parentElement?.scrollIntoView({ block: 'center', inline: 'nearest' });
   }, [evidence?.quote, evidence?.quote_page, evidence?.pdf_page, currentPage]);
 
+
   // Re-paint when match selection or page changes (text layer may already be rendered)
   useEffect(() => {
     applyHighlights();
@@ -487,8 +564,8 @@ export function EvidenceViewer({ evidence, onClose, backLabel = 'Back to Chat' }
     if (!matches.length) return;
     const n = (activeMatchIdx + delta + matches.length) % matches.length;
     setActiveMatchIdx(n);
-    setCurrentPage(matches[n].page);
-  }, [matches, activeMatchIdx]);
+    goToPage(matches[n].page);
+  }, [matches, activeMatchIdx, goToPage]);
 
   const openFind = useCallback(() => {
     setFindOpen(true);
@@ -634,7 +711,7 @@ export function EvidenceViewer({ evidence, onClose, backLabel = 'Back to Chat' }
         <div className="doc-group">
           <button
             className="icon-btn icon-btn-sm"
-            onClick={() => setCurrentPage((p) => Math.max(1, p - 1))}
+            onClick={() => goToPage(currentPage - 1)}
             disabled={currentPage <= 1}
             title="Previous page"
             aria-label="Previous page"
@@ -655,7 +732,7 @@ export function EvidenceViewer({ evidence, onClose, backLabel = 'Back to Chat' }
           <span className="doc-page-total">{totalPages ? `/ ${totalPages}` : ''}</span>
           <button
             className="icon-btn icon-btn-sm"
-            onClick={() => setCurrentPage((p) => p + 1)}
+            onClick={() => goToPage(currentPage + 1)}
             disabled={totalPages != null && currentPage >= totalPages}
             title="Next page"
             aria-label="Next page"
@@ -819,7 +896,7 @@ export function EvidenceViewer({ evidence, onClose, backLabel = 'Back to Chat' }
               key={w.appearance_seq}
               className={`doc-witness${w.start_page <= currentPage && currentPage <= w.end_page ? ' is-current' : ''}`}
               onClick={() => {
-                setCurrentPage(w.start_page);
+                goToPage(w.start_page);
                 setShowWitnesses(false);
               }}
               title={`Pages ${w.start_page}–${w.end_page}`}
@@ -849,7 +926,7 @@ export function EvidenceViewer({ evidence, onClose, backLabel = 'Back to Chat' }
       )}
 
       {/* PDF render: react-pdf, single page at a time (bounded memory for large docs) */}
-      <div className="doc-canvas">
+      <div className="doc-canvas" ref={scrollerRef}>
         {!mounted || docLoading ? (
           <div className="loading"><span className="spinner" /> Loading document…</div>
         ) : loadError ? (
@@ -881,30 +958,63 @@ export function EvidenceViewer({ evidence, onClose, backLabel = 'Back to Chat' }
             </a>
           </div>
         ) : (
-          <div className="doc-page" ref={pageWrapRef}>
+          <div className="doc-pages" ref={pageWrapRef}>
             <Document
               file={fileProp}
               loading={<div className="loading"><span className="spinner" /> Loading document…</div>}
               error={<div className="loading">Could not load this PDF.</div>}
-              onLoadSuccess={(pdf) => {
+              onLoadSuccess={async (pdf) => {
                 pdfRef.current = pdf;
                 setNumPages(pdf.numPages);
                 setLoadError(null);
+                // Page 1's size at scale 1 sizes the wrappers of pages that
+                // have not rendered, so the scrollbar is the right length and
+                // scrolling does not jump as pages mount.
+                try {
+                  const vp = (await pdf.getPage(1)).getViewport({ scale: 1 });
+                  setBaseSize({ w: vp.width, h: vp.height });
+                } catch { /* fall back to the default placeholder size */ }
               }}
               onLoadError={(err) => setLoadError(err?.message || 'Failed to load PDF.')}
             >
-              <Page
-                key={currentPage}
-                pageNumber={currentPage}
-                scale={zoom / 100}
-                renderAnnotationLayer
-                renderTextLayer
-                onRenderTextLayerSuccess={() => {
-                  applyHighlights();
-                  applyEvidenceHighlight();
-                }}
-                loading={<div className="loading"><span className="spinner" /> Rendering page…</div>}
-              />
+              {Array.from({ length: numPages ?? 0 }, (_, i) => i + 1).map((n) => {
+                // Only pages near the viewport are mounted: these documents run
+                // to hundreds of scanned pages, and rendering them all would
+                // exhaust memory long before the reader got there.
+                const mounted = Math.abs(n - currentPage) <= RENDER_WINDOW;
+                const scale = zoom / 100;
+                return (
+                  <div
+                    key={n}
+                    className="doc-page"
+                    data-page={n}
+                    ref={(el) => {
+                      if (el) pageEls.current.set(n, el);
+                      else pageEls.current.delete(n);
+                    }}
+                    style={{
+                      width: baseSize ? baseSize.w * scale : undefined,
+                      minHeight: baseSize ? baseSize.h * scale : 600,
+                    }}
+                  >
+                    {mounted ? (
+                      <Page
+                        pageNumber={n}
+                        scale={scale}
+                        renderAnnotationLayer
+                        renderTextLayer
+                        onRenderTextLayerSuccess={() => {
+                          applyHighlights();
+                          applyEvidenceHighlight();
+                        }}
+                        loading={<span className="doc-page-placeholder">{n}</span>}
+                      />
+                    ) : (
+                      <span className="doc-page-placeholder">{n}</span>
+                    )}
+                  </div>
+                );
+              })}
             </Document>
           </div>
         )}
