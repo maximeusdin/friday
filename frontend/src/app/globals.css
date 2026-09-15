@@ -229,6 +229,7 @@ hr {
 .flex   { display: flex; }
 .flex-1 { flex: 1; }
 .gap-sm { gap: var(--s-2); }
+.items-center { align-items: center; }
 .mt-sm  { margin-top: var(--s-2); }
 .mt-md  { margin-top: var(--s-4); }
 .mb-sm  { margin-bottom: var(--s-2); }
@@ -839,10 +840,12 @@ input[type='radio'] {
 
 /* --- Toast ----------------------------------------------------------------- */
 
+/* Top-centre, under the header: the bottom of the workspace belongs to the
+   composer, and a toast there would cover the control it is reporting on. */
 .toast-wrap {
   position: fixed;
   left: 50%;
-  bottom: var(--s-6);
+  top: calc(var(--h-header) + var(--s-3));
   transform: translateX(-50%);
   z-index: var(--z-toast);
   display: flex;
@@ -869,7 +872,7 @@ input[type='radio'] {
    background, where the animation clock is frozen — fading in from 0 would
    leave it invisible until the tab is focused again. */
 @keyframes toast-in {
-  from { transform: translateY(10px); }
+  from { transform: translateY(-10px); }
   to   { transform: none; }
 }
 
@@ -905,8 +908,10 @@ input[type='radio'] {
   position: relative;
 }
 
+/* Collapsed: one column, not a zero-width one — a 0fr track would still be the
+   first grid item's home and squeeze the workspace out of the layout. */
 .app[data-sidebar='closed'] .app-body {
-  grid-template-columns: var(--w-sidebar-collapsed) minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1fr);
 }
 
 .app[data-sidebar='closed'] .sidebar {
@@ -1134,6 +1139,11 @@ input[type='radio'] {
   0%   { box-shadow: 0 0 0 0 var(--accent-soft-2); }
   70%  { box-shadow: 0 0 0 6px rgba(23, 71, 92, 0); }
   100% { box-shadow: 0 0 0 0 rgba(23, 71, 92, 0); }
+}
+
+/* Drawer scrim — only ever visible at the drawer breakpoint. */
+.sidebar-scrim {
+  display: none;
 }
 
 .sidebar-empty {
@@ -2723,6 +2733,7 @@ mark {
 }
 
 @media (max-width: 900px) {
+  /* The drawer is out of flow, so the workspace owns the only column. */
   .app-body {
     grid-template-columns: minmax(0, 1fr);
   }
@@ -2742,12 +2753,14 @@ mark {
     transform: none;
   }
 
-  .app[data-sidebar='open'] .app-body::after {
-    content: '';
+  .app[data-sidebar='open'] .sidebar-scrim {
+    display: block;
     position: absolute;
     inset: 0;
+    border: none;
     background: rgba(22, 24, 27, 0.32);
     z-index: calc(var(--z-sticky) + 4);
+    animation: fade-in var(--dur-2) var(--ease);
   }
 
   .thread-inner,
@@ -2813,7 +2826,13 @@ mark {
     width: 100%;
   }
 
-  .hdr-nav .hdr-link-text {
+  /* Icons only, and no strapline: the wordmark must never wrap. */
+  .hdr-nav .hdr-link-text,
+  .hdr-sub {
     display: none;
+  }
+
+  .hdr-link {
+    padding: 0 var(--s-2);
   }
 }

@@ -1,10 +1,23 @@
-import type { Metadata } from 'next';
+import type { Metadata, Viewport } from 'next';
 import { Providers } from './providers';
 import './globals.css';
 
 export const metadata: Metadata = {
-  title: 'Friday Research Console',
-  description: 'AI research assistant for Cold War archival materials',
+  title: 'Friday — Cold War archive',
+  description:
+    'Search declassified Cold War archives. Friday reads the files, resolves cover names, and cites the page.',
+};
+
+/**
+ * viewport-fit=cover is what makes env(safe-area-inset-*) resolve to real values,
+ * which the composer already pads for — so the phone layout inherits correct
+ * spacing under the home indicator the day it lands.
+ */
+export const viewport: Viewport = {
+  width: 'device-width',
+  initialScale: 1,
+  viewportFit: 'cover',
+  themeColor: '#faf9f7',
 };
 
 export default function RootLayout({

@@ -115,7 +115,6 @@
   --h-header:     3.25rem;  /* 52 */
   --h-toolbar:    2.875rem; /* 46 */
   --w-sidebar:    16.5rem;  /* 264 */
-  --w-sidebar-collapsed: 0rem;
   --control-h:    2.125rem; /* 34 — standard button/input height */
   --control-h-lg: 2.625rem; /* 42 — composer, primary CTAs */
   --z-sticky:  10;

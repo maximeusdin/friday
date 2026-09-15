@@ -279,7 +279,7 @@ export function CollectionsDownloadsBody({ initialCollectionId }: { initialColle
         <div className="dl-bar">
           {dl.status === 'running' ? (
             <>
-              <div className="dl-bar-status flex items-center gap-sm" style={{ flex: 1, minWidth: 0 }}>
+              <div className="flex items-center gap-sm" style={{ flex: 1, minWidth: 0 }}>
                 <div className="dl-progress">
                   <div
                     className="dl-progress-fill"

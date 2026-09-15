@@ -242,6 +242,16 @@ export default function Home() {
           </div>
         )}
 
+        {/* Tapping outside the drawer closes it. Desktop hides this entirely — see
+            the 900px breakpoint in globals.css. */}
+        <button
+          type="button"
+          className="sidebar-scrim"
+          aria-label="Close sessions"
+          tabIndex={sidebarOpen ? 0 : -1}
+          onClick={toggleSidebar}
+        />
+
         <SessionSidebar
           activeSessionId={activeSession?.id}
           onSessionSelect={handleSessionSelect}
