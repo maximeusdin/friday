@@ -2837,10 +2837,81 @@ mark {
 /* =============================================================================
    17  Responsive
    -----------------------------------------------------------------------------
-   The desktop layout holds down to ~1000px by shedding width. Below that the
-   sidebar becomes an overlay drawer — the structural hook the phone layout will
-   use, so no component has to change shape when that lands.
+   Three layouts, chosen by width, with touch behaviour layered on top:
+
+     desktop  >= 1024px   persistent sessions rail, two-pane workspace
+     tablet   680-1023px  rail becomes an overlay drawer, everything else as desktop
+     phone    <  680px    bottom tab bar, single column, sheets instead of popovers
+
+   The breakpoints are mirrored in lib/useLayout.ts (PHONE_MAX, TABLET_MAX), so
+   components and the stylesheet always agree on which layout is showing.
+   `[data-touch='true']` on the shell marks a finger as the primary pointer;
+   anything hover-revealed on desktop is simply visible there.
    ========================================================================== */
+
+/* Utilities that key off the layout. */
+.phone-only { display: none; }
+
+/* --- Touch: no hover ------------------------------------------------------- */
+
+.app[data-touch='true'] .hit-actions,
+.app[data-touch='true'] .sb-item-actions,
+.app[data-touch='true'] .scope-doc-open {
+  opacity: 1;
+}
+
+/* Bigger targets where a finger has to land. */
+.app[data-touch='true'] .scope-row,
+.app[data-touch='true'] .scope-doc-row {
+  min-height: var(--control-h);
+  padding-top: var(--s-1);
+  padding-bottom: var(--s-1);
+}
+
+.app[data-touch='true'] .scope-expand {
+  width: var(--control-h);
+  height: var(--control-h);
+}
+
+.app[data-touch='true'] .sb-item {
+  min-height: var(--control-h);
+}
+
+.app[data-touch='true'] .cite {
+  padding: 0.15em 0.5em;
+}
+
+/* --- Bottom tab bar (phone) --------------------------------------------------- */
+
+.bottom-nav {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: stretch;
+  height: calc(3.5rem + env(safe-area-inset-bottom, 0px));
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+  background: var(--surface);
+  border-top: 1px solid var(--line);
+  z-index: var(--z-sticky);
+}
+
+.bottom-nav-item {
+  flex: 1 1 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  font-size: var(--text-2xs);
+  font-weight: var(--weight-medium);
+  color: var(--ink-3);
+  -webkit-tap-highlight-color: transparent;
+}
+
+.bottom-nav-item[aria-current='true'] {
+  color: var(--accent);
+}
+
+/* --- Narrow desktop ---------------------------------------------------------- */
 
 @media (max-width: 1100px) {
   :root {
@@ -2848,13 +2919,14 @@ mark {
   }
 }
 
-@media (max-width: 900px) {
+/* --- Tablet: the rail becomes a drawer --------------------------------------- */
+
+@media (max-width: 1023px) {
   /* The drawer is out of flow, so the workspace owns the only column. */
   .app-body {
     grid-template-columns: minmax(0, 1fr);
   }
 
-  /* Drawer: the sidebar floats over the workspace instead of taking a column. */
   .sidebar {
     position: absolute;
     inset: 0 auto 0 0;
@@ -2880,11 +2952,7 @@ mark {
   }
 
   .thread-inner,
-  .composer {
-    padding-left: var(--s-4);
-    padding-right: var(--s-4);
-  }
-
+  .composer,
   .search-head,
   .search-body,
   .search-tabs {
@@ -2914,7 +2982,105 @@ mark {
   }
 }
 
-@media (max-width: 680px) {
+/* --- Phone -------------------------------------------------------------------- */
+
+@media (max-width: 679px) {
+  .phone-only { display: inline-flex; }
+
+  /* Header: wordmark, new session, guide, account. The bottom bar has Sessions. */
+  .hdr {
+    padding: 0 var(--s-2);
+  }
+
+  .hdr > .icon-btn:first-child {
+    display: none;
+  }
+
+  .hdr-nav .hdr-link-text,
+  .hdr-sub {
+    display: none;
+  }
+
+  .hdr-link {
+    padding: 0 var(--s-2);
+  }
+
+  /* The bottom bar replaces the Chat/Search control; the bar keeps the title. */
+  .ws-bar .segmented {
+    display: none;
+  }
+
+  .ws-bar {
+    height: 2.5rem;
+    padding: 0 var(--s-4);
+  }
+
+  .ws-bar-title {
+    font-size: var(--text-sm);
+    color: var(--ink-2);
+  }
+
+  /* The drawer is the full width bar a thumb expects. */
+  .sidebar {
+    width: min(22rem, 88vw);
+  }
+
+  /* Thread + composer */
+  .thread-inner {
+    padding: var(--s-4) var(--s-4) var(--s-8);
+    gap: var(--s-6);
+  }
+
+  .msg-user-bubble {
+    max-width: 92%;
+    font-size: var(--text-base);
+  }
+
+  .answer-prose {
+    font-size: 1rem;
+  }
+
+  .composer {
+    padding: var(--s-2) var(--s-3) var(--s-3);
+  }
+
+  .composer-box {
+    padding: var(--s-2);
+    border-radius: var(--r-md);
+  }
+
+  .composer-hint {
+    display: none;
+  }
+
+  .scope-chip {
+    max-width: 55vw;
+  }
+
+  .answer-foot {
+    font-size: var(--text-2xs);
+  }
+
+  /* Welcome */
+  .welcome {
+    padding: var(--s-6) var(--s-4) var(--s-4);
+    gap: var(--s-6);
+  }
+
+  .welcome-title {
+    font-size: var(--title-md);
+  }
+
+  .welcome-lede {
+    font-size: var(--text-md);
+  }
+
+  .prompt-grid,
+  .tile-row {
+    grid-template-columns: 1fr;
+  }
+
+  /* Overlays dock to the bottom. */
   .modal-backdrop {
     padding: 0;
     align-items: flex-end;
@@ -2926,7 +3092,18 @@ mark {
     border-radius: var(--r-lg) var(--r-lg) 0 0;
   }
 
-  /* A popover at phone width is a bottom sheet. */
+  .modal-head {
+    padding: var(--s-3) var(--s-3) var(--s-3) var(--s-4);
+  }
+
+  .modal-title {
+    font-size: var(--title-xs);
+  }
+
+  .help-body {
+    padding: var(--s-4);
+  }
+
   .popover[data-sheet='true'] {
     left: 0 !important;
     right: 0 !important;
@@ -2936,19 +3113,183 @@ mark {
     max-width: none;
     max-height: 82dvh;
     border-radius: var(--r-lg) var(--r-lg) 0 0;
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+
+  .popover[data-sheet='true']::before {
+    /* Grab handle: a sheet should look like something you can pull down. */
+    content: '';
+    display: block;
+    width: 2.25rem;
+    height: 0.25rem;
+    margin: var(--s-2) auto 0;
+    border-radius: var(--r-full);
+    background: var(--line-2);
   }
 
   .scope-picker {
     width: 100%;
   }
 
-  /* Icons only, and no strapline: the wordmark must never wrap. */
-  .hdr-nav .hdr-link-text,
-  .hdr-sub {
+  .scope-modes {
+    grid-template-columns: 1fr;
+  }
+
+  .toast-wrap {
+    left: var(--s-3);
+    right: var(--s-3);
+    transform: none;
+  }
+
+  .toast {
+    width: 100%;
+    border-radius: var(--r-md);
+  }
+
+  /* Search: query on one line, controls on the next, results in one column. */
+  .search-head {
+    padding: var(--s-3) var(--s-3) var(--s-2);
+  }
+
+  .search-bar .btn-lg {
+    padding: 0 var(--s-3);
+  }
+
+  .search-bar .btn-lg .btn-label {
     display: none;
   }
 
-  .hdr-link {
+  .search-opts {
+    gap: var(--s-3);
+    overflow-x: auto;
+    flex-wrap: nowrap;
+    padding-bottom: 2px;
+    scrollbar-width: none;
+  }
+
+  .search-opts::-webkit-scrollbar {
+    display: none;
+  }
+
+  .search-opts .spacer {
+    display: none;
+  }
+
+  .search-tabs {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    padding: var(--s-2) var(--s-3) 0;
+    scrollbar-width: none;
+  }
+
+  .search-tabs::-webkit-scrollbar {
+    display: none;
+  }
+
+  .search-chip {
+    flex: 0 0 auto;
+  }
+
+  .search-body {
+    padding: var(--s-3) var(--s-3) var(--s-8);
+  }
+
+  .search-meta {
+    padding: var(--s-3);
+  }
+
+  .hit {
+    grid-template-columns: 1.75rem minmax(0, 1fr) auto;
+    gap: var(--s-2);
+    padding: var(--s-3);
+  }
+
+  .hit-snippet {
+    font-size: var(--text-md);
+  }
+
+  /* Document viewer: compact toolbar, no zoom buttons (pinch), collapsible quote. */
+  .doc-bar {
+    gap: var(--s-1);
     padding: 0 var(--s-2);
+  }
+
+  .doc-bar .btn-ghost .btn-label,
+  .doc-title-sub,
+  .doc-group-zoom {
+    display: none;
+  }
+
+  .doc-title-main {
+    font-size: var(--text-xs);
+  }
+
+  .doc-page-input {
+    width: 2.5rem;
+  }
+
+  .doc-find {
+    padding: var(--s-2);
+  }
+
+  .doc-find input {
+    max-width: none;
+  }
+
+  .doc-find-count {
+    min-width: 0;
+  }
+
+  .doc-quote {
+    padding: var(--s-2) var(--s-3);
+    font-size: var(--text-sm);
+  }
+
+  .doc-quote[data-collapsed='true'] > span:first-child {
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+
+  .doc-canvas {
+    padding: var(--s-3) 0;
+  }
+
+  .doc-pages {
+    gap: var(--s-4);
+  }
+
+  .doc-page::after {
+    right: var(--s-2);
+  }
+
+  /* Collections & downloads: the file table becomes a list. */
+  .files-table thead,
+  .files-table .files-num {
+    display: none;
+  }
+
+  .files-table td {
+    word-break: break-word;
+  }
+
+  .coll-detail {
+    padding-left: var(--s-2);
+  }
+
+  .dl-bar {
+    flex-wrap: wrap;
+  }
+}
+
+/* Very small phones: nothing may overflow horizontally. */
+@media (max-width: 360px) {
+  .hdr-wordmark {
+    font-size: var(--text-base);
+  }
+
+  .hit {
+    grid-template-columns: 1.5rem minmax(0, 1fr) auto;
   }
 }

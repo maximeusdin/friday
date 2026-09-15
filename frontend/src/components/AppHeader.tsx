@@ -11,6 +11,8 @@ interface AppHeaderProps {
   onLogout?: () => void;
   sidebarOpen: boolean;
   onToggleSidebar: () => void;
+  /** Phone only: the sidebar is a drawer there, so "new session" needs a home in the header. */
+  onNewSession?: () => void;
 }
 
 /**
@@ -22,7 +24,7 @@ interface AppHeaderProps {
  * link because it is content; the rest collapse into Guide, which opens the
  * same modal with a section rail.
  */
-export function AppHeader({ user, onLogout, sidebarOpen, onToggleSidebar }: AppHeaderProps) {
+export function AppHeader({ user, onLogout, sidebarOpen, onToggleSidebar, onNewSession }: AppHeaderProps) {
   const [help, setHelp] = useState<HelpSection | null>(null);
 
   const handleLogout = async () => {
@@ -53,6 +55,17 @@ export function AppHeader({ user, onLogout, sidebarOpen, onToggleSidebar }: AppH
       <div className="spacer" />
 
       <nav className="hdr-nav" aria-label="Main">
+        {onNewSession && (
+          <button
+            type="button"
+            className="icon-btn phone-only"
+            onClick={onNewSession}
+            aria-label="New session"
+            title="New session"
+          >
+            <Icon name="plus" size={20} />
+          </button>
+        )}
         <button type="button" className="hdr-link" onClick={() => setHelp('collections')}>
           <Icon name="library" size={16} />
           <span className="hdr-link-text">Collections</span>

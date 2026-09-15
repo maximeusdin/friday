@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useCallback, useEffect } from 'react';
+import { useState, useCallback, useEffect, useRef } from 'react';
 import dynamic from 'next/dynamic';
 import { useQueryClient } from '@tanstack/react-query';
 import { SessionSidebar } from '@/components/SessionSidebar';
@@ -22,6 +22,11 @@ import type { Session, EvidenceRef, UserSelectedScope, CollectionNode } from '@/
 import type { AuthUser } from '@/lib/api';
 import { api, getLoginUrl } from '@/lib/api';
 import { titleFromQuestion } from '@/lib/format';
+import { useLayout, TABLET_MAX } from '@/lib/useLayout';
+
+/** Overlays that become history entries on touch layouts, so the back gesture
+ *  closes them instead of leaving the site. */
+type Layer = 'viewer' | 'drawer';
 
 const FULL_ARCHIVE: UserSelectedScope = { mode: 'full_archive' };
 
@@ -53,6 +58,33 @@ export default function Home() {
   // screen changes no state, so without this the button would feel dead.
   const [newSessionNonce, setNewSessionNonce] = useState(0);
 
+  const layout = useLayout();
+
+  // --- History-backed overlays ---------------------------------------------
+  // On a phone, the document viewer and the sessions drawer cover the whole
+  // screen, and people close full-screen things with the back gesture. Each
+  // one pushes a history entry when it opens; popstate closes it. Closing from
+  // the UI goes through history.back() so the two paths stay in step.
+  const layers = useRef<Layer[]>([]);
+
+  const pushLayer = useCallback((layer: Layer) => {
+    if (layout.isDesktop) return;
+    try {
+      window.history.pushState({ friday: layer }, '');
+      layers.current.push(layer);
+    } catch { /* history unavailable: fall back to plain state changes */ }
+  }, [layout.isDesktop]);
+
+  /** Close a layer from the UI: pop history if we pushed it, else just close. */
+  const closeLayer = useCallback((layer: Layer, close: () => void) => {
+    const top = layers.current[layers.current.length - 1];
+    if (top === layer) {
+      window.history.back(); // popstate does the closing
+    } else {
+      close();
+    }
+  }, []);
+
   // Deep link: open the document viewer directly from /?document_id=…&pdf_page=….
   // Plain window.location (not useSearchParams) so the static export needs no
   // Suspense boundary. Runs once on mount.
@@ -79,22 +111,41 @@ export default function Home() {
     });
   }, []);
 
-  // Restore the sidebar preference; narrow viewports start with it closed so the
-  // drawer doesn't cover the conversation on first paint.
+  // Restore the sidebar preference on desktop, where it is a persistent rail.
+  // On tablet and phone it is an overlay drawer, and an overlay always starts
+  // closed, whatever was saved on a larger screen.
   useEffect(() => {
+    if (window.innerWidth < TABLET_MAX) {
+      setSidebarOpen(false);
+      return;
+    }
     try {
       const stored = localStorage.getItem('friday.sidebar');
       if (stored) setSidebarOpen(stored === 'open');
-      else if (window.innerWidth < 900) setSidebarOpen(false);
     } catch { /* ignore */ }
   }, []);
 
+  const openSidebar = useCallback(() => {
+    setSidebarOpen(true);
+    pushLayer('drawer');
+  }, [pushLayer]);
+
+  const closeSidebar = useCallback(() => {
+    closeLayer('drawer', () => setSidebarOpen(false));
+  }, [closeLayer]);
+
   const toggleSidebar = useCallback(() => {
-    setSidebarOpen((open) => {
-      try { localStorage.setItem('friday.sidebar', open ? 'closed' : 'open'); } catch { /* ignore */ }
-      return !open;
-    });
-  }, []);
+    if (layout.isDesktop) {
+      // Desktop: a persistent preference, not an overlay.
+      setSidebarOpen((open) => {
+        try { localStorage.setItem('friday.sidebar', open ? 'closed' : 'open'); } catch { /* ignore */ }
+        return !open;
+      });
+      return;
+    }
+    if (sidebarOpen) closeSidebar();
+    else openSidebar();
+  }, [layout.isDesktop, sidebarOpen, openSidebar, closeSidebar]);
 
   // --- Sessions ---
 
@@ -108,7 +159,7 @@ export default function Home() {
     setActiveEvidence(null);
     setActiveSearchResultSetId(null);
     setActiveScope(full.scope_json || FULL_ARCHIVE);
-    if (window.innerWidth < 900) setSidebarOpen(false);
+    if (!layout.isDesktop && sidebarOpen) closeSidebar();
   };
 
   const handleNewSession = () => {
@@ -118,7 +169,7 @@ export default function Home() {
     setActiveSearchResultSetId(null);
     setActiveScope(FULL_ARCHIVE);
     setActiveTab('chat');
-    if (window.innerWidth < 900) setSidebarOpen(false);
+    if (!layout.isDesktop && sidebarOpen) closeSidebar();
   };
 
   /** Create the session a question implies, keeping whatever scope was chosen first. */
@@ -183,12 +234,14 @@ export default function Home() {
   const handleSearchRun = useCallback(() => setActiveSearchResultSetId(null), []);
 
   const handleEvidenceClick = (evidence: EvidenceRef | null) => {
-    setActiveEvidence(evidence);
     setActiveSearchResultSetId(null);
+    if (evidence && !activeEvidence) pushLayer('viewer');
+    setActiveEvidence(evidence);
   };
 
   const handleOpenPageFromSearch = (evidence: EvidenceRef, resultSetId: string) => {
     setActiveSearchResultSetId(resultSetId);
+    if (!activeEvidence) pushLayer('viewer');
     setActiveEvidence(evidence);
   };
 
@@ -215,19 +268,41 @@ export default function Home() {
   const showingEvidence = !!activeEvidence;
   const fromSearch = !!activeSearchResultSetId;
 
-  const handleCloseEvidence = () => {
+  const closeEvidenceNow = useCallback(() => {
     setActiveEvidence(null);
     if (fromSearch) setActiveTab('search');
     // Keep activeSearchResultSetId so results are still there on return.
-  };
+  }, [fromSearch]);
+
+  const handleCloseEvidence = () => closeLayer('viewer', closeEvidenceNow);
+
+  // The back gesture (or button) pops whatever we pushed last.
+  useEffect(() => {
+    const onPop = () => {
+      const top = layers.current.pop();
+      if (top === 'viewer') closeEvidenceNow();
+      else if (top === 'drawer') setSidebarOpen(false);
+    };
+    window.addEventListener('popstate', onPop);
+    return () => window.removeEventListener('popstate', onPop);
+  }, [closeEvidenceNow]);
+
+  const view: 'chat' | 'search' | 'viewer' = showingEvidence ? 'viewer' : activeTab;
 
   return (
-    <div className="app" data-sidebar={sidebarOpen ? 'open' : 'closed'}>
+    <div
+      className="app"
+      data-sidebar={sidebarOpen ? 'open' : 'closed'}
+      data-layout={layout.mode}
+      data-touch={layout.touch ? 'true' : 'false'}
+      data-view={view}
+    >
       <AppHeader
         user={user}
         onLogout={() => setUser(null)}
         sidebarOpen={sidebarOpen}
         onToggleSidebar={toggleSidebar}
+        onNewSession={handleNewSession}
       />
 
       <div className="app-body">
@@ -253,7 +328,7 @@ export default function Home() {
           className="sidebar-scrim"
           aria-label="Close sessions"
           tabIndex={sidebarOpen ? 0 : -1}
-          onClick={toggleSidebar}
+          onClick={closeSidebar}
         />
 
         <SessionSidebar
@@ -332,6 +407,40 @@ export default function Home() {
           )}
         </main>
       </div>
+
+      {/* Phone: the three places you can be, always one tap away. Hidden while a
+          document is open so the page gets the whole screen. */}
+      {layout.isPhone && view !== 'viewer' && (
+        <nav className="bottom-nav" aria-label="Sections">
+          <button
+            type="button"
+            className="bottom-nav-item"
+            aria-current={view === 'chat'}
+            onClick={() => setActiveTab('chat')}
+          >
+            <Icon name="message" size={20} />
+            <span>Chat</span>
+          </button>
+          <button
+            type="button"
+            className="bottom-nav-item"
+            aria-current={view === 'search'}
+            onClick={() => setActiveTab('search')}
+          >
+            <Icon name="search" size={20} />
+            <span>Search</span>
+          </button>
+          <button
+            type="button"
+            className="bottom-nav-item"
+            aria-current={sidebarOpen}
+            onClick={toggleSidebar}
+          >
+            <Icon name="menu" size={20} />
+            <span>Sessions</span>
+          </button>
+        </nav>
+      )}
 
       <Toaster />
     </div>
