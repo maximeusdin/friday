@@ -11,6 +11,22 @@ import { plural } from '@/lib/format';
 
 const INITIAL_LIMIT = 100;
 const FETCH_MORE_BATCH = 100;
+/** How long to keep waiting for a search someone else started (Chat, another tab). */
+const RUNNING_POLL_MS = 2000;
+const RUNNING_POLL_MAX = 45;
+
+/** Fetch a result set's metadata, waiting while the search is still executing.
+ *  Reading a 'running' set gives total_hits = null, which renders as a finished
+ *  search with no results. */
+async function awaitResultSet(id: string, cancelled: () => boolean) {
+  let meta = await api.getSearchResultSet(id);
+  for (let i = 0; meta.status === 'running' && i < RUNNING_POLL_MAX; i++) {
+    await new Promise((r) => setTimeout(r, RUNNING_POLL_MS));
+    if (cancelled()) return meta;
+    meta = await api.getSearchResultSet(id);
+  }
+  return meta;
+}
 
 export interface SearchResultBlock {
   resultSetId: string;
@@ -59,6 +75,13 @@ export function SearchTab({
   const [showChatTabs, setShowChatTabs] = useState(false);
   const [syntaxOpen, setSyntaxOpen] = useState(false);
   const syntaxRef = useRef<HTMLButtonElement>(null);
+  // Result sets started from this tab. The backend inserts a search row (status
+  // 'running') and commits it *before* running the search, which can take a
+  // minute on the full archive — so a concurrent "load this session's saved
+  // searches" can see a half-born search, read total_hits as null, and render
+  // it as a finished search with zero results. These ids are skipped there: the
+  // request that started them is the one that reports them.
+  const startedHere = useRef<Set<string>>(new Set());
 
   const scopeEmpty = activeScope?.mode === 'custom'
     && (activeScope.included_collection_ids?.length ?? 0) === 0
@@ -92,6 +115,7 @@ export function SearchTab({
         fuzzy_progressive: fuzzyMode,  // exact first, then expand-fuzzy in the background
       };
       const res = await api.createSearchResultSet(req);
+      startedHere.current.add(res.result_set_id);
       onSearchRun?.();
       const meta = await api.getSearchResultSet(res.result_set_id);
       const data = await api.getSearchResultSetItems(res.result_set_id, { limit: INITIAL_LIMIT });
@@ -104,7 +128,13 @@ export function SearchTab({
         nextCursor: data.next_cursor ?? null,
         notice: res.notice ?? null,
       };
-      setSearchHistory((prev) => [...prev, block]);
+      setSearchHistory((prev) => {
+        const idx = prev.findIndex((b) => b.resultSetId === block.resultSetId);
+        if (idx < 0) return [...prev, block];
+        const next = [...prev];
+        next[idx] = block;
+        return next;
+      });
       setActiveResultSetId(res.result_set_id);
       setIsSearching(false);
 
@@ -161,11 +191,16 @@ export function SearchTab({
     setError(null);
     setSearchHistory([]);
     setActiveResultSetId(null);
+    // Per-session: on the way back into a session its own searches must load
+    // normally. Protection for a search in flight *right now* comes from the
+    // 'running' status check below.
+    startedHere.current.clear();
     if (!sessionId) return;
     let cancelled = false;
     (async () => {
       try {
-        const summaries = await api.listSearchResultSets(sessionId);
+        const summaries = (await api.listSearchResultSets(sessionId))
+          .filter((s) => !startedHere.current.has(s.id));
         if (cancelled || summaries.length === 0) return;
         const blocks = await Promise.all(
           summaries.map(async (s): Promise<SearchResultBlock | null> => {
@@ -174,6 +209,9 @@ export function SearchTab({
                 api.getSearchResultSet(s.id),
                 api.getSearchResultSetItems(s.id, { limit: INITIAL_LIMIT }),
               ]);
+              // Still executing somewhere else: showing it now would report a
+              // finished search with no hits. It will be there next time.
+              if (meta.status === 'running') return null;
               return {
                 resultSetId: s.id,
                 query: s.query_display || s.query_raw || meta.query_display || 'Search',
@@ -191,12 +229,21 @@ export function SearchTab({
         );
         if (cancelled) return;
         const loaded = blocks.filter((b): b is SearchResultBlock => b !== null);
-        setSearchHistory(loaded);
-        // The most recent search is the active tab on reload — preferring the
-        // researcher's own searches so Chat's don't steal focus.
-        const lastUser = [...loaded].reverse().find((b) => b.origin !== 'chat');
-        const fallback = loaded[loaded.length - 1];
-        if (fallback) setActiveResultSetId((lastUser ?? fallback).resultSetId);
+        if (loaded.length === 0) return;
+        // Merge, never replace: a search started while this was in flight must
+        // survive, and it stays selected if the user is already looking at it.
+        setSearchHistory((prev) => {
+          const byId = new Map(loaded.map((b) => [b.resultSetId, b]));
+          for (const b of prev) byId.set(b.resultSetId, b);
+          return [...byId.values()];
+        });
+        setActiveResultSetId((cur) => {
+          if (cur) return cur;
+          // The most recent search is the active tab on reload — preferring the
+          // researcher's own searches so Chat's don't steal focus.
+          const lastUser = [...loaded].reverse().find((b) => b.origin !== 'chat');
+          return (lastUser ?? loaded[loaded.length - 1]).resultSetId;
+        });
       } catch (e) {
         if (!cancelled) setError(e instanceof Error ? e.message : 'Failed to load saved searches');
       }
@@ -220,7 +267,7 @@ export function SearchTab({
     let cancelled = false;
     (async () => {
       try {
-        const meta = await api.getSearchResultSet(externalResultSetId);
+        const meta = await awaitResultSet(externalResultSetId, () => cancelled);
         if (cancelled) return;
         const data = await api.getSearchResultSetItems(externalResultSetId, { limit: INITIAL_LIMIT });
         if (cancelled) return;
@@ -233,8 +280,11 @@ export function SearchTab({
           nextCursor: data.next_cursor ?? null,
         };
         setSearchHistory((prev) => {
-          if (prev.some((b) => b.resultSetId === externalResultSetId)) return prev;
-          return [...prev, block];
+          const idx = prev.findIndex((b) => b.resultSetId === externalResultSetId);
+          if (idx < 0) return [...prev, block];
+          const next = [...prev];
+          next[idx] = block;
+          return next;
         });
         setActiveResultSetId(externalResultSetId);
         setError(null);
