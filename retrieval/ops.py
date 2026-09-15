@@ -799,6 +799,22 @@ def _parse_lexemes_from_tsquery(tsquery_text: Optional[str]) -> Optional[List[st
     return lexemes if lexemes else None
 
 
+# Transcript-bearing documents (documents.metadata ? 'transcript') keep raw OCR in
+# chunks.text while clean_text holds the corrected transcript. Lexical MATCHING also
+# searches the raw text on those chunks so a vision-transcription error can never
+# delete a previously-findable raw-OCR hit. DISPLAY paths (ts_headline, previews)
+# stay on COALESCE(clean_text, text) only.
+# Requires alias `c` for chunks; inner aliases are suffixed to avoid collisions.
+_TRANSCRIPT_DOC_EXISTS = """EXISTS (
+        SELECT 1
+        FROM chunk_pages cp_tr
+        JOIN pages p_tr ON p_tr.id = cp_tr.page_id
+        JOIN documents d_tr ON d_tr.id = p_tr.document_id
+        WHERE cp_tr.chunk_id = c.id
+          AND d_tr.metadata ? 'transcript'
+      )"""
+
+
 def _fetch_highlights(
     conn,
     chunk_ids: List[int],
@@ -818,7 +834,7 @@ def _fetch_highlights(
         # Use ts_headline to generate highlights
         # tsquery_text is in websearch format, so use websearch_to_tsquery
         cur.execute(
-            """
+            f"""
             SELECT
                 c.id AS chunk_id,
                 ts_headline(
@@ -830,9 +846,13 @@ def _fetch_highlights(
             FROM chunks c
             WHERE c.id = ANY(%s::bigint[])
               AND c.pipeline_version = %s
-              AND to_tsvector('simple', COALESCE(c.clean_text, c.text)) @@ websearch_to_tsquery('simple', %s)
+              AND (
+                to_tsvector('simple', COALESCE(c.clean_text, c.text)) @@ websearch_to_tsquery('simple', %s)
+                OR ({_TRANSCRIPT_DOC_EXISTS}
+                    AND to_tsvector('simple', c.text) @@ websearch_to_tsquery('simple', %s))
+              )
             """,
-            (tsquery_text, chunk_ids, chunk_pv, tsquery_text),
+            (tsquery_text, chunk_ids, chunk_pv, tsquery_text, tsquery_text),
         )
         
         for chunk_id, highlight in cur.fetchall():
@@ -1403,16 +1423,19 @@ def lex_exact(
     if _short_word:
         # \m / \M are Postgres word-boundary markers; regex-safe because the term is alphanumeric
         params["pat"] = r"\m" + term + r"\M"
-        match_sql = ("COALESCE(c.clean_text, c.text) ~ %(pat)s" if case_sensitive
-                     else "COALESCE(c.clean_text, c.text) ~* %(pat)s")
+        _re_op = "~" if case_sensitive else "~*"
+        match_sql = (f"COALESCE(c.clean_text, c.text) {_re_op} %(pat)s"
+                     f" OR ({_TRANSCRIPT_DOC_EXISTS} AND c.text {_re_op} %(pat)s)")
     elif case_sensitive:
         # LIKE is case-sensitive depending on collation; safest: use POSITION on raw string
         # We do a simple POSITION on the display text.
         params["term"] = term
-        match_sql = "POSITION(%(term)s IN COALESCE(c.clean_text, c.text)) > 0"
+        match_sql = ("POSITION(%(term)s IN COALESCE(c.clean_text, c.text)) > 0"
+                     f" OR ({_TRANSCRIPT_DOC_EXISTS} AND POSITION(%(term)s IN c.text) > 0)")
     else:
         params["pat"] = f"%{term}%"
-        match_sql = "COALESCE(c.clean_text, c.text) ILIKE %(pat)s"
+        match_sql = ("COALESCE(c.clean_text, c.text) ILIKE %(pat)s"
+                     f" OR ({_TRANSCRIPT_DOC_EXISTS} AND c.text ILIKE %(pat)s)")
 
     sql = f"""
     SELECT
@@ -1503,11 +1526,17 @@ def lex_and(
     if case_sensitive:
         for i, t in enumerate(terms):
             params[f"t{i}"] = t
-            clauses.append(f"POSITION(%(t{i})s IN COALESCE(c.clean_text, c.text)) > 0")
+            clauses.append(
+                f"(POSITION(%(t{i})s IN COALESCE(c.clean_text, c.text)) > 0"
+                f" OR ({_TRANSCRIPT_DOC_EXISTS} AND POSITION(%(t{i})s IN c.text) > 0))"
+            )
     else:
         for i, t in enumerate(terms):
             params[f"p{i}"] = f"%{t}%"
-            clauses.append(f"COALESCE(c.clean_text, c.text) ILIKE %(p{i})s")
+            clauses.append(
+                f"(COALESCE(c.clean_text, c.text) ILIKE %(p{i})s"
+                f" OR ({_TRANSCRIPT_DOC_EXISTS} AND c.text ILIKE %(p{i})s))"
+            )
 
     match_sql = " AND ".join(clauses)
 
@@ -1634,12 +1663,13 @@ def lex_near(
       cm.date_min,
       cm.date_max,
       COALESCE(c.clean_text, c.text) AS full_text,
-      LEFT(COALESCE(c.clean_text, c.text), %(preview_chars)s) AS preview
+      LEFT(COALESCE(c.clean_text, c.text), %(preview_chars)s) AS preview,
+      CASE WHEN c.clean_text IS NOT NULL AND {_TRANSCRIPT_DOC_EXISTS} THEN c.text END AS raw_text
     FROM chunks c
     JOIN chunk_metadata cm ON cm.chunk_id = c.id
     WHERE {where_sql}
-      AND COALESCE(c.clean_text, c.text) ILIKE %(pa)s
-      AND COALESCE(c.clean_text, c.text) ILIKE %(pb)s
+      AND (COALESCE(c.clean_text, c.text) ILIKE %(pa)s OR ({_TRANSCRIPT_DOC_EXISTS} AND c.text ILIKE %(pa)s))
+      AND (COALESCE(c.clean_text, c.text) ILIKE %(pb)s OR ({_TRANSCRIPT_DOC_EXISTS} AND c.text ILIKE %(pb)s))
     ORDER BY cm.document_id, cm.first_page_id, c.id
     LIMIT %(candidate_pool)s;
     """
@@ -1662,9 +1692,16 @@ def lex_near(
             date_max,
             full_text,
             preview,
+            raw_text,
         ) = r
         toks = _tokenize_for_near(full_text)
         dist = _min_token_distance(toks, a, b)
+        # Union matching: for transcript-bearing docs, also verify proximity in raw OCR text
+        # so a transcript correction can never delete a previously-findable hit.
+        if raw_text:
+            raw_dist = _min_token_distance(_tokenize_for_near(raw_text), a, b)
+            if raw_dist is not None and (dist is None or raw_dist < dist):
+                dist = raw_dist
         if dist is not None and dist <= window_words:
             verified.append((dist, r))
 
@@ -1682,6 +1719,7 @@ def lex_near(
             date_max,
             _full_text,
             preview,
+            _raw_text,
         ) = r
         hits.append(
             ChunkHit(
@@ -2269,6 +2307,7 @@ def hybrid_rrf(
       WHERE {where_sql}
         AND {max_similarity_expr} >= %(soft_lex_trigram_threshold)s
         AND {max_similarity_expr} >= %(soft_lex_threshold)s
+      ORDER BY {max_similarity_expr} DESC, c.id ASC
       LIMIT %(soft_lex_max_results)s
     )"""
             
@@ -2331,7 +2370,15 @@ def hybrid_rrf(
       FROM chunks c
       JOIN chunk_metadata cm ON cm.chunk_id = c.id
       WHERE {where_sql}
-        AND to_tsvector('simple', COALESCE(c.clean_text, c.text)) @@ to_tsquery('simple', %(tsq)s)
+        AND (
+          to_tsvector('simple', COALESCE(c.clean_text, c.text)) @@ to_tsquery('simple', %(tsq)s)
+          OR ({_TRANSCRIPT_DOC_EXISTS}
+              AND to_tsvector('simple', c.text) @@ to_tsquery('simple', %(tsq)s))
+        )
+      ORDER BY ts_rank_cd(
+        to_tsvector('simple', COALESCE(c.clean_text, c.text)),
+        to_tsquery('simple', %(tsq)s)
+      ) DESC, c.id ASC
       LIMIT %(top_n_lex)s
     ){soft_lex_cte},
     fused AS (
@@ -2776,7 +2823,15 @@ def hybrid_rrf_sql(
         FROM chunks c
         JOIN chunk_metadata cm ON cm.chunk_id = c.id
         WHERE {where_sql}
-          AND to_tsvector('simple', COALESCE(c.clean_text, c.text)) @@ to_tsquery('simple', %(tsq)s)
+          AND (
+            to_tsvector('simple', COALESCE(c.clean_text, c.text)) @@ to_tsquery('simple', %(tsq)s)
+            OR ({_TRANSCRIPT_DOC_EXISTS}
+                AND to_tsvector('simple', c.text) @@ to_tsquery('simple', %(tsq)s))
+          )
+        ORDER BY ts_rank_cd(
+            to_tsvector('simple', COALESCE(c.clean_text, c.text)),
+            to_tsquery('simple', %(tsq)s)
+        ) DESC, c.id ASC
         LIMIT %(lex_limit)s
     ),
     vec_ranked AS (
@@ -2875,7 +2930,15 @@ def hybrid_rrf_sql(
             FROM chunks c
             JOIN chunk_metadata cm ON cm.chunk_id = c.id
             WHERE {where_sql}
-              AND to_tsvector('simple', COALESCE(c.clean_text, c.text)) @@ to_tsquery('simple', %(tsq)s)
+              AND (
+                to_tsvector('simple', COALESCE(c.clean_text, c.text)) @@ to_tsquery('simple', %(tsq)s)
+                OR ({_TRANSCRIPT_DOC_EXISTS}
+                    AND to_tsvector('simple', c.text) @@ to_tsquery('simple', %(tsq)s))
+              )
+            ORDER BY ts_rank_cd(
+                to_tsvector('simple', COALESCE(c.clean_text, c.text)),
+                to_tsquery('simple', %(tsq)s)
+            ) DESC, c.id ASC
             LIMIT %(lex_limit)s
         ),
         vec_ranked AS (

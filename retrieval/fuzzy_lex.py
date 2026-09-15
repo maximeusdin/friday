@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import re
 from dataclasses import dataclass, asdict
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -36,6 +37,19 @@ class FuzzyLexConfig:
     min_token_len: int = 3
     dictionary_build_id: Optional[int] = None  # if None, use latest for slice
     stopwords: Optional[Iterable[str]] = None
+    # OCR-variant channel: skeleton-keyed lookup of plausible OCR corruptions
+    # (see retrieval/ocr_variants.py). Rarity is the point — garbled forms are
+    # rare — so that channel ranks chunk_freq ASC, unlike the trigram channel.
+    ocr_enabled: bool = True
+    ocr_max_cost: float = 1.5
+    ocr_top_k: int = 4
+    ocr_freq_ceiling: int = 500
+    # Trigram expansion is skipped for tokens shorter than this. Below ~5
+    # chars the similarity threshold admits mostly truncations and common
+    # real-word neighbours (ranked chunk_freq DESC, so they win), while a
+    # genuine one-letter OCR error can't reach the threshold at all — that
+    # error class belongs to the ocr channel, which has its own len>=4 gate.
+    trgm_min_token_len: int = 5
 
     def to_json(self) -> Dict[str, Any]:
         d = asdict(self)
@@ -116,6 +130,8 @@ def fetch_fuzzy_variants_for_tokens(
 
     with conn.cursor() as cur:
         for tok in tokens:
+            if len(tok) < config.trgm_min_token_len:
+                continue  # short tokens: ocr channel only (see config comment)
             # Fast pre-filter using similarity() against lexeme; rank primarily by corpus frequency, then similarity.
             cur.execute(
                 """
@@ -147,7 +163,93 @@ def fetch_fuzzy_variants_for_tokens(
                 if total_variants >= config.max_total_variants:
                     break
 
+    # OCR-variant channel: expand query tokens to corpus tokens that are
+    # plausible OCR corruptions (e.g. FUHR -> FUER), which trigram similarity
+    # misses for short names. Lazy import: the module (and its config artifact)
+    # may be absent; retrieval must never crash because of it.
+    if config.ocr_enabled and build_id is not None and tokens:
+        try:
+            _ocr = importlib.import_module("retrieval.ocr_variants")
+        except ImportError:
+            _ocr = None
+        if _ocr is not None:
+            conf = _ocr.load_confusion()
+            ocr_expansions = _ocr.fetch_ocr_variants(
+                conn,
+                tokens,
+                build_id,
+                conf,
+                max_cost=config.ocr_max_cost,
+                top_k=config.ocr_top_k,
+                freq_ceiling=config.ocr_freq_ceiling,
+            )
+            _merge_ocr_expansions(
+                tokens=tokens,
+                expansions=expansions,
+                ocr_expansions=ocr_expansions or {},
+                max_total_variants=config.max_total_variants,
+            )
+
     return (build_id, expansions)
+
+
+def _merge_ocr_expansions(
+    *,
+    tokens: List[str],
+    expansions: Dict[str, List[Dict[str, Any]]],
+    ocr_expansions: Dict[str, List[Dict[str, Any]]],
+    max_total_variants: int,
+) -> None:
+    """
+    Merge OCR-variant entries into the trigram expansions, in place.
+
+    Per token: trigram entries keep their existing order and gain
+    "source":"trgm" — upgraded to "both" when the ocr channel found the same
+    lexeme — then ocr-only entries ("source":"ocr", carrying "cost") follow,
+    ordered by (cost asc, chunk_freq asc). max_total_variants is honored
+    across the merged set: trigram entries first, then ocr entries cheapest
+    (lowest cost) first across all tokens.
+    """
+    total_variants = 0
+    seen_by_token: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    for tok, entries in expansions.items():
+        by_lexeme: Dict[str, Dict[str, Any]] = {}
+        for entry in entries:
+            entry["source"] = "trgm"
+            by_lexeme[str(entry.get("lexeme"))] = entry
+        seen_by_token[tok] = by_lexeme
+        total_variants += len(entries)
+
+    # Collect ocr-only candidates globally so the cap keeps the cheapest first.
+    candidates: List[Tuple[float, int, int, str, Dict[str, Any]]] = []
+    for tok_idx, tok in enumerate(tokens):
+        by_lexeme = seen_by_token.setdefault(tok, {})
+        for ocr_entry in ocr_expansions.get(tok) or []:
+            lex = ocr_entry.get("lexeme")
+            if not lex:
+                continue
+            lex = str(lex)
+            existing = by_lexeme.get(lex)
+            if existing is not None:
+                # Found by both channels: keep the trigram dict, relabel.
+                if existing.get("source") == "trgm":
+                    existing["source"] = "both"
+                continue
+            merged = dict(ocr_entry)
+            merged["source"] = "ocr"
+            by_lexeme[lex] = merged
+            cost = float(merged.get("cost", 0.0))
+            freq = int(merged.get("chunk_freq") or 0)
+            candidates.append((cost, freq, tok_idx, tok, merged))
+
+    # Global rank (cost asc, chunk_freq asc): rarity is the point for the ocr
+    # channel — garbled forms are rare — so low chunk_freq wins, not high.
+    candidates.sort(key=lambda c: (c[0], c[1], c[2]))
+    for cost, freq, tok_idx, tok, merged in candidates:
+        if total_variants >= max_total_variants:
+            break
+        expansions.setdefault(tok, []).append(merged)
+        total_variants += 1
 
 
 def _tsquery_escape_token(t: str) -> str:

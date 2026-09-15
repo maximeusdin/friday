@@ -216,7 +216,8 @@ def main():
             print(f"    ussr_ref_no={refset}")
             print(f"    sender={senderset}  recipient={recipset}")
             print(f"    date_min={dmin}  date_max={dmax}")
-            print(f"    preview: {preview.replace('\\n',' ')}")
+            flat_preview = preview.replace("\n", " ")
+            print(f"    preview: {flat_preview}")
             print()
 
     finally:

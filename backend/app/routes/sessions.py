@@ -31,6 +31,7 @@ class Session(BaseModel):
     label: str
     created_at: datetime
     message_count: Optional[int] = None
+    search_count: Optional[int] = None
     last_activity: Optional[datetime] = None
     scope_json: Optional[dict] = None
     output_mode: Optional[str] = "evidence_only"  # evidence_only | evidence_summary | narrative
@@ -152,19 +153,28 @@ def list_sessions(user=Depends(require_user)):
     conn = get_conn()
     try:
         with conn.cursor() as cur:
+            # Pre-aggregated subqueries (not direct joins) so the two counts
+            # don't cross-multiply per session.
             cur.execute(
                 """
-                SELECT 
+                SELECT
                     s.id,
                     s.label,
                     s.created_at,
-                    COUNT(m.id) AS message_count,
-                    MAX(m.created_at) AS last_activity
+                    COALESCE(m.cnt, 0) AS message_count,
+                    COALESCE(sr.cnt, 0) AS search_count,
+                    GREATEST(m.last_at, sr.last_at) AS last_activity
                 FROM research_sessions s
-                LEFT JOIN research_messages m ON m.session_id = s.id
+                LEFT JOIN (
+                    SELECT session_id, COUNT(*) AS cnt, MAX(created_at) AS last_at
+                    FROM research_messages GROUP BY session_id
+                ) m ON m.session_id = s.id
+                LEFT JOIN (
+                    SELECT session_id, COUNT(*) AS cnt, MAX(created_at) AS last_at
+                    FROM search_result_sets GROUP BY session_id
+                ) sr ON sr.session_id = s.id
                 WHERE s.user_sub = %s
-                GROUP BY s.id
-                ORDER BY COALESCE(MAX(m.created_at), s.created_at) DESC
+                ORDER BY COALESCE(GREATEST(m.last_at, sr.last_at), s.created_at) DESC
                 """,
                 (sub,),
             )
@@ -175,7 +185,8 @@ def list_sessions(user=Depends(require_user)):
                     label=row[1],
                     created_at=row[2],
                     message_count=row[3],
-                    last_activity=row[4],
+                    search_count=row[4],
+                    last_activity=row[5],
                 )
                 for row in rows
             ]

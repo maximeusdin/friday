@@ -294,19 +294,21 @@ def _build_s3_url(source_ref: Optional[str], source_name: str, collection_slug: 
     else:
         path = _fallback_s3_path(collection_slug, source_name)
 
-    path = path.lstrip("/")
+    return _public_data_url(path)
+
+
+def _public_data_url(path: str) -> str:
+    """Public URL for an object under the PDF bucket, path like "data/raw/x.pdf"."""
+    from urllib.parse import quote
+
     # URL-encode each segment (handles spaces in filenames, e.g. "Venona London GRU.pdf")
-    path_encoded = "/".join(quote(part, safe="") for part in path.split("/"))
-    
-    # Build URL - S3_PDF_BUCKET is typically a domain like "fridayarchive.org"
-    # which serves as an S3 website endpoint
+    path_encoded = "/".join(quote(part, safe="") for part in path.lstrip("/").split("/"))
+
+    # S3_PDF_BUCKET is typically a domain like "fridayarchive.org" (CloudFront /
+    # S3 website endpoint); a bare bucket name falls back to the REST URL.
     if "." in S3_PDF_BUCKET:
-        # Domain-style bucket (S3 website hosting or CloudFront)
-        # https://fridayarchive.org/data/raw/...
         return f"https://{S3_PDF_BUCKET}/{path_encoded}"
     else:
-        # Standard S3 bucket URL
-        # https://bucket-name.s3.us-west-1.amazonaws.com/data/raw/...
         return f"https://{S3_PDF_BUCKET}.s3.{S3_PDF_REGION}.amazonaws.com/{path_encoded}"
 
 
@@ -402,6 +404,160 @@ def _find_pdf_by_filename(pdf_root: Path, filename: str) -> Optional[Path]:
             if f.lower() == filename_lower:
                 return Path(dirpath) / f
     return None
+
+
+# =============================================================================
+# Collection zips (bulk download)
+#
+# scripts/build_collection_zips.py publishes data/zips/<slug>.zip plus
+# data/zips/manifest.json to the PDF bucket. These endpoints surface that
+# manifest to the frontend; the zips themselves are served straight from
+# S3/CloudFront in production.
+# =============================================================================
+
+_ZIPS_MANIFEST_PATH = "data/zips/manifest.json"
+_ZIPS_CACHE_TTL_SECONDS = 300
+_ZIPS_NEGATIVE_TTL_SECONDS = 60
+_ZIPS_MANIFEST_MISSING = object()  # sentinel: "looked, not there" (cached briefly)
+_zips_manifest_cache: dict = {"at": 0.0, "data": None}
+
+
+class CollectionZipInfo(BaseModel):
+    slug: str
+    title: Optional[str] = None
+    num_files: int
+    total_bytes: Optional[int] = None
+    zip_bytes: Optional[int] = None
+    built_at: Optional[str] = None
+    url: str
+
+
+class CollectionZipsResponse(BaseModel):
+    generated_at: Optional[str] = None
+    collections: list[CollectionZipInfo] = []
+    complete: Optional[CollectionZipInfo] = None
+
+
+def _load_zips_manifest() -> Optional[dict]:
+    """Manifest from S3 (prod) or local data/zips/ (dev), cached briefly.
+
+    CloudFront serves the SPA index.html with status 200 for ANY missing path,
+    so a JSON parse guard — not the status code — decides whether it exists.
+    """
+    import time
+
+    now = time.monotonic()
+    cached = _zips_manifest_cache["data"]
+    if cached is not None:
+        age = now - _zips_manifest_cache["at"]
+        if cached is _ZIPS_MANIFEST_MISSING:
+            # Negative result cached briefly: before the first zip publish this
+            # endpoint is hit on every modal open, and each miss would otherwise
+            # be a fresh blocking network fetch pinning a threadpool worker.
+            if age < _ZIPS_NEGATIVE_TTL_SECONDS:
+                return None
+        elif age < _ZIPS_CACHE_TTL_SECONDS:
+            return cached
+
+    manifest = None
+    if S3_PDF_BUCKET:
+        import httpx
+
+        try:
+            resp = httpx.get(_public_data_url(_ZIPS_MANIFEST_PATH), timeout=5.0)
+            if resp.status_code == 200:
+                content_type = resp.headers.get("content-type", "")
+                if "html" not in content_type.lower():
+                    data = resp.json()
+                    if isinstance(data, dict) and isinstance(data.get("collections"), list):
+                        manifest = data
+        except Exception:
+            manifest = None
+    else:
+        local = PDF_ROOT / "zips" / "manifest.json"
+        if local.exists():
+            try:
+                import json
+
+                data = json.loads(local.read_text(encoding="utf-8"))
+                if isinstance(data, dict) and isinstance(data.get("collections"), list):
+                    manifest = data
+            except Exception:
+                manifest = None
+
+    _zips_manifest_cache["data"] = manifest if manifest is not None else _ZIPS_MANIFEST_MISSING
+    _zips_manifest_cache["at"] = now
+    return manifest
+
+
+def _zip_url_for_client(slug: str, zip_key: str) -> str:
+    if S3_PDF_BUCKET:
+        return _public_data_url(zip_key)
+    return f"/api/collection_zips/{slug}/download"
+
+
+@router.get("/collection_zips", response_model=CollectionZipsResponse)
+def get_collection_zips():
+    """List downloadable per-collection zip archives (empty until first publish)."""
+    manifest = _load_zips_manifest()
+    if not manifest:
+        return CollectionZipsResponse()
+
+    collections = []
+    for entry in manifest.get("collections", []):
+        slug = entry.get("slug")
+        zip_key = entry.get("zip_key")
+        if not slug or not zip_key or not entry.get("num_files"):
+            continue
+        collections.append(CollectionZipInfo(
+            slug=slug,
+            title=entry.get("title"),
+            num_files=entry["num_files"],
+            total_bytes=entry.get("total_bytes"),
+            zip_bytes=entry.get("zip_bytes"),
+            built_at=entry.get("built_at"),
+            url=_zip_url_for_client(slug, zip_key),
+        ))
+
+    complete = None
+    comp = manifest.get("complete")
+    if comp and comp.get("zip_key") and comp.get("num_files"):
+        complete = CollectionZipInfo(
+            slug="friday_complete",
+            title="Complete archive (all collections)",
+            num_files=comp["num_files"],
+            total_bytes=comp.get("total_bytes"),
+            zip_bytes=comp.get("zip_bytes"),
+            built_at=comp.get("built_at"),
+            url=_zip_url_for_client("friday_complete", comp["zip_key"]),
+        )
+
+    return CollectionZipsResponse(
+        generated_at=manifest.get("generated_at"),
+        collections=collections,
+        complete=complete,
+    )
+
+
+@router.get("/collection_zips/{slug}/download")
+def download_collection_zip(slug: str):
+    """Dev-mode zip download (prod links point straight at S3/CloudFront)."""
+    import re
+
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", slug):
+        raise HTTPException(status_code=404, detail="Unknown collection zip")
+
+    if S3_PDF_BUCKET:
+        return RedirectResponse(url=_public_data_url(f"data/zips/{slug}.zip"), status_code=302)
+
+    local = PDF_ROOT / "zips" / f"{slug}.zip"
+    if not local.exists():
+        raise HTTPException(status_code=404, detail="Zip not built; run scripts/build_collection_zips.py")
+    return FileResponse(
+        path=local,
+        media_type="application/zip",
+        filename=f"{slug}.zip",
+    )
 
 
 @router.get("/evidence", response_model=EvidenceResponse)
@@ -531,6 +687,8 @@ class DocumentNodeResponse(BaseModel):
     source_ref: Optional[str] = None
     volume: Optional[str] = None
     chunk_count: Optional[int] = None
+    size_bytes: Optional[int] = None
+    pdf_url: Optional[str] = None
 
 
 @router.get("/collections_tree", response_model=list[CollectionNodeResponse])
@@ -583,36 +741,51 @@ def get_collection_documents(
     conn = get_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT 1 FROM collections WHERE id = %s", (collection_id,))
-            if not cur.fetchone():
+            cur.execute("SELECT slug FROM collections WHERE id = %s", (collection_id,))
+            col_row = cur.fetchone()
+            if not col_row:
                 raise HTTPException(status_code=404, detail="Collection not found")
+            collection_slug = col_row[0]
 
-            if include_counts:
-                cur.execute("""
-                    SELECT d.id, d.source_name, d.source_ref, d.volume,
-                           COUNT(cm.chunk_id) AS chunk_count
-                    FROM documents d
-                    LEFT JOIN chunk_metadata cm ON cm.document_id = d.id
-                    WHERE d.collection_id = %s
-                    GROUP BY d.id
-                    ORDER BY d.source_name
-                """, (collection_id,))
-            else:
-                cur.execute("""
-                    SELECT d.id, d.source_name, d.source_ref, d.volume
-                    FROM documents d
-                    WHERE d.collection_id = %s
-                    ORDER BY d.source_name
-                """, (collection_id,))
+            def _select(with_size: bool):
+                size_col = "d.size_bytes" if with_size else "NULL"
+                if include_counts:
+                    cur.execute(f"""
+                        SELECT d.id, d.source_name, d.source_ref, d.volume, {size_col},
+                               COUNT(cm.chunk_id) AS chunk_count
+                        FROM documents d
+                        LEFT JOIN chunk_metadata cm ON cm.document_id = d.id
+                        WHERE d.collection_id = %s
+                        GROUP BY d.id
+                        ORDER BY d.source_name
+                    """, (collection_id,))
+                else:
+                    cur.execute(f"""
+                        SELECT d.id, d.source_name, d.source_ref, d.volume, {size_col}
+                        FROM documents d
+                        WHERE d.collection_id = %s
+                        ORDER BY d.source_name
+                    """, (collection_id,))
+
+            # size_bytes is backfilled by scripts/backfill_document_sizes.py;
+            # stay compatible with DBs that predate the column.
+            try:
+                _select(with_size=True)
+            except psycopg2.errors.UndefinedColumn:
+                conn.rollback()
+                _select(with_size=False)
             rows = cur.fetchall()
+
             result = []
             for row in rows:
                 node = DocumentNodeResponse(
                     id=row[0], source_name=row[1],
                     source_ref=row[2], volume=row[3],
+                    size_bytes=row[4],
+                    pdf_url=_build_pdf_url_for_client(row[2], row[1], collection_slug, row[0]),
                 )
-                if include_counts and len(row) > 4:
-                    node.chunk_count = row[4]
+                if include_counts and len(row) > 5:
+                    node.chunk_count = row[5]
                 result.append(node)
             return result
     finally:

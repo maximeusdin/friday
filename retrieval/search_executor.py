@@ -8,6 +8,7 @@ per page. Computes snippets in Python.
 
 from __future__ import annotations
 
+import importlib
 import json
 import logging
 import os
@@ -19,7 +20,14 @@ from psycopg2.extras import execute_values
 
 from retrieval.agent.v9_session import session_scope_to_filter
 from retrieval.agent.v9_types import ScopeFilter
-from retrieval.ops import SearchFilters, _build_where, concordance_expand_terms, _extract_query_terms
+from retrieval.fuzzy_lex import get_latest_dictionary_build_id, tokenize_query
+from retrieval.ops import (
+    SearchFilters,
+    _build_where,
+    concordance_expand_terms,
+    _extract_query_terms,
+    resolve_collection_pipeline_versions,
+)
 from retrieval.search_expansion import pem_expand_surfaces_for_query, pem_enumerate_pages_for_entity
 from retrieval.agent.v10_page_bridge import chunks_for_pages, has_page_entity_mentions, pages_to_chunks_map
 from retrieval.agent.v10_normalize import normalize_surface_for_lookup
@@ -48,6 +56,16 @@ FUZZY_MAX_RESULTS = 2000
 
 # Snippet prefetch: compute snippets for first N hits only; rest fetched on demand
 PREFETCH_SNIPPETS = 100
+
+# Shared by the fuzzy-expand phases (variant-exact + trigram) so hits land
+# identically; PK ON CONFLICT dedupes across phases, earlier insert wins.
+# Whitespace matches the historical inline literal so emitted SQL is unchanged.
+PAGE_HITS_INSERT_SQL = """
+                    INSERT INTO search_result_page_hits
+                    (result_set_id, collection_id, document_id, page_id, page_seq, pdf_page_number, chunk_id, snippet, hit_rank)
+                    VALUES %s
+                    ON CONFLICT (result_set_id, collection_id, document_id, page_id) DO NOTHING
+                    """
 
 
 def _scope_is_pem_only(filters: SearchFilters) -> bool:
@@ -92,7 +110,7 @@ def _run_fuzzy_page_hits_query(
 
     sql = f"""
     WITH matched_chunks AS (
-      SELECT c.id, c.text, {max_similarity_expr} AS rank
+      SELECT c.id, COALESCE(c.clean_text, c.text) AS text, {max_similarity_expr} AS rank
       FROM chunks c
       JOIN chunk_metadata cm ON cm.chunk_id = c.id AND cm.pipeline_version = c.pipeline_version
       WHERE {scope_where}
@@ -344,7 +362,7 @@ def _run_page_hits_query(
 
     sql = f"""
     WITH matched_chunks AS (
-      SELECT c.id, c.text,
+      SELECT c.id, COALESCE(c.clean_text, c.text) AS text,
              GREATEST(
                ts_rank_cd(c.{tsv_col}, ({tsquery_sql_named2})),
                COALESCE(ts_rank_cd(cec.text_canonical_tsv, ({tsquery_sql_named2})), 0)
@@ -763,6 +781,81 @@ def run_search(
     return {"total_hits": total_hits_val, "coverage_json": coverage, "status": status}
 
 
+def _ocr_variant_terms_for_collections(
+    conn,
+    query_raw: str,
+    collection_slugs: List[str],
+) -> Dict[str, List[str]]:
+    """
+    OCR-variant channel for the fuzzy phase: for each scoped collection that has
+    a corpus dictionary build (chunk_pv, slug, norm_v1), expand query tokens to
+    corpus lexemes that are plausible OCR corruptions (skeleton lookup +
+    confusion-weighted distance; e.g. typed FUHR OCR-read as FUER, which
+    word_similarity misses for short names). Returns slug -> variant terms.
+
+    Never raises and never leaves the transaction aborted: with zero dictionary
+    builds (prod today), a missing retrieval.ocr_variants module, or any error,
+    it returns {} and the caller behaves exactly as before this channel existed.
+    """
+    if not collection_slugs:
+        return {}
+    tokens = tokenize_query(query_raw)
+    if not tokens:
+        return {}
+    # Lazy import: the module (and its config artifact) may be absent;
+    # retrieval must never crash because of it (mirrors retrieval/fuzzy_lex.py).
+    try:
+        _ocr = importlib.import_module("retrieval.ocr_variants")
+    except ImportError:
+        return {}
+
+    out: Dict[str, List[str]] = {}
+    try:
+        try:
+            pv_by_slug = dict(resolve_collection_pipeline_versions(conn, collection_slugs))
+        except ValueError:
+            # Batch resolve is all-or-nothing; retry per collection so one bad
+            # collection (no chunks / multiple PVs) doesn't disable the rest.
+            pv_by_slug = {}
+            for slug in collection_slugs:
+                try:
+                    pv_by_slug.update(dict(resolve_collection_pipeline_versions(conn, [slug])))
+                except ValueError:
+                    continue
+        conf = None
+        for slug in collection_slugs:
+            pv = pv_by_slug.get(slug)
+            if not pv:
+                continue
+            build_id = get_latest_dictionary_build_id(
+                conn, chunk_pv=pv, collection_slug=slug, norm_version="norm_v1"
+            )
+            if build_id is None:
+                continue  # no build for this collection; others may have one
+            if conf is None:
+                conf = _ocr.load_confusion()
+            expansions = _ocr.fetch_ocr_variants(conn, tokens, build_id, conf) or {}
+            terms: List[str] = []
+            for tok in tokens:
+                for entry in expansions.get(tok) or []:
+                    lex = str(entry.get("lexeme") or "")
+                    if lex and lex != tok and lex not in terms:
+                        terms.append(lex)
+            if terms:
+                out[slug] = terms
+    except Exception:
+        logger.warning("OCR-variant expansion disabled for this search", exc_info=True)
+        # A failed statement (e.g. skeleton column not migrated yet) aborts the
+        # psycopg2 transaction; the caller has written nothing yet at this
+        # point, so rolling back only clears the failed transaction state.
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return {}
+    return out
+
+
 def run_search_expand_fuzzy(
     conn,
     result_set_id: str,
@@ -802,6 +895,22 @@ def run_search_expand_fuzzy(
     if not collections_to_search:
         return {"total_hits": 0, "status": "complete"}
 
+    # OCR-variant channel: expand query tokens to corpus lexemes that are
+    # plausible OCR corruptions and run them through the exact page-hits
+    # machinery below, so they land (and get labeled) exactly like fuzzy hits.
+    # Zero dictionary builds (prod today) => {} and byte-identical behavior.
+    ocr_variant_terms = _ocr_variant_terms_for_collections(
+        conn, query_raw, [slug for _cid, slug, _title in collections_to_search]
+    )
+    tsv_col = "tsv_simple"
+    if any(ocr_variant_terms.values()):
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name = 'chunks' AND column_name = 'tsv_simple'
+            """)
+            tsv_col = "tsv_simple" if cur.fetchone() else "tsv"
+
     with conn.cursor() as cur:
         cur.execute("SELECT COALESCE(MAX(hit_rank), 0) FROM search_result_page_hits WHERE result_set_id = %s", (result_set_id,))
         hit_rank = cur.fetchone()[0] or 0
@@ -814,6 +923,26 @@ def run_search_expand_fuzzy(
             date_from=filters.date_from,
             date_to=filters.date_to,
         )
+        # Variant-exact hits first: they claim (result_set, collection, document,
+        # page) slots with lower hit_rank, so the word_similarity inserts below
+        # dedupe against them via ON CONFLICT DO NOTHING.
+        variant_terms = ocr_variant_terms.get(slug) or []
+        if variant_terms:
+            variant_primitives = [OrGroupPrimitive(primitives=[TermPrimitive(value=t) for t in variant_terms])]
+            v_tsquery_sql, _, v_tsquery_params = compile_search_primitives_to_tsquery(variant_primitives)
+            variant_rows = _run_page_hits_query(conn, v_tsquery_sql, v_tsquery_params, col_filters, tsv_col=tsv_col)
+            insert_rows = []
+            for r in variant_rows:
+                hit_rank += 1
+                collection_id, document_id, page_id, page_seq, pdf_page_number, chunk_id, text = r
+                if hit_rank <= PREFETCH_SNIPPETS:
+                    snippet = _compute_snippet(conn, chunk_id, text or "", variant_terms + phrases)
+                else:
+                    snippet = ""
+                insert_rows.append((result_set_id, collection_id, document_id, page_id, page_seq, pdf_page_number, chunk_id, snippet, hit_rank))
+            if insert_rows:
+                with conn.cursor() as cur:
+                    execute_values(cur, PAGE_HITS_INSERT_SQL, insert_rows)
         fuzzy_rows = _run_fuzzy_page_hits_query(conn, query_raw, col_filters)
         if not fuzzy_rows:
             continue
@@ -828,16 +957,7 @@ def run_search_expand_fuzzy(
             insert_rows.append((result_set_id, collection_id, document_id, page_id, page_seq, pdf_page_number, chunk_id, snippet, hit_rank))
         if insert_rows:
             with conn.cursor() as cur:
-                execute_values(
-                    cur,
-                    """
-                    INSERT INTO search_result_page_hits
-                    (result_set_id, collection_id, document_id, page_id, page_seq, pdf_page_number, chunk_id, snippet, hit_rank)
-                    VALUES %s
-                    ON CONFLICT (result_set_id, collection_id, document_id, page_id) DO NOTHING
-                    """,
-                    insert_rows,
-                )
+                execute_values(cur, PAGE_HITS_INSERT_SQL, insert_rows)
         if on_progress:
             on_progress("collection", col_idx + 1, total_cols, {"slug": slug, "title": title or slug, "hits": len(fuzzy_rows), "phase": "fuzzy"})
 
@@ -852,6 +972,14 @@ def run_search_expand_fuzzy(
         cur.execute("SELECT id, slug, title FROM collections")
         collections = {r[0]: {"id": r[0], "slug": r[1], "title": r[2]} for r in cur.fetchall()}
 
+    # Include variant terms so fetch_more_snippets can center snippets on the
+    # garbled form that actually matched. Empty variants => identical to phrases.
+    coverage_phrases = list(phrases)
+    for terms in ocr_variant_terms.values():
+        for t in terms:
+            if t not in coverage_phrases:
+                coverage_phrases.append(t)
+
     coverage = {
         "collections": [
             {"id": cid, "slug": collections.get(cid, {}).get("slug", ""), "title": collections.get(cid, {}).get("title", ""), "hits": cnt}
@@ -861,7 +989,7 @@ def run_search_expand_fuzzy(
         "collections_searched": len(collection_hits),
         "collections_total": len(collections),
         "missing_collections": [],
-        "phrases": phrases,
+        "phrases": coverage_phrases,
     }
 
     with conn.cursor() as cur:

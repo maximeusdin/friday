@@ -5,16 +5,28 @@ expansion and codename resolution).
 """
 import csv
 import io
+import os
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, Query
-from fastapi.responses import StreamingResponse
+from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel
 
 from app.routes.auth_cognito import require_user
+from app.routes.documents import PDF_ROOT, S3_PDF_BUCKET, _build_s3_url
 from app.services.db import get_conn
 
 router = APIRouter()
+
+# Original PDF edition of the concordance (John Earl Haynes' "Index and
+# Concordance to Alexander Vassiliev's Notebooks and Soviet Cables Deciphered
+# by the National Security Agency's Venona Project"). Path is relative to the
+# data/ root, mirrored in S3 like every other served PDF.
+CONCORDANCE_PDF_REL_PATH = os.getenv(
+    "CONCORDANCE_PDF_PATH",
+    "raw/index/Vassiliev_Notebooks_and_Venona_Index-Concordance.pdf",
+)
+CONCORDANCE_PDF_FILENAME = "Vassiliev_Notebooks_and_Venona_Index-Concordance.pdf"
 
 
 class ConcordanceEntry(BaseModel):
@@ -177,4 +189,31 @@ def concordance_export(
         generate(),
         media_type="text/csv",
         headers={"Content-Disposition": 'attachment; filename="concordance_index.csv"'},
+    )
+
+
+@router.api_route("/concordance/pdf", methods=["GET", "HEAD"])
+def concordance_pdf(user=Depends(require_user)):
+    """Serve the original PDF edition of the concordance (Haynes' Index and
+    Concordance to the Vassiliev Notebooks and Venona cables).
+
+    In production (S3_PDF_BUCKET set), redirects to the S3 copy under
+    data/raw/index/. In development, serves the file from PDF_ROOT if present.
+    """
+    if S3_PDF_BUCKET:
+        s3_url = _build_s3_url(f"data/{CONCORDANCE_PDF_REL_PATH}", CONCORDANCE_PDF_FILENAME, "")
+        return RedirectResponse(url=s3_url, status_code=302)
+
+    pdf_path = (PDF_ROOT / CONCORDANCE_PDF_REL_PATH).resolve()
+    if not pdf_path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail=f"Concordance PDF not found: {CONCORDANCE_PDF_REL_PATH}. "
+            "Set S3_PDF_BUCKET or place the file under PDF_ROOT.",
+        )
+    return FileResponse(
+        path=pdf_path,
+        media_type="application/pdf",
+        filename=CONCORDANCE_PDF_FILENAME,
+        headers={"Content-Disposition": f'inline; filename="{CONCORDANCE_PDF_FILENAME}"'},
     )

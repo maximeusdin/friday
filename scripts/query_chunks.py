@@ -300,7 +300,8 @@ def main():
                 print(f"[{i}] chunk_id={cid}  score={float(score):.6f}  r_vec={r_vec}  r_lex={r_lex}")
             print(f"    collection_slug={collection_slug}  document_id={document_id}  pages={first_page_id}->{last_page_id}")
             print(f"    date_min={dmin}  date_max={dmax}")
-            print(f"    preview: {preview.replace('\\n',' ')}")
+            flat_preview = preview.replace("\n", " ")
+            print(f"    preview: {flat_preview}")
             print()
 
     finally:

@@ -89,8 +89,15 @@ fi
 # 1) Build image with BUILD_SHA baked in
 ############################################
 echo "Building Docker image..."
+# Fargate service runs LINUX/X86_64 (see task definition runtimePlatform), so
+# always build linux/amd64 — Apple Silicon Macs otherwise produce arm64-only
+# images that fail on ECS with "CannotPullContainerError: image Manifest does
+# not contain descriptor matching". --provenance=false keeps the attestation
+# manifest out of the image index (same pull error on some ECS versions).
 docker build \
-  --build-arg BUILD_SHA="${SHA}" \
+  --platform linux/amd64 \
+  --provenance=false \
+  --build-arg GIT_SHA="${SHA}" \
   --no-cache \
   -t "${ECR_REPO_NAME}:${SHA}" \
   -t "${ECR_REPO_NAME}:latest" \
@@ -118,8 +125,26 @@ docker tag "${ECR_REPO_NAME}:${SHA}" "${IMAGE_SHA}"
 docker tag "${ECR_REPO_NAME}:latest" "${ECR_IMAGE_BASE}:latest"
 
 echo "Pushing images..."
-docker push "${IMAGE_SHA}"
-docker push "${ECR_IMAGE_BASE}:latest"
+# ECR occasionally drops a blob upload mid-flight ("failed to do request: ... EOF").
+# Layers already uploaded are skipped on retry, so a re-push is cheap — far cheaper
+# than losing the --no-cache rebuild above.
+push_with_retry() {
+  local ref="$1" attempt
+  for attempt in 1 2 3; do
+    if docker push "${ref}"; then
+      return 0
+    fi
+    echo "  push failed (attempt ${attempt}/3) for ${ref}; re-authenticating and retrying in $((attempt * 10))s..."
+    sleep $((attempt * 10))
+    aws ecr get-login-password --region "${AWS_REGION}" \
+      | docker login --username AWS --password-stdin "${ECR_REGISTRY}" >/dev/null
+  done
+  echo "ERROR: docker push failed 3 times for ${ref}" >&2
+  return 1
+}
+
+push_with_retry "${IMAGE_SHA}"
+push_with_retry "${ECR_IMAGE_BASE}:latest"
 
 ############################################
 # 5) Discover current task definition from the service

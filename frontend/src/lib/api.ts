@@ -748,7 +748,7 @@ export async function sendV9MessageStreaming(
 // Scope Window API
 // =============================================================================
 
-import type { CollectionNode, DocumentNode, UserSelectedScope } from '@/types/api';
+import type { CollectionNode, CollectionZipsResponse, DocumentNode, UserSelectedScope } from '@/types/api';
 
 async function getCollectionsTree(includeCounts = false): Promise<CollectionNode[]> {
   const params = includeCounts ? '?include_counts=1' : '';
@@ -758,6 +758,49 @@ async function getCollectionsTree(includeCounts = false): Promise<CollectionNode
 async function getCollectionDocuments(collectionId: number, includeCounts = false): Promise<DocumentNode[]> {
   const params = includeCounts ? '?include_counts=1' : '';
   return request<DocumentNode[]>(`/collections/${collectionId}/documents${params}`);
+}
+
+async function getCollectionZips(): Promise<CollectionZipsResponse> {
+  return request<CollectionZipsResponse>('/collection_zips');
+}
+
+/**
+ * Make an archive asset URL (PDF or zip) usable from the current page.
+ *
+ * Absolute URLs are pinned to the site apex (https://fridayarchive.org/...) by
+ * the backend, but the SPA is also reachable on www.fridayarchive.org — and the
+ * CDN serves no CORS headers, so a fetch() from www to the apex is blocked.
+ * Both hosts front the same distribution, so rewriting to the page's own origin
+ * keeps the fetch same-origin. Relative URLs (dev mode: "/api/...") are
+ * resolved against the API host, not the Next.js dev server.
+ */
+export function resolveArchiveAssetUrl(url: string): string {
+  if (/^https?:\/\//i.test(url)) {
+    if (typeof window !== 'undefined') {
+      try {
+        const u = new URL(url);
+        const page = window.location;
+        if (u.hostname !== page.hostname && page.hostname === `www.${u.hostname}`) {
+          u.protocol = page.protocol;
+          u.host = page.host;
+          return u.toString();
+        }
+      } catch {
+        /* fall through to the URL as given */
+      }
+    }
+    return url;
+  }
+  // Relative "/api/..." path from a dev backend: prefix the API origin
+  // (getRequestBase() ends in "/api", which the path already includes).
+  return getRequestBase().replace(/\/api\/?$/, '') + url;
+}
+
+/** Fetchable PDF URL for a document row: absolute S3/CloudFront URL in prod,
+ *  routed through the API in dev (where it serves the local file). */
+export function resolveDocumentPdfUrl(doc: Pick<DocumentNode, 'id' | 'pdf_url'>): string {
+  if (doc.pdf_url && /^https?:\/\//i.test(doc.pdf_url)) return resolveArchiveAssetUrl(doc.pdf_url);
+  return getDocumentPdfUrl(doc.id);
 }
 
 async function getSessionScope(sessionId: number): Promise<UserSelectedScope> {
@@ -975,6 +1018,12 @@ function getConcordanceExportUrl(): string {
   return `${getRequestBase()}/concordance/export?format=csv`;
 }
 
+/** URL of the original PDF edition of the concordance (Haynes' Index and
+ * Concordance to the Vassiliev Notebooks and Venona cables). */
+function getConcordancePdfUrl(): string {
+  return `${getRequestBase()}/concordance/pdf`;
+}
+
 // =============================================================================
 // Export
 // =============================================================================
@@ -1013,6 +1062,9 @@ export const api = {
   // Scope Window
   getCollectionsTree,
   getCollectionDocuments,
+  getCollectionZips,
+  resolveArchiveAssetUrl,
+  resolveDocumentPdfUrl,
   getSessionScope,
   updateSessionScope,
   updateOutputMode,
@@ -1030,6 +1082,7 @@ export const api = {
   getConcordanceSummary,
   getConcordanceEntries,
   getConcordanceExportUrl,
+  getConcordancePdfUrl,
 };
 
 export { ApiError };

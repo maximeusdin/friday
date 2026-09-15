@@ -1,31 +1,43 @@
 'use client';
 
-import { useEffect, useState } from 'react';
-import { api } from '@/lib/api';
-import type { CollectionNode, DocumentNode } from '@/types/api';
-import { ClaudeConnectBody } from './AddToClaude';
+import { ChatbotConnectBody } from './ConnectChatbot';
+import { CollectionsDownloadsBody } from './CollectionsDownloads';
 
-export type InfoSection = 'about' | 'howto' | 'chatsearch' | 'claude';
+export type InfoSection = 'about' | 'collections' | 'howto' | 'chatsearch' | 'connect';
 
 export const INFO_SECTIONS: { key: InfoSection; label: string }[] = [
   { key: 'about', label: 'About' },
+  { key: 'collections', label: 'Collections & Downloads' },
   { key: 'howto', label: 'How to Use' },
   { key: 'chatsearch', label: 'Chat vs. Search' },
-  { key: 'claude', label: 'Use in Claude' },
+  { key: 'connect', label: 'Use in Chatbots' },
 ];
 
 const TITLES: Record<InfoSection, string> = {
   about: 'About Friday',
+  collections: 'Collections & Downloads',
   howto: 'How to Use Friday',
   chatsearch: 'Chat vs. Search',
-  claude: 'Use Friday in Claude',
+  connect: 'Use Friday in Your AI Chatbot',
 };
 
 /** Shared info modal — opened from the header buttons and the splash cards. */
-export function InfoModal({ section, onClose }: { section: InfoSection; onClose: () => void }) {
+export function InfoModal({
+  section,
+  onClose,
+  initialCollectionId,
+}: {
+  section: InfoSection;
+  onClose: () => void;
+  /** For section="collections": expand this collection on open. */
+  initialCollectionId?: number;
+}) {
   return (
     <div className="about-overlay" onClick={onClose} role="dialog" aria-modal="true" aria-label={TITLES[section]}>
-      <div className="about-card" onClick={(e) => e.stopPropagation()}>
+      <div
+        className={section === 'collections' ? 'about-card about-card--wide' : 'about-card'}
+        onClick={(e) => e.stopPropagation()}
+      >
         <div className="about-card-header">
           <h2>{TITLES[section]}</h2>
           <button type="button" className="about-close-btn" onClick={onClose} aria-label="Close">
@@ -34,9 +46,10 @@ export function InfoModal({ section, onClose }: { section: InfoSection; onClose:
         </div>
         <div className="about-card-body">
           {section === 'about' && <AboutBody />}
+          {section === 'collections' && <CollectionsDownloadsBody initialCollectionId={initialCollectionId} />}
           {section === 'howto' && <HowToBody />}
           {section === 'chatsearch' && <ChatVsSearchBody />}
-          {section === 'claude' && <ClaudeConnectBody />}
+          {section === 'connect' && <ChatbotConnectBody />}
         </div>
       </div>
     </div>
@@ -89,8 +102,8 @@ function HowToBody() {
       <p><strong>What Friday doesn&apos;t do:</strong> it can&apos;t read text the OCR mangled beyond
         recognition (try Fuzzy in Search for near-miss spellings); it won&apos;t speculate beyond
         the documents; and it doesn&apos;t search outside the indexed collections.</p>
-      <h3>Using Friday in Claude</h3>
-      <ClaudeConnectBody />
+      <h3>Using Friday in AI chatbots</h3>
+      <ChatbotConnectBody />
     </>
   );
 }
@@ -131,30 +144,6 @@ function ChatVsSearchBody() {
 }
 
 function AboutBody() {
-  const [collections, setCollections] = useState<CollectionNode[] | null>(null);
-  const [collectionsError, setCollectionsError] = useState<string | null>(null);
-  const [expandedId, setExpandedId] = useState<number | null>(null);
-  const [docsByCollection, setDocsByCollection] = useState<Record<number, DocumentNode[] | 'loading' | 'error'>>({});
-
-  useEffect(() => {
-    let cancelled = false;
-    api.getCollectionsTree(true)
-      .then((cols) => { if (!cancelled) setCollections(cols); })
-      .catch((e) => { if (!cancelled) setCollectionsError(e instanceof Error ? e.message : 'Failed to load collections'); });
-    return () => { cancelled = true; };
-  }, []);
-
-  const toggleCollection = (colId: number) => {
-    const next = expandedId === colId ? null : colId;
-    setExpandedId(next);
-    if (next != null && docsByCollection[next] === undefined) {
-      setDocsByCollection((prev) => ({ ...prev, [next]: 'loading' }));
-      api.getCollectionDocuments(next)
-        .then((docs) => setDocsByCollection((prev) => ({ ...prev, [next]: docs })))
-        .catch(() => setDocsByCollection((prev) => ({ ...prev, [next]: 'error' })));
-    }
-  };
-
   return (
     <>
       <h3>What is Friday?</h3>
@@ -168,12 +157,10 @@ function AboutBody() {
         nulla pariatur.
       </p>
       <h3>Funding</h3>
-      {/* Placeholder copy — replace with real funding acknowledgement */}
       <p>
-        Lorem ipsum dolor sit amet, consectetur adipiscing elit. Nemo
-        enim ipsam voluptatem quia voluptas sit aspernatur aut odit aut
-        fugit, sed quia consequuntur magni dolores eos qui ratione
-        voluptatem sequi nesciunt.
+        Friday has been funded by a National Endowment for the Humanities
+        Chairman&apos;s Grant, FEJ-310584-26, and an Emory University Heilbrun
+        Distinguished Emeritus Fellowship.
       </p>
       <h3>Origins of Friday</h3>
       {/* Placeholder copy — replace with the real origin story: who conceived and
@@ -188,75 +175,9 @@ function AboutBody() {
       </p>
       <h3>Collections</h3>
       <p className="about-collections-hint">
-        Click a collection to see what it consists of, its files, and its source.
+        The archive&apos;s collections — and every file in them, individually or in bulk — are
+        browsable and downloadable under <strong>Collections &amp; Downloads</strong>.
       </p>
-      {collectionsError && <div className="search-error">{collectionsError}</div>}
-      {!collections && !collectionsError && <div className="loading">Loading collections…</div>}
-      {collections?.map((col) => {
-        const docs = docsByCollection[col.id];
-        const isOpen = expandedId === col.id;
-        return (
-          <div key={col.id} className="about-collection">
-            <button
-              type="button"
-              className="about-collection-row"
-              onClick={() => toggleCollection(col.id)}
-              aria-expanded={isOpen}
-            >
-              <span className="about-collection-chevron">{isOpen ? '▼' : '▶'}</span>
-              <span className="about-collection-name">{col.title || col.slug}</span>
-              {col.document_count != null && (
-                <span className="about-collection-count">
-                  {col.document_count} document{col.document_count === 1 ? '' : 's'}
-                </span>
-              )}
-            </button>
-            {isOpen && (
-              <div className="about-collection-detail">
-                {/* Placeholder copy — replace with the real collection description */}
-                <p>
-                  Lorem ipsum dolor sit amet, consectetur adipiscing elit —
-                  quis nostrud exercitation ullamco laboris nisi ut aliquip
-                  ex ea commodo consequat.
-                </p>
-                <p className="about-collection-source">
-                  {/* Placeholder — replace with the real source/provenance */}
-                  <strong>Source:</strong> Lorem ipsum dolor sit amet, consectetur adipiscing elit.
-                </p>
-                <div className="about-collection-files-label">Files</div>
-                {docs === 'loading' && <div className="loading">Loading files…</div>}
-                {docs === 'error' && <div className="search-error">Failed to load files.</div>}
-                {Array.isArray(docs) && (
-                  docs.length > 0 ? (
-                    <div className="about-collection-files-scroll">
-                      <table className="about-collection-files-table">
-                        <thead>
-                          <tr>
-                            <th>#</th>
-                            <th>File</th>
-                            <th>Source reference</th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {docs.map((d, i) => (
-                            <tr key={d.id}>
-                              <td className="files-table-num">{i + 1}</td>
-                              <td>{d.source_name || `Document #${d.id}`}</td>
-                              <td className="files-table-ref">{d.source_ref || '—'}</td>
-                            </tr>
-                          ))}
-                        </tbody>
-                      </table>
-                    </div>
-                  ) : (
-                    <div className="about-collection-files-empty">No documents.</div>
-                  )
-                )}
-              </div>
-            )}
-          </div>
-        );
-      })}
     </>
   );
 }

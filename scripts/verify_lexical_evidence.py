@@ -52,7 +52,7 @@ def verify_run(conn, run_id: int):
     print(f"{'=' * 80}")
     print(f"Query: {query_text!r}")
     print(f"Search type: {search_type}")
-    print(f"tsquery_text: {tsquery_text!r if tsquery_text else 'NULL'}")
+    print(f"tsquery_text: {repr(tsquery_text) if tsquery_text else 'NULL'}")
     print(f"Expected chunks: {num_chunks}")
     
     # Get evidence

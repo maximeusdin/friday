@@ -180,7 +180,10 @@ export function SessionList({ activeSessionId, onSessionSelect, onSessionDelete 
                 <div className="session-meta">
                   {formatDate(session.last_activity || session.created_at)}
                   {session.message_count !== undefined && (
-                    <> · {session.message_count} messages</>
+                    <> · {session.message_count} {session.message_count === 1 ? 'message' : 'messages'}</>
+                  )}
+                  {session.search_count !== undefined && (
+                    <> · {session.search_count} {session.search_count === 1 ? 'search' : 'searches'}</>
                   )}
                   {runningIds.includes(session.id) && (
                     <span style={{ color: 'var(--color-primary, #4a90d9)' }}> · running…</span>

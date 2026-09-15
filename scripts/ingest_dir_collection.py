@@ -45,6 +45,18 @@ def s3_relative_ref(path: Path) -> str:
     return p
 
 
+def set_document_size_bytes(cur, doc_id: int, size_bytes: int):
+    """Record the PDF byte size (drives download-size UI). Savepoint-guarded so
+    ingest still works against DBs that predate the documents.size_bytes column."""
+    import psycopg2.errors
+    cur.execute("SAVEPOINT size_col")
+    try:
+        cur.execute("UPDATE documents SET size_bytes=%s WHERE id=%s", (size_bytes, doc_id))
+    except psycopg2.errors.UndefinedColumn:
+        cur.execute("ROLLBACK TO SAVEPOINT size_col")
+    cur.execute("RELEASE SAVEPOINT size_col")
+
+
 def get_pages_embedded(pdf_path):
     doc = fitz.open(str(pdf_path))
     pages = [(i + 1, extract_page_text(doc, i)) for i in range(doc.page_count)]
@@ -121,6 +133,7 @@ def main():
                     "page_count": len(raw_pages), "sha256": sha256_file(Path(f))}
             doc_id = upsert_document(cur, collection_id=collection_id, source_name=name,
                                      source_ref=s3_relative_ref(Path(f)), volume="", metadata=meta)
+            set_document_size_bytes(cur, doc_id, os.path.getsize(f))
             delete_chunks_for_document(cur, doc_id)
             delete_pages_for_document(cur, doc_id)
 
@@ -142,7 +155,14 @@ def main():
             try:
                 conn.rollback()
             except Exception:
-                pass
+                # Connection is dead (e.g. server dropped it during a long OCR wait);
+                # reconnect so the remaining files don't cascade-fail on a closed cursor.
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                conn = _connect()
+                cur = conn.cursor()
             print(f"[{n}/{len(files)}] SKIP {name[:42]:42} -> {type(e).__name__}: {str(e)[:90]}", flush=True)
             continue
 

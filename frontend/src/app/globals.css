@@ -630,6 +630,25 @@ html, body {
   flex: 1;
 }
 
+.concordance-intro {
+  margin: 10px 0 14px;
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.concordance-intro .about-section-body p {
+  margin: 8px 0;
+}
+
+.concordance-intro-title {
+  font-weight: 600;
+}
+
+.concordance-intro-byline {
+  color: var(--color-text-muted);
+  font-size: 12px;
+}
+
 .concordance-entry {
   padding: 8px 0;
   border-top: 1px solid var(--color-border);
@@ -3142,4 +3161,166 @@ textarea:focus {
 .search-load-more {
   margin-top: var(--spacing-md);
   width: 100%;
+}
+
+/* =============================================================================
+   Collections & Downloads (info modal section)
+   ============================================================================= */
+
+/* Wider card variant: the files table + checkboxes need more room than 560px */
+.about-card--wide {
+  max-width: 760px;
+}
+
+.about-collection-header {
+  display: flex;
+  align-items: center;
+}
+
+.about-collection-header .about-collection-row {
+  flex: 1;
+  min-width: 0;
+}
+
+.col-zip-link {
+  flex: none;
+  font-size: 12px;
+  padding: 3px 10px;
+  margin-right: 8px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm, 4px);
+  color: var(--color-text);
+  text-decoration: none;
+  white-space: nowrap;
+  background: var(--color-bg);
+}
+
+.col-zip-link:hover {
+  background: var(--color-bg-subtle, rgba(0, 0, 0, 0.03));
+}
+
+.dl-complete-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm, 4px);
+  padding: 8px 10px;
+  margin-bottom: 10px;
+  font-size: 13px;
+}
+
+.dl-complete-row .col-zip-link {
+  margin-right: 0;
+}
+
+.dl-files-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.dl-select-all {
+  font-size: 12px;
+  color: var(--color-text-muted);
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.about-collection-files-table .files-table-check {
+  width: 26px;
+  text-align: center;
+}
+
+.about-collection-files-table .files-table-check input {
+  cursor: pointer;
+  vertical-align: middle;
+}
+
+.about-collection-files-table .files-table-size {
+  width: 64px;
+  white-space: nowrap;
+  color: var(--color-text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.about-collection-files-table tr.dl-row-selected td {
+  background: var(--color-bg-subtle, rgba(0, 0, 0, 0.03));
+}
+
+/* Sticky selection / progress bar pinned to the bottom of the scrolling card */
+.dl-bar {
+  position: sticky;
+  bottom: 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 12px -20px -20px;
+  padding: 10px 20px;
+  background: var(--color-bg);
+  border-top: 1px solid var(--color-border);
+  font-size: 13px;
+}
+
+.dl-bar-status {
+  flex: 1;
+  min-width: 0;
+}
+
+.dl-bar-text {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--color-text-muted);
+}
+
+.dl-bar-error {
+  color: #721c24;
+}
+
+.dl-bar-btn {
+  flex: none;
+  font-size: 12px;
+  padding: 4px 12px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm, 4px);
+  background: var(--color-bg);
+  cursor: pointer;
+}
+
+.dl-bar-btn:hover {
+  background: var(--color-bg-subtle, rgba(0, 0, 0, 0.03));
+}
+
+.dl-bar-btn-primary {
+  background: var(--color-primary, #0d6efd);
+  border-color: var(--color-primary, #0d6efd);
+  color: #fff;
+}
+
+.dl-bar-btn-primary:hover {
+  filter: brightness(1.08);
+  background: var(--color-primary, #0d6efd);
+}
+
+.dl-progress-track {
+  height: 6px;
+  border-radius: 3px;
+  background: var(--color-bg-subtle, rgba(0, 0, 0, 0.06));
+  border: 1px solid var(--color-border);
+  overflow: hidden;
+  margin-bottom: 4px;
+}
+
+.dl-progress-fill {
+  height: 100%;
+  background: var(--color-primary, #0d6efd);
+  transition: width 0.15s linear;
 }

@@ -17,8 +17,9 @@ why those two tools carry those exact names.
 """
 import json
 import os
+import re
 import uuid
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import anyio
 from mcp.server.fastmcp import FastMCP
@@ -79,27 +80,130 @@ mcp = FastMCP(
 # search
 # =============================================================================
 
-def _search_impl(query: str, collection: Optional[str], mode: str, limit: int) -> Dict[str, Any]:
+def _resolve_slugs_to_ids(conn, slugs: List[str]) -> Dict[str, int]:
+    """Map collection slugs to ids; silently drops unknown slugs."""
+    if not slugs:
+        return {}
+    with conn.cursor() as cur:
+        cur.execute("SELECT slug, id FROM collections WHERE slug = ANY(%s)", (list(slugs),))
+        return {slug: cid for (slug, cid) in cur.fetchall()}
+
+
+def _search_impl(
+    query: str,
+    scope_text: Optional[str],
+    collection: Optional[str],
+    mode: str,
+    limit: int,
+) -> Dict[str, Any]:
     query = (query or "").strip()
     if not query:
         return {"error": "Query is required."}
+    original_query = query
     if mode not in ("exact", "fuzzy"):
         mode = "exact"
     limit = max(1, min(limit, 50))
 
+    from retrieval.agent.scope_nl import detect_nl_scope, resolve_scope_text, strip_nl_scope
+
     conn = get_conn()
     try:
         scope: Dict[str, Any] = {"mode": "full_archive"}
+        scoped_slugs: List[str] = []
+        notices: List[str] = []
+        explicit_full_archive = False
+
+        # 1. Free-text scope parameter ("the Rosenberg files and Venona").
+        if scope_text and scope_text.strip():
+            res = resolve_scope_text(conn, scope_text)
+            if res.exclusion:
+                return {
+                    "error": (
+                        f"Scope '{scope_text}' excludes collections, which isn't supported — "
+                        "scopes are include-lists only."
+                    ),
+                    "hint": "Call list_collections and pass a scope naming the collections to INCLUDE.",
+                }
+            if res.full_archive:
+                explicit_full_archive = True
+            elif res.collections:
+                scoped_slugs.extend(res.collections)
+            else:
+                colls = _list_collections_impl().get("collections", [])
+                return {
+                    "error": f"Could not match scope '{scope_text}' to any collection.",
+                    "collections": [
+                        {"slug": c["slug"], "title": c["title"]} for c in colls
+                    ],
+                    "hint": "Re-run with scope naming one or more of these collections (or 'full archive').",
+                }
+
+        # 2. Explicit slug parameter (kept for backward compatibility; unioned in).
         if collection:
-            with conn.cursor() as cur:
-                cur.execute("SELECT id FROM collections WHERE slug = %s", (collection,))
-                row = cur.fetchone()
-            if not row:
+            if collection not in _resolve_slugs_to_ids(conn, [collection]):
                 return {
                     "error": f"Unknown collection slug '{collection}'.",
                     "hint": "Call list_collections to see valid slugs, or omit the parameter to search the full archive.",
                 }
-            scope = {"mode": "custom", "included_collection_ids": [row[0]]}
+            if collection not in scoped_slugs:
+                scoped_slugs.append(collection)
+
+        # 3. Scope phrases inside the query itself ("Perlo group in the Venona
+        #    decrypts"): always strip them from the retrieval query so they
+        #    don't pollute the keyword match; apply them as scope only when no
+        #    explicit 'full archive' was requested.
+        det = detect_nl_scope(conn, query)
+        if det.collections:
+            stripped = strip_nl_scope(query, det.matched_phrases)
+            # If nothing meaningful survives ("the Venona decrypts" -> "the"),
+            # the query was pure scope: ask for search terms rather than
+            # searching for stopwords.
+            leftover = [
+                w for w in re.findall(r"\w+", stripped.lower())
+                if w not in ("the", "a", "an", "of", "in", "on", "for", "about", "from", "all")
+            ]
+            if not leftover:
+                return {
+                    "error": (
+                        f"'{original_query}' names where to search "
+                        f"({', '.join(det.collections)}) but not what to search for."
+                    ),
+                    "hint": "Re-run with search terms in query and the collection(s) in scope.",
+                }
+            query = stripped
+            if explicit_full_archive:
+                notices.append(
+                    "Searched the full archive as requested; removed the scope wording "
+                    f"({', '.join(det.matched_phrases)}) from the query terms."
+                )
+            else:
+                new_slugs = [s for s in det.collections if s not in scoped_slugs]
+                scoped_slugs.extend(new_slugs)
+                if not scope_text and not collection:
+                    notices.append(
+                        f"Scoped to {', '.join(det.collections)} based on your query wording. "
+                        "Pass scope='full archive' to search everything instead."
+                    )
+                elif new_slugs:
+                    notices.append(
+                        f"Also included {', '.join(new_slugs)}, named in the query wording."
+                    )
+
+        if scoped_slugs:
+            slug_to_id = _resolve_slugs_to_ids(conn, scoped_slugs)
+            missing = [s for s in scoped_slugs if s not in slug_to_id]
+            if missing and not slug_to_id:
+                return {
+                    "error": f"Collections not found: {', '.join(missing)}.",
+                    "hint": "Call list_collections to see what exists.",
+                }
+            if missing:
+                notices.append(f"Ignored unknown collections: {', '.join(missing)}.")
+            scoped_slugs = [s for s in scoped_slugs if s in slug_to_id]
+            scope = {
+                "mode": "custom",
+                "included_collection_ids": [slug_to_id[s] for s in scoped_slugs],
+            }
 
         result_set_id = str(uuid.uuid4())
         with conn.cursor() as cur:
@@ -110,7 +214,7 @@ def _search_impl(query: str, collection: Optional[str], mode: str, limit: int) -
                  alias_expand, is_exhaustive, status, origin, origin_query)
                 VALUES (%s, %s, NULL, %s, %s, %s, 'page', 'canonical', true, %s, 'running', 'mcp', %s)
                 """,
-                (result_set_id, MCP_USER_SUB, json.dumps(scope), query, mode, mode == "exact", query),
+                (result_set_id, MCP_USER_SUB, json.dumps(scope), query, mode, mode == "exact", original_query),
             )
         conn.commit()
 
@@ -128,7 +232,6 @@ def _search_impl(query: str, collection: Optional[str], mode: str, limit: int) -
 
         # Same NL fallback the Search tab uses: a full sentence ANDs every word
         # (including verbs that never co-occur with the answer) and returns zero.
-        notice = None
         if out.get("total_hits", 0) == 0:
             from app.routes.search import _keyword_relax, _looks_like_nl_query
 
@@ -138,7 +241,7 @@ def _search_impl(query: str, collection: Optional[str], mode: str, limit: int) -
                     out2 = run_search(conn, result_set_id, relaxed, scope, alias_expand=True, mode=mode)
                     if out2.get("status") != "error" and out2.get("total_hits", 0) > 0:
                         out = out2
-                        notice = (
+                        notices.append(
                             f'No exact matches for the full phrase; searched the keywords instead: "{relaxed}".'
                         )
 
@@ -175,12 +278,13 @@ def _search_impl(query: str, collection: Optional[str], mode: str, limit: int) -
         total = out.get("total_hits", len(results))
         resp: Dict[str, Any] = {
             "query": query,
+            "scope": {"collections": scoped_slugs} if scoped_slugs else "full_archive",
             "total_hits": total,
             "showing": len(results),
             "results": results,
         }
-        if notice:
-            resp["notice"] = notice
+        if notices:
+            resp["notice"] = " ".join(notices)
         if total > len(results):
             resp["note"] = (
                 f"{total - len(results)} more hits not shown. Narrow the query, scope to a "
@@ -194,6 +298,7 @@ def _search_impl(query: str, collection: Optional[str], mode: str, limit: int) -
 @mcp.tool()
 async def search(
     query: str,
+    scope: Optional[str] = None,
     collection: Optional[str] = None,
     mode: str = "exact",
     limit: int = 15,
@@ -207,12 +312,19 @@ async def search(
     `OR` between terms, "quoted phrases" for exact phrases. Known aliases and
     codenames are expanded automatically. Prefer 1-3 distinctive terms over full
     sentences. Use mode='fuzzy' to catch OCR-garbled spellings of a name.
-    Optionally scope with a collection slug from list_collections.
+
+    To restrict where to search, pass `scope` in plain language — e.g.
+    "the Venona decrypts and Vassiliev notebooks", "FBI Silvermaster file",
+    "Rosenberg grand jury" or "full archive". Multiple collections are fine;
+    the response echoes which collections were actually searched. If the user's
+    request names its own scope ("...in the Venona cables"), that is detected
+    automatically. `collection` (a single slug from list_collections) still
+    works and is unioned in.
 
     Returns page-level hits with snippets; use `fetch` to read a full page or
     document, and cite viewer_url so readers can open the scanned page.
     """
-    return await anyio.to_thread.run_sync(lambda: _search_impl(query, collection, mode, limit))
+    return await anyio.to_thread.run_sync(lambda: _search_impl(query, scope, collection, mode, limit))
 
 
 # =============================================================================

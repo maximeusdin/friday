@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "copy-pdf-worker": "node -e \"const p=require('path').dirname(require.resolve('react-pdf/package.json'));require('fs').copyFileSync(require.resolve('pdfjs-dist/build/pdf.worker.min.mjs',{paths:[p]}),'public/pdf.worker.min.mjs')\"",
+    "copy-pdf-worker": "node -e \"const fs=require('fs');fs.mkdirSync('public',{recursive:true});const p=require('path').dirname(require.resolve('react-pdf/package.json'));fs.copyFileSync(require.resolve('pdfjs-dist/build/pdf.worker.min.mjs',{paths:[p]}),'public/pdf.worker.min.mjs')\"",
     "predev": "npm run copy-pdf-worker",
     "prebuild": "npm run copy-pdf-worker",
     "dev": "next dev",
@@ -12,20 +12,22 @@
     "lint": "next lint"
   },
   "dependencies": {
+    "@tanstack/react-query": "^5.60.0",
+    "client-zip": "^2.5.0",
+    "clsx": "^2.1.0",
     "next": "^14.2.0",
+    "pdf-lib": "^1.17.1",
+    "pdfjs-dist": "^4.4.168",
     "react": "^18.3.0",
     "react-dom": "^18.3.0",
-    "@tanstack/react-query": "^5.60.0",
-    "react-pdf": "^9.1.0",
-    "pdfjs-dist": "^4.4.168",
-    "clsx": "^2.1.0"
+    "react-pdf": "^9.1.0"
   },
   "devDependencies": {
-    "typescript": "^5.5.0",
     "@types/node": "^20.14.0",
     "@types/react": "^18.3.0",
     "@types/react-dom": "^18.3.0",
     "eslint": "^8.57.0",
-    "eslint-config-next": "^14.2.0"
+    "eslint-config-next": "^14.2.0",
+    "typescript": "^5.5.0"
   }
 }

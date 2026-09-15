@@ -81,6 +81,7 @@ export interface Session {
   label: string;
   created_at: string;
   message_count?: number;
+  search_count?: number;
   last_activity?: string;
   scope_json?: UserSelectedScope;
   output_mode?: OutputMode;
@@ -411,6 +412,26 @@ export interface DocumentNode {
   source_ref?: string;
   volume?: string;
   chunk_count?: number;
+  size_bytes?: number | null;    // PDF byte size (null until backfilled)
+  pdf_url?: string | null;       // direct PDF URL (absolute in prod, /api path in dev)
+}
+
+/** One downloadable collection zip, from GET /collection_zips (built offline
+ *  by scripts/build_collection_zips.py and served from S3/CloudFront). */
+export interface CollectionZipInfo {
+  slug: string;
+  title?: string | null;
+  num_files: number;
+  total_bytes?: number | null;
+  zip_bytes?: number | null;
+  built_at?: string | null;
+  url: string;
+}
+
+export interface CollectionZipsResponse {
+  generated_at?: string | null;
+  collections: CollectionZipInfo[];
+  complete?: CollectionZipInfo | null;
 }
 
 export type ScopeMode = 'full_archive' | 'custom';

@@ -41,6 +41,7 @@ _CURATED: Dict[str, Tuple[List[str], bool]] = {
     "soviet_atomic_espionage_1951": (["soviet atomic espionage"], False),
     "hiss_chambers": (["hiss-chambers", "hiss and chambers", "alger hiss", "whittaker chambers", "hiss", "chambers"], True),
     "rosenberg": (["rosenberg case", "julius rosenberg", "rosenberg"], True),
+    "rosenberg_ethel": (["ethel rosenberg", "rosenberg, ethel"], True),
     "rosenberg_grand_jury": (["rosenberg grand jury"], False),
     "rosenberg_trial_transcripts": (["rosenberg trial"], False),
     "judith_coplon": (["judith coplon", "coplon"], True),
@@ -59,7 +60,23 @@ _CURATED: Dict[str, Tuple[List[str], bool]] = {
     "brothman_moskowitz_grand_jury": (["brothman", "moskowitz"], True),
     "soviet_intel_travel_techniques": (["travel techniques", "intelligence techniques"], False),
     "volodarsky": (["volodarsky", "feldman"], True),
+    "witzak": (["witzak", "witczak", "witzack"], True),
+    "ruth_alscher": (["ruth alscher", "alscher"], True),
+    "arthur_barr": (["arthur barr"], True),
+    "joel_barr": (["joel barr", "barr"], True),
+    "elizabeth_bentley": (["elizabeth bentley", "bentley"], True),
+    "emanuel_bloch": (["emanuel bloch", "bloch"], True),
+    "thomas_black": (["thomas black", "black"], True),
+    "gouzenko": (["igor gouzenko", "gouzenko", "corby case", "corby"], True),
+    "harry_gold": (["harry gold", "gold"], True),
 }
+
+# Exclusion phrasing in a scope description — not supported by the scope model
+# (include-lists only), so resolvers flag it rather than misread it.
+_EXCLUSION_RE = re.compile(
+    r"\b(?:except|excluding|exclude|but\b(?!\s+also\b)|other\s+than|apart\s+from|aside\s+from|without|minus|not\b)",
+    re.IGNORECASE,
+)
 
 # "full archive" reset phrases.
 _FULL_ARCHIVE_RE = re.compile(
@@ -73,6 +90,7 @@ class NLScopeResult:
     collections: List[str] = field(default_factory=list)   # detected collection slugs
     matched_phrases: List[str] = field(default_factory=list)
     full_archive: bool = False                              # explicit "full archive" reset
+    exclusion: bool = False                                 # "except X" — unsupported, caller should reject
     confidence: float = 0.0
 
     @property
@@ -136,6 +154,66 @@ def detect_nl_scope(conn, question: str, *, verbose: bool = False) -> NLScopeRes
         result.confidence = 0.85 if len(found) == 1 else 0.7
         if verbose:
             print(f"  [NL scope] detected {result.collections} via {result.matched_phrases}", file=sys.stderr)
+    return result
+
+
+def resolve_scope_text(conn, text: str) -> NLScopeResult:
+    """Resolve free text that is KNOWN to describe a scope (e.g. the MCP `scope`
+    parameter: "the Rosenberg files and Venona") to collection slugs.
+
+    Unlike detect_nl_scope, no scope-cue words are required and ambiguous
+    person-name phrases match directly — the caller has already told us the
+    whole string is a scope description. Matches curated phrases, slugs
+    (underscores as spaces), and collection titles, longest phrase first with
+    span consumption so "rosenberg grand jury" beats the shorter "rosenberg".
+    """
+    result = NLScopeResult()
+    t = " " + (text or "").lower().strip() + " "
+    if not t.strip():
+        return result
+    # Exclusion phrasing ("all files except Venona") would otherwise match the
+    # full-archive regex and silently search the excluded collection too.
+    if _EXCLUSION_RE.search(text or ""):
+        result.exclusion = True
+        return result
+    if _FULL_ARCHIVE_RE.search(text or ""):
+        result.full_archive = True
+        result.confidence = 0.9
+        return result
+
+    titles = _collection_titles(conn)
+    valid_slugs = set(titles.keys()) or set(_CURATED.keys())
+
+    candidates: List[Tuple[str, str]] = []
+    for slug in valid_slugs:
+        phrases = list(_CURATED.get(slug, ([], False))[0])
+        phrases.append(slug.replace("_", " "))
+        title = (titles.get(slug) or "").strip().lower()
+        if title:
+            phrases.append(title)
+        for ph in phrases:
+            ph = ph.strip().lower()
+            if ph:
+                candidates.append((ph, slug))
+
+    candidates.sort(key=lambda c: -len(c[0]))
+    consumed: List[Tuple[int, int]] = []
+    found: Dict[str, str] = {}
+    for ph, slug in candidates:
+        # Lookarounds instead of \b: titles can start/end with punctuation
+        # ("HUAC (...) Reports (1948-1964)"), where \b never matches.
+        for m in re.finditer(rf"(?<!\w){re.escape(ph)}(?!\w)", t):
+            span = m.span()
+            if any(s < span[1] and span[0] < e for s, e in consumed):
+                continue
+            consumed.append(span)
+            found.setdefault(slug, ph)
+            break
+
+    if found:
+        result.collections = list(found.keys())
+        result.matched_phrases = list(found.values())
+        result.confidence = 0.85
     return result
 
 

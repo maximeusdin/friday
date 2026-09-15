@@ -1,12 +1,13 @@
 'use client';
 
-import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import { useState, useEffect, useRef, useCallback, useMemo, type CSSProperties } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { Document, Page, pdfjs } from 'react-pdf';
 import 'react-pdf/dist/Page/TextLayer.css';
 import 'react-pdf/dist/Page/AnnotationLayer.css';
 import { api } from '@/lib/api';
 import type { EvidenceRef } from '@/types/api';
+import { InfoModal } from './InfoModal';
 
 // Wire up the PDF.js worker. `pdfjs.version` is the EXACT pdfjs-dist version react-pdf uses
 // (its own bundled copy), so pinning the worker to that version can never drift from the API —
@@ -78,6 +79,41 @@ const HIGHLIGHT_SUPPORTED =
   typeof (window as unknown as { Highlight?: unknown }).Highlight !== 'undefined' &&
   typeof CSS !== 'undefined' &&
   'highlights' in CSS;
+
+// --- Transcript provenance chip (document.metadata.transcript.status) ---
+// Documents whose searchable text was produced by AI vision transcription carry
+// transcript.status in their metadata: 'machine_unverified' until a human
+// review pass promotes it to 'reviewed'. Most documents have neither.
+const TRANSCRIPT_CHIP_BASE: CSSProperties = {
+  display: 'inline-block',
+  marginLeft: 'var(--spacing-md)',
+  padding: '1px 8px',
+  borderRadius: 999,
+  fontSize: '11px',
+  fontWeight: 500,
+  whiteSpace: 'nowrap',
+  verticalAlign: 'middle',
+};
+
+const TRANSCRIPT_CHIPS: Record<string, { label: string; tooltip: string; style: CSSProperties }> = {
+  machine_unverified: {
+    label: 'Machine transcript',
+    tooltip:
+      'Searchable text for this document was produced by AI vision transcription. The scan is authoritative; confirm quotations against the image.',
+    style: { ...TRANSCRIPT_CHIP_BASE, background: '#fff8e1', color: '#8a5b00', border: '1px solid #f0dfa8' },
+  },
+  reviewed: {
+    label: 'Reviewed transcript',
+    tooltip: 'Transcript reviewed against the scan. The scan remains authoritative.',
+    style: { ...TRANSCRIPT_CHIP_BASE, background: '#eef7f0', color: '#2e6b46', border: '1px solid #cfe5d6' },
+  },
+};
+
+function transcriptChipFor(metadata: Record<string, unknown> | undefined | null) {
+  const t = metadata?.transcript as { status?: unknown } | undefined | null;
+  const status = typeof t?.status === 'string' ? t.status : null;
+  return status ? TRANSCRIPT_CHIPS[status] ?? null : null;
+}
 
 interface EvidenceViewerProps {
   evidence: EvidenceRef | null;
@@ -208,6 +244,8 @@ export function EvidenceViewer({ evidence, onClose, backLabel = 'Back to Chat' }
   const [zoom, setZoom] = useState(125); // default slightly above 100 for readability
   const [loadError, setLoadError] = useState<string | null>(null);
   const [mounted, setMounted] = useState(false);
+  const [downloadingDoc, setDownloadingDoc] = useState(false);
+  const [showCollections, setShowCollections] = useState(false);
 
   // --- Find-in-document state ---
   const [findOpen, setFindOpen] = useState(false);
@@ -521,6 +559,46 @@ export function EvidenceViewer({ evidence, onClose, backLabel = 'Back to Chat' }
     }
   };
 
+  // Download the FULL document with its PDF /OpenAction set to the page being
+  // viewed, so desktop readers (Acrobat, most Windows viewers; macOS Preview
+  // ignores it) open the file at the hit instead of page 1 — a researcher's
+  // "the whole file is as good as the hit page, if it opens at the hit".
+  // Stamping an existing PDF's catalog needs a real writer, so pdf-lib is
+  // loaded on demand here (never in the page bundle); any failure falls back
+  // to downloading the untouched original.
+  const handleDownloadDocument = async () => {
+    const filename = document?.source_name || 'document.pdf';
+    const fallback = () => {
+      const a = window.document.createElement('a');
+      a.href = resolvedBaseUrl;
+      a.download = filename;
+      a.click();
+    };
+    const pdf = pdfRef.current;
+    if (!pdf) return fallback();
+    setDownloadingDoc(true);
+    try {
+      const [bytes, { PDFDocument, PDFName }] = await Promise.all([
+        pdf.getData(),
+        import('pdf-lib'),
+      ]);
+      const doc = await PDFDocument.load(bytes, { updateMetadata: false });
+      const pageIdx = Math.min(Math.max(currentPage - 1, 0), doc.getPageCount() - 1);
+      const dest = doc.context.obj([doc.getPage(pageIdx).ref, PDFName.of('Fit')]);
+      doc.catalog.set(PDFName.of('OpenAction'), dest);
+      const out = await doc.save();
+      const a = window.document.createElement('a');
+      a.href = URL.createObjectURL(new Blob([out as BlobPart], { type: 'application/pdf' }));
+      a.download = filename;
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+    } catch {
+      fallback();
+    } finally {
+      setDownloadingDoc(false);
+    }
+  };
+
   const handleOpenNewTab = () => {
     window.open(pdfUrl, '_blank', 'noopener,noreferrer');
     onClose(); // Return to chat
@@ -600,15 +678,14 @@ export function EvidenceViewer({ evidence, onClose, backLabel = 'Back to Chat' }
           ↓ Page
         </button>
 
-        <a
-          href={resolvedBaseUrl}
-          download
+        <button
           className="btn-secondary"
-          style={{ textDecoration: 'none' }}
-          title="Download the entire document (PDF)"
+          onClick={handleDownloadDocument}
+          disabled={downloadingDoc}
+          title={`Download the entire document (PDF) — opens at page ${currentPage} in most PDF readers`}
         >
-          ↓ Document
-        </a>
+          {downloadingDoc ? '… Document' : '↓ Document'}
+        </button>
 
         <button
           className="btn-secondary"
@@ -684,6 +761,22 @@ export function EvidenceViewer({ evidence, onClose, backLabel = 'Back to Chat' }
           {(document.collection_title || document.collection_slug) && (
             <span className="text-muted"> · {document.collection_title || document.collection_slug}</span>
           )}
+          {(() => {
+            const chip = transcriptChipFor(document.metadata);
+            return chip ? (
+              <span style={chip.style} title={chip.tooltip}>
+                {chip.label}
+              </span>
+            ) : null;
+          })()}
+          <button
+            className="btn-secondary"
+            onClick={() => setShowCollections(true)}
+            style={{ marginLeft: 'var(--spacing-md)', fontSize: '12px', padding: '2px 8px' }}
+            title="Browse this document's collection and download any or all of its files"
+          >
+            Browse &amp; download collection
+          </button>
           {witnesses && witnesses.length > 0 && (
             <button
               className="btn-secondary"
@@ -828,6 +921,13 @@ export function EvidenceViewer({ evidence, onClose, backLabel = 'Back to Chat' }
           </div>
         )}
       </div>
+      {showCollections && (
+        <InfoModal
+          section="collections"
+          initialCollectionId={document?.collection_id}
+          onClose={() => setShowCollections(false)}
+        />
+      )}
     </div>
   );
 }
