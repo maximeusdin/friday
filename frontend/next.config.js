@@ -3,6 +3,12 @@ const nextConfig = {
   // Static export for S3 hosting (use 'standalone' for containerized deployments)
   output: 'export',
 
+  // `next dev` and `next build` share .next by default, so a production build
+  // (or a deploy) run while a dev server is up deletes the chunks that server is
+  // serving and every asset 404s until it restarts. Setting NEXT_DIST_DIR gives
+  // the dev server its own directory; unset, nothing changes for builds.
+  distDir: process.env.NEXT_DIST_DIR || '.next',
+
   // Disable image optimization (not supported in static export)
   images: {
     unoptimized: true,

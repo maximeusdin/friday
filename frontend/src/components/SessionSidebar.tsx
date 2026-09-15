@@ -124,7 +124,7 @@ export function SessionSidebar({
 
         {!isLoading && !error && total === 0 && (
           <div className="sidebar-empty">
-            No sessions yet — your first question starts one.
+            No sessions yet. Ask a question to start one.
           </div>
         )}
 

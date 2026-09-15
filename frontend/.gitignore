@@ -40,3 +40,4 @@ Thumbs.db
 .vscode/
 *.swp
 *.swo
+.next-dev/

@@ -65,7 +65,7 @@ export function SearchResultsList({
             key={`${item.document.id}-${item.page.id}-${idx}`}
             className={`hit${item.hidden ? ' is-hidden' : ''}`}
           >
-            <span className="hit-num">{num != null ? num : '—'}</span>
+            <span className="hit-num">{num != null ? num : '·'}</span>
 
             <div
               className="hit-main"
@@ -85,6 +85,11 @@ export function SearchResultsList({
                 <span className="count">page {item.page.pdf_page}</span>
                 {item.hidden && <span className="chip">removed</span>}
               </span>
+              {/* Which file inside the collection: some collections hold dozens,
+                  and the collection name alone doesn't say where you have landed. */}
+              {item.document?.title && (
+                <span className="hit-doc" title={item.document.title}>{item.document.title}</span>
+              )}
               <span className="hit-snippet">
                 {item.snippet || `View page ${item.page.pdf_page}`}
               </span>

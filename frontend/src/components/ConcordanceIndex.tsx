@@ -137,7 +137,7 @@ function ConcordanceIntro() {
   return (
     <details className="conc-entry" style={{ paddingTop: 0 }}>
       <summary style={{ cursor: 'pointer', fontSize: 'var(--text-sm)', color: 'var(--ink-2)' }}>
-        About this index — by John Earl Haynes
+        About this index, by John Earl Haynes
       </summary>
       <div className="prose" style={{ marginTop: 'var(--s-3)', fontSize: 'var(--text-base)' }}>
         <p><strong>

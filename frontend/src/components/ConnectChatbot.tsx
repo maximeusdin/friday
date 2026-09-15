@@ -43,8 +43,8 @@ export function AddToClaudeButton({ onShowInstructions }: { onShowInstructions?:
       </button>
       {copied && (
         <p className="text-sm text-muted" style={{ marginTop: 'var(--s-2)' }}>
-          Connector URL copied — in the Claude tab: <strong>Add custom connector</strong>, paste,{' '}
-          <strong>Add</strong>.
+          URL copied. In the Claude tab, choose <strong>Add custom connector</strong>, paste it,
+          then click <strong>Add</strong>.
         </p>
       )}
     </div>
@@ -77,20 +77,19 @@ export function ChatbotConnectBody() {
   return (
     <div className="prose">
       <p>
-        Friday is available as a <strong>connector</strong> for AI chatbots: add it once, and
-        your chatbot can search the archives, resolve codenames, and read documents directly
-        in your conversations — citing pages with links that open Friday&apos;s document
-        viewer. Free, no Friday account needed.
+        Friday is available as a <strong>connector</strong> for AI chatbots. Add it once and
+        your chatbot can search the archives and read documents inside your own conversations.
+        Its citations link back to the scanned page here on Friday. It&apos;s free, and no
+        Friday account is needed.
       </p>
       <p>
-        The connector uses <strong>MCP</strong> (Model Context Protocol), the open standard
-        for connecting AI assistants to external tools — it works with Claude, ChatGPT, and
-        any other chatbot or AI tool that accepts custom MCP connectors. The connector URL
-        is the same everywhere:
+        The connector uses <strong>MCP</strong> (Model Context Protocol), the open standard for
+        connecting AI assistants to external tools. It works with Claude, ChatGPT, and anything
+        else that accepts a custom MCP connector. The URL is the same everywhere:
       </p>
       <McpUrlBox />
 
-      <p><strong>Claude (claude.ai — Free, Pro, or Max):</strong></p>
+      <p><strong>Claude (claude.ai, on Free, Pro or Max):</strong></p>
       <AddToClaudeButton />
       <ol className="steps">
         <li>
@@ -104,10 +103,10 @@ export function ChatbotConnectBody() {
         <li>In any chat, open the <strong>+</strong> (tools) menu near the message box and make
           sure the Friday connector is enabled. For deep dives, use <strong>Research</strong> mode
           with Friday enabled as a source.</li>
-        <li><strong>Claude Desktop &amp; mobile:</strong> same flow — Settings &rarr; Connectors &rarr;
-          Add custom connector. <strong>Team / Enterprise:</strong> an admin adds the connector
-          first (Admin settings &rarr; Connectors); members then enable it under Settings &rarr;
-          Connectors.</li>
+        <li><strong>Claude Desktop and mobile:</strong> same steps, under Settings &rarr;
+          Connectors &rarr; Add custom connector. On <strong>Team or Enterprise</strong>, an admin
+          adds the connector first (Admin settings &rarr; Connectors), then members enable it
+          under Settings &rarr; Connectors.</li>
       </ol>
 
       <p><strong>ChatGPT (Plus, Pro, Business, or Enterprise):</strong></p>
@@ -134,10 +133,10 @@ export function ChatbotConnectBody() {
         </li>
       </ul>
 
-      <p><strong>Then, in any chat:</strong> ask questions in plain language —
+      <p><strong>Then, in any chat:</strong> ask questions in plain language, such as
         &ldquo;Who was ALES in the Venona decrypts?&rdquo; Mentioning Friday or the archives
         (&ldquo;check the Friday archive&rdquo;) nudges the chatbot to search it. Approve the tool
-        calls when prompted, or choose &ldquo;Allow always.&rdquo;</p>
+        calls when prompted, or choose &ldquo;Allow always&rdquo;.</p>
 
       <p>
         The chatbot uses Friday&apos;s search the way a researcher uses the Search tab: it looks up

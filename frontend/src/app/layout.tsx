@@ -3,9 +3,9 @@ import { Providers } from './providers';
 import './globals.css';
 
 export const metadata: Metadata = {
-  title: 'Friday — Cold War archive',
+  title: 'Friday: Cold War archives',
   description:
-    'Search declassified Cold War archives. Friday reads the files, resolves cover names, and cites the page.',
+    'Search declassified Cold War archives. Ask a question and get answers that link to the scanned page.',
 };
 
 /**

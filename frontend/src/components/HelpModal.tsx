@@ -82,10 +82,9 @@ function HowToBody() {
   return (
     <div className="prose">
       <p className="help-lede">
-        Friday searches digitized, OCR-processed declassified archives and answers with
-        citations to the actual pages. It finds and reads documents — it does not add
-        outside knowledge, and it will tell you when the documents don&apos;t answer the
-        question.
+        Friday searches scanned, OCR-processed declassified archives and answers with
+        citations to the actual pages. It only reports what is in the documents. It adds no
+        outside knowledge, and it tells you when the files don&apos;t answer your question.
       </p>
 
       <h3>Asking questions that maximize returns</h3>
@@ -101,13 +100,13 @@ function HowToBody() {
           X recruited?&rdquo; into the archive&apos;s own record language (&ldquo;initial contact&rdquo;,
           &ldquo;memorandum&rdquo;, &ldquo;informant&rdquo;) behind the scenes, because FBI files rarely use everyday
           words. Phrasing a question around records (&ldquo;what records exist about&hellip;&rdquo;) works well too.</li>
-        <li><strong>Lists and counts enumerate the whole archive.</strong> &ldquo;Which journalists
-          were recruited?&rdquo; or &ldquo;How many engineers&hellip;?&rdquo; triggers coverage-first retrieval across
-          every collection — and an exhaustive page-pool read, so members spread over many files
+        <li><strong>Lists and counts search the whole archive.</strong> Questions like
+          &ldquo;Which journalists were recruited?&rdquo; or &ldquo;How many engineers&hellip;?&rdquo; make Friday sweep
+          every collection and read the full pool of pages, so people spread across many files
           aren&apos;t missed.</li>
         <li><strong>Scope narrows the hunt.</strong> The scope chip beside the message box limits
-          a session to chosen collections or files — it applies to both Chat and Search — or just
-          say it in the question (&ldquo;&hellip;in the Vassiliev notebooks&rdquo;).</li>
+          a session to the collections or files you pick, and applies to both Chat and Search.
+          You can also just say it in the question (&ldquo;&hellip;in the Vassiliev notebooks&rdquo;).</li>
         <li><strong>Click the citations.</strong> Evidence links open the document at the right
           page with the supporting passage highlighted. The quoted passage shown is taken
           verbatim from the document, never paraphrased.</li>
@@ -115,27 +114,27 @@ function HowToBody() {
 
       <h3>Reading the answers</h3>
       <p>
-        Findings marked with a source are grounded in a cited page. A summary labeled{' '}
-        <em>unverified</em> means its claims didn&apos;t pass citation checks — treat it as a lead,
-        and click through to the sources. When Friday says it could not find evidence, that is a
-        statement about the search, not proof the fact isn&apos;t somewhere in the archive: rephrase
-        with more specific names or details, or use <em>Think deeper</em> to extend the
-        investigation.
+        Findings with a source are grounded in the page they cite. Anything under an{' '}
+        <em>unverified</em> heading did not pass citation checks, so treat it as a lead and click
+        through to the sources. When Friday says it found no evidence, that is a statement about
+        the search, not proof the fact is absent from the archive. Try again with more specific
+        names or details, or use <em>Think deeper</em> to push the investigation further.
       </p>
 
       <h3>Defaults</h3>
       <p>
-        Entire-archive scope; deep search effort on every query (Think deeper extends even
-        further, reusing the evidence already gathered); alias and codename expansion on;
-        record-language rewriting on. In the Search tab, exact matching is the default — Fuzzy
-        (for OCR errors and typos) and Aliases are toggles beside the search box.
+        Friday searches the entire archive, puts deep effort into every query, expands aliases
+        and codenames, and rewrites questions into the archive&apos;s own record language. Think
+        deeper goes further still, reusing the evidence it has already gathered. In the Search
+        tab, exact matching is the default; Fuzzy (for OCR errors and typos) and Aliases are the
+        toggles beside the search box.
       </p>
 
       <h3>What Friday doesn&apos;t do</h3>
       <p>
-        It can&apos;t read text the OCR mangled beyond recognition (try Fuzzy in Search for
-        near-miss spellings); it won&apos;t speculate beyond the documents; and it doesn&apos;t
-        search outside the indexed collections.
+        It can&apos;t read text the OCR mangled beyond recognition, though Fuzzy in Search often
+        catches near-miss spellings. It won&apos;t speculate beyond the documents, and it never
+        searches outside the indexed collections.
       </p>
     </div>
   );
@@ -151,13 +150,13 @@ function ChatVsSearchBody() {
 
       <h3>Search</h3>
       <p>
-        A deterministic concordance: it matches your terms — exact, boolean
-        (<code>AND</code>/<code>OR</code>/<code>NOT</code>, quoted phrases), or fuzzy — against
-        every page and returns numbered page hits you can open, prune, and export as CSV. It
-        never interprets your query. Use Search when you know words that actually appear on the
-        page, when you want <em>every</em> occurrence (not a summary), or when you&apos;re building
-        a citation list. Each search becomes a tab in your session, and numbering lets you stop
-        at hit #40 and resume next week.
+        A concordance, plain and literal. It matches your terms against every page and returns
+        numbered page hits you can open, prune and export as CSV. Terms can be exact, boolean
+        (<code>AND</code>, <code>OR</code>, <code>NOT</code>, quoted phrases) or fuzzy. It never
+        interprets your query. Use Search when you know words that actually appear on the page,
+        when you want <em>every</em> occurrence rather than a summary, or when you&apos;re
+        building a citation list. Each search becomes a tab in your session, and the numbering
+        lets you stop at hit 40 and pick it up next week.
       </p>
 
       <h3>Chat</h3>
@@ -185,12 +184,12 @@ function AboutBody() {
     <div className="prose">
       <h3>What is Friday?</h3>
       <p>
-        Friday is a research assistant for declassified Cold War archives. It holds digitized,
-        OCR-processed collections — FBI files, HUAC hearings, the Vassiliev notebooks, the Venona
-        decrypts and more — and lets researchers work across them in two ways: a deterministic
-        page-level search, and an investigative assistant that plans a question, reads the
-        retrieved pages, resolves cover names against a concordance, and answers with citations
-        that open the scanned original at the cited page.
+        Friday is a research assistant for declassified Cold War archives. It holds scanned,
+        OCR-processed collections: FBI files, HUAC hearings, the Vassiliev notebooks, the Venona
+        decrypts and more. There are two ways to work across them. Search is literal and matches
+        your terms against every page. Chat plans a question, reads the pages it retrieves,
+        resolves cover names against a concordance, and answers with citations that open the
+        scanned original at the cited page.
       </p>
 
       {/* Editorial placeholder — replace with the real origin story: who conceived and
@@ -209,8 +208,8 @@ function AboutBody() {
 
       <h3>Collections</h3>
       <p>
-        The archive&apos;s collections — and every file in them, individually or in bulk — are
-        browsable and downloadable under <strong>Collections &amp; downloads</strong>.
+        Every collection, and every file inside it, can be browsed and downloaded under{' '}
+        <strong>Collections &amp; downloads</strong>, one file at a time or in bulk.
       </p>
     </div>
   );

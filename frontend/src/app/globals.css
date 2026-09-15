@@ -524,19 +524,22 @@ input[type='radio'] {
   padding: 0 var(--s-3);
   border-radius: calc(var(--r-sm) - 1px);
   font-size: var(--text-sm);
-  font-weight: var(--weight-medium);
-  color: var(--ink-2);
+  font-weight: var(--weight-normal);
+  /* Unselected sits well back: which mode you are in is the first thing the eye
+     should settle, and a near-equal pair reads as neither. */
+  color: var(--ink-3);
   transition: background var(--dur-1) var(--ease), color var(--dur-1) var(--ease);
 }
 
 .segmented-item:hover {
-  color: var(--ink);
+  color: var(--ink-2);
 }
 
 .segmented-item[aria-selected='true'] {
   background: var(--surface);
-  color: var(--ink);
-  box-shadow: var(--shadow-1);
+  color: var(--accent);
+  font-weight: var(--weight-semi);
+  box-shadow: 0 1px 2px rgba(22, 24, 27, 0.08), inset 0 0 0 1px var(--line);
 }
 
 /* --- Switch ---------------------------------------------------------------- */
@@ -2244,6 +2247,14 @@ input[type='radio'] {
   text-underline-offset: 2px;
 }
 
+.hit-doc {
+  font-size: var(--text-xs);
+  color: var(--ink-3);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .hit-snippet {
   font-family: var(--font-read);
   font-size: var(--text-base);
@@ -2276,7 +2287,15 @@ mark {
   opacity: 0.5;
 }
 
-.hit.is-hidden .hit-snippet {
+.hit.is-hidden .hit-doc {
+  font-size: var(--text-xs);
+  color: var(--ink-3);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.hit-snippet {
   text-decoration: line-through;
   text-decoration-color: var(--line-2);
 }

@@ -359,7 +359,7 @@ export function SearchTab({
       // A toast, not just the inline notice: the chip staying put with a quiet
       // red line elsewhere on the page reads as "nothing happened".
       const why = e instanceof Error ? e.message : 'unknown error';
-      toast(`Could not delete that search — ${why}`);
+      toast(`Could not delete that search. ${why}`);
       setError(`Could not delete the search “${block?.query ?? ''}”: ${why}`);
       return;
     }
@@ -429,8 +429,8 @@ export function SearchTab({
         onClick={() => setActiveResultSetId(block.resultSetId)}
         title={
           isChat
-            ? `Chat ran this search${block.originQuery ? ` while answering: “${block.originQuery}”` : ''} — ${block.totalHits} hits`
-            : `${block.query} — ${block.totalHits} hits`
+            ? `Chat ran this search${block.originQuery ? ` while answering: “${block.originQuery}”` : ''} (${block.totalHits} hits)`
+            : `${block.query} (${block.totalHits} hits)`
         }
       >
         {isChat && <Icon name="spark" size={12} />}
@@ -507,11 +507,11 @@ export function SearchTab({
               <div className="popover-body" style={{ padding: 'var(--s-4)', maxWidth: '26rem' }}>
                 <div className="prose" style={{ fontSize: 'var(--text-base)' }}>
                   <ul>
-                    <li><code>Harry AND White</code> — both terms must appear</li>
-                    <li><code>Rosenberg OR Hiss</code> — either term</li>
-                    <li><code>Soviet NOT Rosenberg</code> — exclude a term</li>
-                    <li><code>&quot;Harry Dexter White&quot;</code> — exact phrase</li>
-                    <li><code>(Rosenberg OR Hiss) AND Soviet</code> — group with parentheses</li>
+                    <li><code>Harry AND White</code>: both terms must appear</li>
+                    <li><code>Rosenberg OR Hiss</code>: either term</li>
+                    <li><code>Soviet NOT Rosenberg</code>: exclude a term</li>
+                    <li><code>&quot;Harry Dexter White&quot;</code>: exact phrase</li>
+                    <li><code>(Rosenberg OR Hiss) AND Soviet</code>: group with parentheses</li>
                   </ul>
                   <p>
                     Boolean operators work in exact mode only. <strong>Fuzzy</strong> handles OCR
@@ -535,7 +535,7 @@ export function SearchTab({
                 className="search-chip-more"
                 onClick={() => setShowChatTabs((v) => !v)}
                 aria-expanded={showChatTabs || activeIsChat}
-                title="Searches Chat ran while answering your questions — open any of them to continue where it left off"
+                title="Searches Chat ran while answering your questions. Open one to carry on where it left off."
               >
                 <Icon name="spark" size={12} />
                 From Chat
@@ -555,13 +555,13 @@ export function SearchTab({
           {isSearching && (
             <div className="loading">
               <span className="spinner" />
-              Searching collections — the entire archive can take 10–60 seconds.
+              Searching collections. The whole archive can take up to a minute.
             </div>
           )}
           {isExpandingFuzzy && !isSearching && (
             <div className="loading">
               <span className="spinner" />
-              Loading fuzzy matches — exact results are shown below.
+              Loading fuzzy matches. Exact results are shown below.
             </div>
           )}
 
@@ -569,8 +569,8 @@ export function SearchTab({
             <div className="empty-state">
               <Icon name="search" size={22} />
               <p>
-                Search returns every page that matches your terms, numbered so you can work
-                through them and pick up where you left off.
+                Search returns every page that matches your terms. Hits are numbered, so you
+                can work through them and pick up where you left off.
               </p>
               <div className="suggestions" style={{ justifyContent: 'center' }}>
                 {['"Harry Dexter White"', 'Rosenberg OR Hiss', 'Silvermaster AND film'].map((q) => (

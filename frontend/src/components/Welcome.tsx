@@ -30,15 +30,15 @@ export function Welcome({ onAsk }: { onAsk: (question: string) => void }) {
   return (
     <div className="welcome">
       <div className="welcome-hero">
-        <h1 className="welcome-title">Search the Cold War archives.</h1>
+        <h1 className="welcome-title">Search the Cold War archives</h1>
         <p className="welcome-lede">
-          Ask in plain language. Friday reads the declassified files, resolves cover names,
-          and cites the page it came from.
+          Ask a question in plain language. Friday reads the declassified files and links
+          every answer back to the scanned page.
         </p>
       </div>
 
       <section className="welcome-section">
-        <h2 className="eyebrow">Start with</h2>
+        <h2 className="eyebrow">Try one of these</h2>
         <div className="prompt-grid">
           {PROMPTS.map((q) => (
             <button key={q} type="button" className="prompt-card" onClick={() => onAsk(q)}>
@@ -50,7 +50,7 @@ export function Welcome({ onAsk }: { onAsk: (question: string) => void }) {
       </section>
 
       <section className="welcome-section">
-        <h2 className="eyebrow">Also here</h2>
+        <h2 className="eyebrow">Also worth knowing</h2>
         <div className="tile-row">
           <div className="tile">
             <span className="tile-title">
@@ -59,7 +59,7 @@ export function Welcome({ onAsk }: { onAsk: (question: string) => void }) {
             </span>
             <p className="tile-body">
               Proper names, cover names and organizations across twenty-one volumes of
-              Vassiliev notebooks and Venona cables — cross-indexed to the real names behind
+              Vassiliev notebooks and Venona cables, cross-indexed to the real names behind
               the codenames.
             </p>
             <div className="flex gap-sm">
@@ -95,8 +95,8 @@ export function Welcome({ onAsk }: { onAsk: (question: string) => void }) {
               Collections
             </span>
             <p className="tile-body">
-              Browse every collection in the archive and download any file — or a whole
-              collection — as a zip.
+              Browse every collection and download single files, or take a whole
+              collection as a zip.
             </p>
             <button type="button" className="btn-secondary btn-sm" onClick={() => setHelp('collections')}>
               Browse &amp; download

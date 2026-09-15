@@ -45,7 +45,7 @@ export function AppHeader({ user, onLogout, sidebarOpen, onToggleSidebar }: AppH
         <Icon name="menu" size={18} />
       </button>
 
-      <a href="/" className="hdr-brand" title="Friday — home">
+      <a href="/" className="hdr-brand" title="Friday home">
         <span className="hdr-wordmark">Friday</span>
         <span className="hdr-sub">Cold War archive</span>
       </a>

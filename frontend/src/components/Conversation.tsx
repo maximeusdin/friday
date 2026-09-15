@@ -19,16 +19,10 @@ import { Welcome } from './Welcome';
 import { Icon } from './ui/Icon';
 import { toast } from './ui/Toast';
 
-const PROGRESS_PHRASES = [
-  'Searching archives…',
-  'Reviewing documents…',
-  'Cross-referencing sources…',
-  'Extracting key findings…',
-  'Verifying evidence…',
-  'Building answer…',
-  'Following leads…',
-  'Checking citations…',
-];
+/** Shown when the backend reports a step without saying what it is doing.
+ *  One honest line beats a rotating set of invented ones: the elapsed timer
+ *  beside it already shows that work is happening. */
+const WORKING = 'Searching the archive…';
 
 /** Strip chunk_id=..., chunk_ids: [], etc. from bullet text (the model sometimes echoes prompt format). */
 function sanitizeBulletText(text: string): string {
@@ -39,8 +33,9 @@ function sanitizeBulletText(text: string): string {
     .trim();
 }
 
-/** Map technical progress to user-friendly text. Uses the backend message when it has context. */
-function toUserFriendlyProgress(step: V9ProgressEvent, stepIndex?: number): string {
+/** Map a backend progress step to something a reader understands. Prefers the
+ *  backend's own message when it carries real context. */
+function toUserFriendlyProgress(step: V9ProgressEvent): string {
   switch (step.step) {
     case 'tool_call': {
       const msg = (step.message || '').trim();
@@ -48,36 +43,32 @@ function toUserFriendlyProgress(step: V9ProgressEvent, stepIndex?: number): stri
         return msg;
       }
       const tool = (step.details?.tool as string) || '';
-      const idx = stepIndex ?? 0;
-      if (tool.startsWith('search_chunks') || tool === 'search_chunks') {
-        return PROGRESS_PHRASES[idx % PROGRESS_PHRASES.length];
-      }
       if (tool.startsWith('fetch_chunks') || tool === 'fetch_chunks') return 'Reading documents…';
-      if (tool.startsWith('expand_entities') || tool === 'expand_entities') return 'Resolving identities…';
-      if (tool.startsWith('alias_index') || tool.includes('alias')) return 'Looking up references…';
-      return PROGRESS_PHRASES[idx % PROGRESS_PHRASES.length];
+      if (tool.startsWith('expand_entities') || tool === 'expand_entities') return 'Looking up cover names…';
+      if (tool.startsWith('alias_index') || tool.includes('alias')) return 'Looking up cover names…';
+      return WORKING;
     }
     case 'turn_start':
     case 'turn_prepare':
       return 'Investigating…';
     case 'model_call':
-      return 'Analyzing evidence…';
+      return 'Reading the evidence…';
     case 'investigation':
-      return 'Searching and analyzing…';
+      return 'Searching and reading…';
     case 'entity_resolution':
-      return 'Resolving entities…';
+      return 'Looking up cover names…';
     case 'synthesis':
-      return 'Synthesizing answer…';
+      return 'Writing the answer…';
     case 'evidence_update':
-      return 'Found evidence…';
+      return 'Found something…';
     case 'routing':
     case 'routing_start':
-      return 'Understanding your question…';
+      return 'Reading your question…';
     case 'investigation_start':
     case 'retrieval_prepare':
-      return 'Starting investigation…';
+      return 'Getting started…';
     case 'context_build':
-      return 'Building context…';
+      return 'Gathering context…';
     case 'follow_up_start':
     case 'follow_up':
       return 'Searching evidence…';
@@ -85,11 +76,10 @@ function toUserFriendlyProgress(step: V9ProgressEvent, stepIndex?: number): stri
       return 'Resuming Think deeper…';
     default: {
       const msg = (step.message || '').toLowerCase();
-      if (msg.includes('search')) return 'Searching archives…';
-      if (msg.includes('round')) return 'Cross-referencing sources…';
+      if (msg.includes('search')) return WORKING;
       if (msg.includes('fetch')) return 'Reading documents…';
-      if (msg.includes('synthes')) return 'Synthesizing answer…';
-      return PROGRESS_PHRASES[(stepIndex ?? 0) % PROGRESS_PHRASES.length];
+      if (msg.includes('synthes')) return 'Writing the answer…';
+      return WORKING;
     }
   }
 }
@@ -315,9 +305,9 @@ export function Conversation({
                     <span className="spinner" />
                     <span className="thinking-text">
                       {elapsed >= 360
-                        ? 'This one is tough — almost there'
+                        ? 'Still going. This one is taking a while…'
                         : progressSteps.length > 0
-                          ? toUserFriendlyProgress(progressSteps[progressSteps.length - 1], progressSteps.length - 1)
+                          ? toUserFriendlyProgress(progressSteps[progressSteps.length - 1])
                           : 'Investigating…'}
                     </span>
                     {elapsed >= 5 && (
@@ -359,7 +349,7 @@ export function Conversation({
                   handleSubmit(e);
                 }
               }}
-              placeholder={session ? 'Ask a follow-up, or start a new line of enquiry…' : 'Ask the archive a question…'}
+              placeholder={session ? 'Ask a follow-up, or start something new…' : 'Ask the archive a question…'}
               disabled={isSending}
               rows={1}
               aria-label="Your question"
@@ -396,7 +386,7 @@ export function Conversation({
           </form>
           <div className="composer-hint">
             {scopeEmpty
-              ? 'No sources selected — choose collections in the scope menu, or switch back to the entire archive.'
+              ? 'No sources selected. Pick collections in the scope menu, or switch back to the entire archive.'
               : 'Enter to send · Shift + Enter for a new line'}
           </div>
         </div>
@@ -776,7 +766,7 @@ function EscalationBlock({
 
   return (
     <div className="choices">
-      <div className="choices-title">The evidence so far doesn&apos;t settle it. What next?</div>
+      <div className="choices-title">The evidence so far doesn&apos;t settle this. What next?</div>
       {escalations.map((opt, i) => (
         <button
           key={i}
@@ -849,7 +839,7 @@ function CopyAnswerButton({
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
     } else {
-      toast('Could not copy — your browser blocked clipboard access');
+      toast('Could not copy. Your browser blocked clipboard access.');
     }
   };
 

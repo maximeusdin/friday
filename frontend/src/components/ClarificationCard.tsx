@@ -94,7 +94,7 @@ export function ClarificationCard({ clarification, onSubmit, disabled }: Props) 
                         disabled={disabled}
                         onChange={() => (q.kind === 'multi_choice' ? toggleMulti(q.id, o.id) : toggleSingle(q.id, o.id))}
                       />
-                      <span>{o.label}{o.hint ? <span className="text-muted"> — {o.hint}</span> : null}</span>
+                      <span>{o.label}{o.hint ? <span className="text-muted"> ({o.hint})</span> : null}</span>
                     </label>
                   );
                 })}

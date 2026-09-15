@@ -1003,7 +1003,7 @@ export function EvidenceViewer({ evidence, onClose, backLabel = 'Back to Chat' }
               <><Icon name="check" size={13} /> highlighted on page {locatedPage ?? currentPage}</>
             )}
             {quoteTier === 'fuzzy' && (
-              <><Icon name="check" size={13} /> highlighted on page {locatedPage ?? currentPage} — approximate match</>
+              <><Icon name="check" size={13} /> highlighted on page {locatedPage ?? currentPage} (close match)</>
             )}
             {quoteTier === 'none' && locating && (
               <><span className="spinner" style={{ width: 12, height: 12 }} /> locating the passage…</>

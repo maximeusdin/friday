@@ -153,9 +153,9 @@ export function CollectionsDownloadsBody({ initialCollectionId }: { initialColle
   return (
     <>
       <p className="help-lede">
-        Open a collection to browse its files. Tick any set of files and use{' '}
-        <strong>Download selected</strong> — they arrive as one zip — or take a whole collection
-        (or the entire archive) with its download link.
+        Open a collection to see its files. Tick the ones you want and click{' '}
+        <strong>Download selected</strong>; they arrive as a single zip. To take everything at
+        once, use the download link on a collection or on the whole archive.
       </p>
 
       {zips?.complete && (
@@ -308,8 +308,9 @@ export function CollectionsDownloadsBody({ initialCollectionId }: { initialColle
                 ) : dl.status === 'done' ? (
                   dl.skipped.length > 0 ? (
                     <span style={{ color: 'var(--red)' }} title={dl.skipped.map((s) => `${s.name}: ${s.reason}`).join('\n')}>
-                      Downloaded {dl.files} of {dl.files + dl.skipped.length} files — {dl.skipped.length} skipped
-                      (listed in the zip&apos;s _SKIPPED FILES.txt)
+                      Downloaded {dl.files} of {dl.files + dl.skipped.length} files.{' '}
+                      {dl.skipped.length} were skipped, and are listed in the zip&apos;s
+                      _SKIPPED FILES.txt
                     </span>
                   ) : (
                     <>Downloaded {dl.files} file{dl.files === 1 ? '' : 's'}{dl.asZip ? ' as a zip' : ''}.</>
