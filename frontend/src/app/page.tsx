@@ -49,6 +49,9 @@ export default function Home() {
   const [collections, setCollections] = useState<CollectionNode[]>([]);
 
   const [sidebarOpen, setSidebarOpen] = useState(true);
+  // Bumped on every "New session" click. Clicking it while already on the welcome
+  // screen changes no state, so without this the button would feel dead.
+  const [newSessionNonce, setNewSessionNonce] = useState(0);
 
   // Deep link: open the document viewer directly from /?document_id=…&pdf_page=….
   // Plain window.location (not useSearchParams) so the static export needs no
@@ -109,6 +112,7 @@ export default function Home() {
   };
 
   const handleNewSession = () => {
+    setNewSessionNonce((n) => n + 1);
     setActiveSession(null);
     setActiveEvidence(null);
     setActiveSearchResultSetId(null);
@@ -306,6 +310,7 @@ export default function Home() {
                   onOpenSearchTab={() => setActiveTab('search')}
                   onEvidenceClick={handleEvidenceClick}
                   onStartSession={handleStartSession}
+                  newSessionNonce={newSessionNonce}
                   pendingQuestion={pendingQuestion}
                   onPendingQuestionConsumed={() => setPendingQuestion(null)}
                 />

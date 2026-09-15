@@ -16,6 +16,7 @@ import { ClarificationCard } from './ClarificationCard';
 import { ScopeControl } from './ScopeControl';
 import { Welcome } from './Welcome';
 import { Icon } from './ui/Icon';
+import { toast } from './ui/Toast';
 
 const PROGRESS_PHRASES = [
   'Searching archives…',
@@ -115,6 +116,9 @@ interface ConversationProps {
   onScopeChange: (scope: UserSelectedScope) => void;
   /** Asked with no session open — the parent creates one, then queues the question. */
   onStartSession: (question: string) => void;
+  /** Incremented when "New session" is clicked, so the composer takes focus even
+   *  when the welcome screen was already showing. */
+  newSessionNonce?: number;
   /** Question queued by the parent to auto-send once the new session is active. */
   pendingQuestion?: string | null;
   onPendingQuestionConsumed?: () => void;
@@ -122,7 +126,7 @@ interface ConversationProps {
 
 export function Conversation({
   session, onViewSearchResultSet, onOpenSearchTab, onEvidenceClick,
-  activeScope, collections, onScopeChange, onStartSession,
+  activeScope, collections, onScopeChange, onStartSession, newSessionNonce,
   pendingQuestion, onPendingQuestionConsumed,
 }: ConversationProps) {
   const [input, setInput] = useState('');
@@ -160,6 +164,11 @@ export function Conversation({
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, isSending]);
+
+  // Starting a new session puts the cursor where the work begins.
+  useEffect(() => {
+    if (!session) inputRef.current?.focus();
+  }, [session, newSessionNonce]);
 
   // Auto-grow the composer up to the max height the stylesheet allows.
   useLayoutEffect(() => {
@@ -760,6 +769,31 @@ function EscalationBlock({
   );
 }
 
+/** Clipboard write with a fallback for the contexts where the async API is
+ *  refused (older browsers, some embedded views, an unfocused document). */
+async function writeToClipboard(text: string): Promise<boolean> {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch {
+    /* fall through to the legacy path */
+  }
+  try {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.setAttribute('readonly', '');
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand('copy');
+    document.body.removeChild(ta);
+    return ok;
+  } catch {
+    return false;
+  }
+}
+
 function CopyAnswerButton({
   content, citationMap,
 }: {
@@ -782,12 +816,11 @@ function CopyAnswerButton({
       lines.push(`- ${label}: ${url}`);
     }
     if (lines.length > 0) text += `\n\nSources:\n${lines.join('\n')}`;
-    try {
-      await navigator.clipboard.writeText(text);
+    if (await writeToClipboard(text)) {
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
-    } catch {
-      /* clipboard unavailable (e.g. insecure context) */
+    } else {
+      toast('Could not copy — your browser blocked clipboard access');
     }
   };
 

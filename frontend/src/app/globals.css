@@ -1087,6 +1087,18 @@ input[type='radio'] {
   background: var(--accent);
 }
 
+/* The not-yet-created session: present enough to show the click landed,
+   quiet enough not to look like a real row. */
+.sb-item.is-draft {
+  border: 1px dashed var(--accent-line);
+  background: var(--accent-soft);
+  box-shadow: none;
+}
+
+.sb-item.is-draft .sb-item-label {
+  color: var(--accent);
+}
+
 .sb-item-body {
   flex: 1 1 auto;
   min-width: 0;

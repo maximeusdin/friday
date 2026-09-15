@@ -17,6 +17,22 @@ interface SessionSidebarProps {
   onNewSession: () => void;
 }
 
+/** Placeholder row for the session that exists but hasn't been created yet.
+ *  Sessions are created from the first question, so without this the list gives
+ *  no sign that "New session" did anything. */
+function DraftRow({ onSelect }: { onSelect: () => void }) {
+  return (
+    <div className="sb-group">
+      <div className="sb-item is-active is-draft" role="button" tabIndex={0} onClick={onSelect}>
+        <span className="sb-item-body">
+          <span className="sb-item-label">New session</span>
+          <span className="sb-item-meta">Ask a question to start it</span>
+        </span>
+      </div>
+    </div>
+  );
+}
+
 /** Sessions with a filter above them, grouped by recency like every other
  *  conversation list people already know how to read. */
 export function SessionSidebar({
@@ -86,6 +102,10 @@ export function SessionSidebar({
       </div>
 
       <div className="sidebar-scroll">
+        {activeSessionId == null && !isLoading && !error && (
+          <DraftRow onSelect={onNewSession} />
+        )}
+
         {isLoading && <div className="loading"><span className="spinner" /></div>}
 
         {error && (
@@ -104,9 +124,7 @@ export function SessionSidebar({
 
         {!isLoading && !error && total === 0 && (
           <div className="sidebar-empty">
-            No sessions yet.
-            <br />
-            Ask a question to start one.
+            No sessions yet — your first question starts one.
           </div>
         )}
 

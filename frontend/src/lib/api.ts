@@ -224,8 +224,9 @@ export async function logout(): Promise<void> {
 // Meta & Health
 // =============================================================================
 
+/** Health lives at the API root, outside the /api prefix every other route sits under. */
 export async function getHealth(): Promise<HealthResponse> {
-  return request<HealthResponse>('/health');
+  return request<HealthResponse>(`${getAuthBase()}/health`);
 }
 
 export async function getMeta(): Promise<MetaResponse> {
