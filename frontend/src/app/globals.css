@@ -2385,6 +2385,12 @@ mark {
   font-size: var(--text-xs);
   color: var(--ink-3);
   font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.doc-group {
+  flex: 0 0 auto;
+  white-space: nowrap;
 }
 
 .doc-zoom {
@@ -2854,6 +2860,12 @@ mark {
 
 /* --- Touch: no hover ------------------------------------------------------- */
 
+/* The viewer handles pinch itself; the browser keeps one-finger panning and
+   must not page-zoom under two fingers. */
+.app[data-touch='true'] .doc-canvas {
+  touch-action: pan-x pan-y;
+}
+
 .app[data-touch='true'] .hit-actions,
 .app[data-touch='true'] .sb-item-actions,
 .app[data-touch='true'] .scope-doc-open {
@@ -3225,7 +3237,16 @@ mark {
   }
 
   .doc-page-input {
-    width: 2.5rem;
+    width: 2.25rem;
+    padding: 0;
+  }
+
+  .doc-page-total {
+    padding-right: var(--s-1);
+  }
+
+  .doc-bar .doc-title {
+    min-width: 3rem;
   }
 
   .doc-find {

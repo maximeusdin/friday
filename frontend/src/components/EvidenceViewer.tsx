@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import { useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { Document, Page, pdfjs } from 'react-pdf';
 import 'react-pdf/dist/Page/TextLayer.css';
@@ -10,6 +10,7 @@ import type { EvidenceRef } from '@/types/api';
 import { HelpModal } from './HelpModal';
 import { Icon } from './ui/Icon';
 import { Menu } from './ui/Menu';
+import { useLayout } from '@/lib/useLayout';
 
 // Wire up the PDF.js worker. `pdfjs.version` is the EXACT pdfjs-dist version react-pdf uses
 // (its own bundled copy), so pinning the worker to that version can never drift from the API —
@@ -27,6 +28,10 @@ const RENDER_WINDOW = 2;
 const LOCATE_RADIUS = 40;
 /** Misses tolerated before deciding a quote really is not on the page. */
 const QUOTE_MATCH_ATTEMPTS = 5;
+/** Pinch/double-tap zoom range on touch layouts, as a multiple of fit-to-width. */
+const TOUCH_ZOOM_MIN = 0.6;
+const TOUCH_ZOOM_MAX = 4;
+const DOUBLE_TAP_ZOOM = 2.2;
 
 /**
  * Wrap a JPEG in a minimal single-page PDF (PDF 1.4, one image XObject drawn
@@ -239,7 +244,16 @@ function matchQuoteInText(pageText: string, quote: string): QuoteMatch | null {
 export function EvidenceViewer({ evidence, onClose, backLabel = 'Back to Chat' }: EvidenceViewerProps) {
   const [currentPage, setCurrentPage] = useState(1);
   const [numPages, setNumPages] = useState<number | null>(null);
-  const [zoom, setZoom] = useState(125); // default slightly above 100 for readability
+  const [zoom, setZoom] = useState(125); // desktop: percent, stepped through ZOOM_LEVELS
+  const layout = useLayout();
+  // Touch layouts: the page fits the width by default and pinch multiplies it.
+  // `fitScale` is the pdf.js scale at which page 1 exactly fills the scroller.
+  const [fitScale, setFitScale] = useState(1);
+  const [zoomFactor, setZoomFactor] = useState(1);
+  // Live CSS preview while two fingers are down; committed on release.
+  const [pinchPreview, setPinchPreview] = useState<{ k: number; ox: number; oy: number } | null>(null);
+  // The quote strip takes a third of a phone screen: collapsed to two lines there.
+  const [quoteOpen, setQuoteOpen] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [mounted, setMounted] = useState(false);
   const [downloadingDoc, setDownloadingDoc] = useState(false);
@@ -359,16 +373,149 @@ export function EvidenceViewer({ evidence, onClose, backLabel = 'Back to Chat' }
   // Stable `file` object so react-pdf doesn't re-fetch on every render.
   const fileProp = useMemo(() => ({ url: resolvedBaseUrl }), [resolvedBaseUrl]);
 
+  // The scale pages actually render at. Desktop steps through fixed percentages;
+  // touch layouts fit the width and let pinch multiply that.
+  const effectiveScale = layout.touch ? fitScale * zoomFactor : zoom / 100;
+
+  // Where the view should end up after a zoom commits, so the point under the
+  // fingers (or the double-tap) stays put once the pages re-lay out.
+  const zoomAnchor = useRef<{ vx: number; vy: number; sx: number; sy: number; ratio: number } | null>(null);
+
+  /** Zoom on touch layouts around a viewport point, keeping that point still. */
+  const zoomTouchTo = useCallback((factor: number, vx: number, vy: number) => {
+    const scroller = scrollerRef.current;
+    const next = Math.min(TOUCH_ZOOM_MAX, Math.max(TOUCH_ZOOM_MIN, factor));
+    if (!scroller || next === zoomFactor) return;
+    zoomAnchor.current = {
+      vx, vy,
+      sx: scroller.scrollLeft + vx,
+      sy: scroller.scrollTop + vy,
+      ratio: next / zoomFactor,
+    };
+    setZoomFactor(next);
+  }, [zoomFactor]);
+
+  useLayoutEffect(() => {
+    const a = zoomAnchor.current;
+    const scroller = scrollerRef.current;
+    if (!a || !scroller) return;
+    zoomAnchor.current = null;
+    scroller.scrollLeft = a.sx * a.ratio - a.vx;
+    scroller.scrollTop = a.sy * a.ratio - a.vy;
+  }, [zoomFactor]);
+
+  const centre = () => {
+    const el = scrollerRef.current;
+    return el ? { vx: el.clientWidth / 2, vy: el.clientHeight / 2 } : { vx: 0, vy: 0 };
+  };
+
   // Zoom handlers
   const handleZoomIn = () => {
+    if (layout.touch) { const c = centre(); zoomTouchTo(zoomFactor * 1.25, c.vx, c.vy); return; }
     const idx = ZOOM_LEVELS.indexOf(zoom);
     if (idx < ZOOM_LEVELS.length - 1) setZoom(ZOOM_LEVELS[idx + 1]);
   };
   const handleZoomOut = () => {
+    if (layout.touch) { const c = centre(); zoomTouchTo(zoomFactor / 1.25, c.vx, c.vy); return; }
     const idx = ZOOM_LEVELS.indexOf(zoom);
     if (idx > 0) setZoom(ZOOM_LEVELS[idx - 1]);
   };
-  const handleZoomReset = () => setZoom(100);
+  const handleZoomReset = () => {
+    if (layout.touch) { const c = centre(); zoomTouchTo(1, c.vx, c.vy); return; }
+    setZoom(100);
+  };
+
+  // Fit-to-width: measure the scroller and size page 1 to it. Re-measured on
+  // rotation and whenever the scroller resizes.
+  useEffect(() => {
+    const el = scrollerRef.current;
+    if (!el || !baseSize) return;
+    const measure = () => {
+      const cs = getComputedStyle(el);
+      const w = el.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight);
+      if (w > 0) setFitScale(Math.max(0.2, w / baseSize.w));
+    };
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [baseSize]);
+
+  // --- Pinch to zoom and double-tap, on touch layouts ---------------------------
+  // Two fingers scale the page stack with a CSS transform while they move (cheap),
+  // then the real scale is committed on release and the pages re-render sharp.
+  const pointers = useRef<Map<number, { x: number; y: number }>>(new Map());
+  const pinch = useRef<{ dist0: number; factor0: number; k: number; vx: number; vy: number } | null>(null);
+  const lastTap = useRef<{ t: number; x: number; y: number } | null>(null);
+
+  const onPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (!layout.touch || e.pointerType !== 'touch') return;
+    pointers.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (pointers.current.size === 2) {
+      const [a, b] = [...pointers.current.values()];
+      const scroller = scrollerRef.current!;
+      const rect = scroller.getBoundingClientRect();
+      pinch.current = {
+        dist0: Math.hypot(a.x - b.x, a.y - b.y) || 1,
+        factor0: zoomFactor,
+        k: 1,
+        vx: (a.x + b.x) / 2 - rect.left,
+        vy: (a.y + b.y) / 2 - rect.top,
+      };
+    }
+  };
+
+  const onPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (!pointers.current.has(e.pointerId)) return;
+    pointers.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    const pz = pinch.current;
+    if (!pz || pointers.current.size < 2) return;
+    const [a, b] = [...pointers.current.values()];
+    const raw = Math.hypot(a.x - b.x, a.y - b.y) / pz.dist0;
+    const target = Math.min(TOUCH_ZOOM_MAX, Math.max(TOUCH_ZOOM_MIN, pz.factor0 * raw));
+    pz.k = target / pz.factor0;
+    const scroller = scrollerRef.current!;
+    const pagesEl = pageWrapRef.current!;
+    const pr = pagesEl.getBoundingClientRect();
+    const sr = scroller.getBoundingClientRect();
+    setPinchPreview({ k: pz.k, ox: sr.left + pz.vx - pr.left, oy: sr.top + pz.vy - pr.top });
+  };
+
+  const onPointerEnd = (e: React.PointerEvent<HTMLDivElement>) => {
+    const had = pointers.current.has(e.pointerId);
+    pointers.current.delete(e.pointerId);
+    const pz = pinch.current;
+    if (pz && pointers.current.size < 2) {
+      pinch.current = null;
+      setPinchPreview(null);
+      zoomTouchTo(pz.factor0 * pz.k, pz.vx, pz.vy);
+      lastTap.current = null;
+      return;
+    }
+    // Double-tap: toggle between fit-to-width and a readable zoom, at the tap.
+    if (had && layout.touch && e.pointerType === 'touch' && pointers.current.size === 0) {
+      const now = Date.now();
+      const prev = lastTap.current;
+      const rect = scrollerRef.current!.getBoundingClientRect();
+      const vx = e.clientX - rect.left;
+      const vy = e.clientY - rect.top;
+      if (prev && now - prev.t < 320 && Math.hypot(prev.x - e.clientX, prev.y - e.clientY) < 30) {
+        lastTap.current = null;
+        zoomTouchTo(zoomFactor > 1.05 ? 1 : DOUBLE_TAP_ZOOM, vx, vy);
+      } else {
+        lastTap.current = { t: now, x: e.clientX, y: e.clientY };
+      }
+    }
+  };
+
+  // The browser must not pan with two fingers while we are pinching.
+  useEffect(() => {
+    const el = scrollerRef.current;
+    if (!el) return;
+    const onTouchMove = (ev: TouchEvent) => { if (ev.touches.length >= 2) ev.preventDefault(); };
+    el.addEventListener('touchmove', onTouchMove, { passive: false });
+    return () => el.removeEventListener('touchmove', onTouchMove);
+  }, [mounted]);
 
   /** Scroll a page into view inside the document scroller. */
   const scrollToPage = useCallback((n: number, behavior: ScrollBehavior = 'auto') => {
@@ -771,9 +918,9 @@ export function EvidenceViewer({ evidence, onClose, backLabel = 'Back to Chat' }
     <div className="doc">
       {/* Toolbar: back, identity, page nav, zoom, find, overflow */}
       <div className="doc-bar">
-        <button className="btn-ghost" onClick={onClose} title={backLabel}>
+        <button className="btn-ghost" onClick={onClose} title={backLabel} aria-label={backLabel}>
           <Icon name="arrow-left" size={16} />
-          {backLabel}
+          <span className="btn-label">{backLabel}</span>
         </button>
 
         <div className="doc-title">
@@ -823,23 +970,27 @@ export function EvidenceViewer({ evidence, onClose, backLabel = 'Back to Chat' }
           </button>
         </div>
 
-        <div className="doc-group">
+        <div className="doc-group doc-group-zoom">
           <button
             className="icon-btn icon-btn-sm"
             onClick={handleZoomOut}
-            disabled={zoom <= ZOOM_LEVELS[0]}
+            disabled={layout.touch ? zoomFactor <= TOUCH_ZOOM_MIN : zoom <= ZOOM_LEVELS[0]}
             title="Zoom out"
             aria-label="Zoom out"
           >
             <Icon name="zoom-out" size={16} />
           </button>
-          <button className="doc-zoom" onClick={handleZoomReset} title="Reset to 100%">
-            {zoom}%
+          <button
+            className="doc-zoom"
+            onClick={handleZoomReset}
+            title={layout.touch ? 'Fit to width' : 'Reset to 100%'}
+          >
+            {layout.touch ? `${Math.round(zoomFactor * 100)}%` : `${zoom}%`}
           </button>
           <button
             className="icon-btn icon-btn-sm"
             onClick={handleZoomIn}
-            disabled={zoom >= ZOOM_LEVELS[ZOOM_LEVELS.length - 1]}
+            disabled={layout.touch ? zoomFactor >= TOUCH_ZOOM_MAX : zoom >= ZOOM_LEVELS[ZOOM_LEVELS.length - 1]}
             title="Zoom in"
             aria-label="Zoom in"
           >
@@ -860,8 +1011,16 @@ export function EvidenceViewer({ evidence, onClose, backLabel = 'Back to Chat' }
           label="Document actions"
           align="end"
           items={[
+            // The zoom buttons are hidden on phones (pinch does the job); keep a
+            // non-gesture path to the same controls here.
+            ...(layout.isPhone ? [
+              { label: 'Zoom in', icon: <Icon name="zoom-in" size={16} />, onSelect: handleZoomIn },
+              { label: 'Zoom out', icon: <Icon name="zoom-out" size={16} />, onSelect: handleZoomOut },
+              { label: 'Fit to width', icon: <Icon name="restore" size={16} />, onSelect: handleZoomReset, separated: false },
+            ] : []),
             {
               label: 'Download this page',
+              separated: layout.isPhone,
               icon: <Icon name="download" size={16} />,
               onSelect: () => { void handleDownloadPage(); },
             },
@@ -996,7 +1155,14 @@ export function EvidenceViewer({ evidence, onClose, backLabel = 'Back to Chat' }
 
       {/* The cited passage, verbatim, with how confidently it was located */}
       {evidence.quote && (
-        <div className="doc-quote">
+        <div
+          className="doc-quote"
+          data-collapsed={layout.isPhone && !quoteOpen ? 'true' : 'false'}
+          onClick={() => { if (layout.isPhone) setQuoteOpen((v) => !v); }}
+          role={layout.isPhone ? 'button' : undefined}
+          aria-expanded={layout.isPhone ? quoteOpen : undefined}
+          title={layout.isPhone ? (quoteOpen ? 'Collapse' : 'Show the whole passage') : undefined}
+        >
           <span>&ldquo;{evidence.quote}&rdquo;</span>
           <span className="doc-quote-meta">
             {quoteTier === 'exact' && (
@@ -1022,7 +1188,14 @@ export function EvidenceViewer({ evidence, onClose, backLabel = 'Back to Chat' }
       )}
 
       {/* PDF render: react-pdf, single page at a time (bounded memory for large docs) */}
-      <div className="doc-canvas" ref={scrollerRef}>
+      <div
+        className="doc-canvas"
+        ref={scrollerRef}
+        onPointerDown={onPointerDown}
+        onPointerMove={onPointerMove}
+        onPointerUp={onPointerEnd}
+        onPointerCancel={onPointerEnd}
+      >
         {!mounted || docLoading ? (
           <div className="loading"><span className="spinner" /> Loading document…</div>
         ) : loadError ? (
@@ -1054,7 +1227,15 @@ export function EvidenceViewer({ evidence, onClose, backLabel = 'Back to Chat' }
             </a>
           </div>
         ) : (
-          <div className="doc-pages" ref={pageWrapRef}>
+          <div
+            className="doc-pages"
+            ref={pageWrapRef}
+            style={pinchPreview ? {
+              transform: `scale(${pinchPreview.k})`,
+              transformOrigin: `${pinchPreview.ox}px ${pinchPreview.oy}px`,
+              willChange: 'transform',
+            } : undefined}
+          >
             <Document
               file={fileProp}
               loading={<div className="loading"><span className="spinner" /> Loading document…</div>}
@@ -1078,7 +1259,7 @@ export function EvidenceViewer({ evidence, onClose, backLabel = 'Back to Chat' }
                 // to hundreds of scanned pages, and rendering them all would
                 // exhaust memory long before the reader got there.
                 const mounted = Math.abs(n - currentPage) <= RENDER_WINDOW;
-                const scale = zoom / 100;
+                const scale = effectiveScale;
                 return (
                   <div
                     key={n}
