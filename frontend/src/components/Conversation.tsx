@@ -92,6 +92,13 @@ function toUserFriendlyProgress(step: V9ProgressEvent, stepIndex?: number): stri
   }
 }
 
+/** Seconds as m:ss, for the in-flight timer. */
+function clock(seconds: number): string {
+  const m = Math.floor(seconds / 60);
+  const s = seconds % 60;
+  return m > 0 ? `${m}:${String(s).padStart(2, '0')}` : `${s}s`;
+}
+
 const INTENT_LABEL: Record<string, string> = {
   new_retrieval: 'New search',
   follow_up: 'Follow-up',
@@ -127,6 +134,22 @@ export function Conversation({
   // stream at once and a run keeps going when you switch away.
   const run = useChatRun(session?.id ?? null);
   const { isSending, sendError, lastV9, progressSteps, evidenceBullets, pendingText } = run;
+
+  // Elapsed time while a run is in flight. Investigations can take minutes, so
+  // the thinking row says how long it has been working rather than implying
+  // progress with a bar that knows nothing.
+  const [elapsed, setElapsed] = useState(0);
+  useEffect(() => {
+    if (!isSending || !run.startedAt) {
+      setElapsed(0);
+      return;
+    }
+    const start = run.startedAt;
+    const tick = () => setElapsed(Math.floor((Date.now() - start) / 1000));
+    tick();
+    const id = setInterval(tick, 1000);
+    return () => clearInterval(id);
+  }, [isSending, run.startedAt]);
 
   const { data: messages, isLoading } = useQuery({
     queryKey: ['chatHistory', session?.id],
@@ -281,10 +304,15 @@ export function Conversation({
                   <div className="thinking">
                     <span className="spinner" />
                     <span className="thinking-text">
-                      {progressSteps.length > 0
-                        ? toUserFriendlyProgress(progressSteps[progressSteps.length - 1], progressSteps.length - 1)
-                        : 'Investigating…'}
+                      {elapsed >= 360
+                        ? 'This one is tough — almost there'
+                        : progressSteps.length > 0
+                          ? toUserFriendlyProgress(progressSteps[progressSteps.length - 1], progressSteps.length - 1)
+                          : 'Investigating…'}
                     </span>
+                    {elapsed >= 5 && (
+                      <span className="thinking-elapsed">{clock(elapsed)}</span>
+                    )}
                   </div>
                 </div>
               </div>

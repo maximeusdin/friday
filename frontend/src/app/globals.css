@@ -1440,6 +1440,12 @@ input[type='radio'] {
   to   { background-position: -120% 0; }
 }
 
+.thinking-elapsed {
+  font-size: var(--text-xs);
+  color: var(--ink-3);
+  font-variant-numeric: tabular-nums;
+}
+
 /* --- Suggested follow-ups / escalations ------------------------------------ */
 
 .suggestions {
