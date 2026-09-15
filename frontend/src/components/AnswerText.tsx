@@ -28,6 +28,93 @@ function stripPage(label: string): string {
   return label.replace(/\s+p\.?\s*\d+\s*$/i, '').trim() || label;
 }
 
+/**
+ * Split the inside of a `[...]` into citation labels.
+ *
+ * Labels contain commas of their own ("Silvermaster FBI file, Vol. 3 p. 41"),
+ * and a bracket can hold several of them, so a plain comma split shreds every
+ * label into unresolvable fragments. Instead the comma-separated pieces are
+ * rejoined greedily: at each position take the longest run of pieces that
+ * resolves to a real citation, and move on.
+ */
+function splitLabels(
+  inner: string,
+  resolve: (label: string) => CitationDetail | undefined,
+): string[] {
+  const whole = inner.trim();
+  if (resolve(whole)) return [whole];
+
+  const parts = inner.split(',').map((p) => p.trim()).filter(Boolean);
+  const out: string[] = [];
+  const MAX_JOIN = 4; // a label is never more than a few comma-separated pieces
+  let i = 0;
+  while (i < parts.length) {
+    let taken = 1;
+    for (let n = Math.min(MAX_JOIN, parts.length - i); n >= 1; n--) {
+      if (resolve(parts.slice(i, i + n).join(', '))) {
+        taken = n;
+        break;
+      }
+    }
+    out.push(parts.slice(i, i + taken).join(', '));
+    i += taken;
+  }
+  return out;
+}
+
+interface CiteChip {
+  display: string;
+  document: string;
+  page?: number;
+  detail?: CitationDetail;
+}
+
+/**
+ * Turn the labels inside one `[...]` bracket into chips.
+ *
+ * Two things the raw labels get wrong on screen: the page is stripped for
+ * readability, which makes two citations to different pages of the same file
+ * render as identical twins; and the same page cited twice renders twice. So
+ * pages are kept whenever they disambiguate, and exact repeats collapse.
+ */
+function citeChips(
+  labels: string[],
+  resolve: (label: string) => CitationDetail | undefined,
+): CiteChip[] {
+  const chips: CiteChip[] = labels.map((label) => {
+    const detail = resolve(label);
+    const rawLabel = detail?.label && /^\d+$/.test(label)
+      ? detail.label
+      : (detail?.label || stripConfidence(label));
+    const document = stripPage(stripConfidence(rawLabel)) || label;
+    const page = detail?.quote_page ?? detail?.page ?? undefined;
+    return { display: document, document, page, detail };
+  });
+
+  // Same document cited on different pages: put the page back so they differ.
+  const pagesPerDoc = new Map<string, Set<number>>();
+  for (const c of chips) {
+    if (c.page == null) continue;
+    const set = pagesPerDoc.get(c.document) ?? new Set<number>();
+    set.add(c.page);
+    pagesPerDoc.set(c.document, set);
+  }
+  for (const c of chips) {
+    if (c.page != null && (pagesPerDoc.get(c.document)?.size ?? 0) > 1) {
+      c.display = `${c.document} p. ${c.page}`;
+    }
+  }
+
+  // Collapse exact repeats (the same page cited twice in one bracket).
+  const seen = new Set<string>();
+  return chips.filter((c) => {
+    const key = `${c.detail?.document_id ?? c.document}|${c.page ?? ''}|${c.display}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
 interface Props {
   text: string;
   citationMap: Record<string, CitationDetail>;
@@ -67,43 +154,28 @@ export function AnswerText({ text, citationMap, onEvidenceClick }: Props) {
       const bracket = /\[([^\]\n]+)\]/g;
       let m: RegExpExecArray | null;
       while ((m = bracket.exec(raw)) !== null) {
-        // A bracket holds either one label or a comma-separated list — and labels
-        // themselves contain commas ("Silvermaster FBI file, Vol. 3 p. 41"), so
-        // the whole content is tried as a single label before splitting.
-        const labels = resolve(m[1].trim())
-          ? [m[1].trim()]
-          : m[1].split(',').map((s) => s.trim()).filter(Boolean);
+        const labels = splitLabels(m[1], resolve);
         if (!labels.some((l) => resolve(l))) continue; // not a citation — leave as text
         if (m.index > cursor) {
           out.push(...emphasis(raw.slice(cursor, m.index), `${keyBase}-t${n++}`));
         }
         out.push(
           <span className="cite-group" key={`${keyBase}-c${n++}`}>
-            {labels.map((label, j) => {
-              const detail = resolve(label);
-              if (detail?.document_id) {
-                const rawLabel = detail.label && /^\d+$/.test(label)
-                  ? detail.label
-                  : (detail.label || stripConfidence(label));
-                const display = stripPage(stripConfidence(rawLabel));
-                return (
-                  <button
-                    type="button"
-                    key={j}
-                    className="cite"
-                    onClick={() => openCitation(detail)}
-                    title={`Open ${display}${detail.page ? `, page ${detail.quote_page ?? detail.page}` : ''}`}
-                  >
-                    {display}
-                  </button>
-                );
-              }
-              return (
-                <span className="cite-unresolved" key={j}>
-                  [{stripPage(stripConfidence(label)) || label}]
-                </span>
-              );
-            })}
+            {citeChips(labels, resolve).map((chip, j) => (
+              chip.detail?.document_id ? (
+                <button
+                  type="button"
+                  key={j}
+                  className="cite"
+                  onClick={() => openCitation(chip.detail!)}
+                  title={`Open ${chip.document}${chip.page ? `, page ${chip.page}` : ''}`}
+                >
+                  {chip.display}
+                </button>
+              ) : (
+                <span className="cite-unresolved" key={j}>[{chip.display}]</span>
+              )
+            ))}
           </span>,
         );
         cursor = m.index + m[0].length;
@@ -144,6 +216,12 @@ const BULLET = /^\s*[-*•]\s+(.*)$/;
 const ORDERED = /^\s*\d+[.)]\s+(.*)$/;
 const HEADING = /^\s*#{1,4}\s+(.*)$/;
 const QUOTE = /^\s*>\s?(.*)$/;
+/** The answer builder's own rules: "--- Summary ---", "--- Narrative (…) ---". */
+const RULE_HEADING = /^\s*-{2,}\s*(.+?)\s*-{2,}\s*$/;
+/** Its section labels: "Findings:", "Members identified:", "Evidence:", … */
+const SECTION = /^\s*([A-Z][^.!?]{0,70}):\s*$/;
+/** Sections whose claims are, by construction, not fully supported. */
+const UNVERIFIED = /unverified|partial or overlap-only|no claims passed/i;
 
 /** Block pass: group lines into paragraphs, lists, headings and quotes. */
 function renderBlocks(text: string, inline: Inline): ReactNode[] {
@@ -154,10 +232,15 @@ function renderBlocks(text: string, inline: Inline): ReactNode[] {
   let quote: string[] = [];
   let key = 0;
 
+  // Claims under an "Unverified"/"draft" heading are marked, so a bullet with no
+  // citation reads as "the evidence is partial" rather than as a missing link.
+  let unverified = false;
+  const cls = () => (unverified ? 'is-unverified' : undefined);
+
   const flushPara = () => {
     if (!para.length) return;
     const body = para.join(' ');
-    blocks.push(<p key={`p${key++}`}>{inline(body, `p${key}`)}</p>);
+    blocks.push(<p key={`p${key++}`} className={cls()}>{inline(body, `p${key}`)}</p>);
     para = [];
   };
   const flushList = () => {
@@ -165,8 +248,8 @@ function renderBlocks(text: string, inline: Inline): ReactNode[] {
     const { ordered, items } = list;
     const children = items.map((item, i) => <li key={i}>{inline(item, `l${key}-${i}`)}</li>);
     blocks.push(ordered
-      ? <ol key={`o${key++}`}>{children}</ol>
-      : <ul key={`u${key++}`}>{children}</ul>);
+      ? <ol key={`o${key++}`} className={cls()}>{children}</ol>
+      : <ul key={`u${key++}`} className={cls()}>{children}</ul>);
     list = null;
   };
   const flushQuote = () => {
@@ -179,10 +262,19 @@ function renderBlocks(text: string, inline: Inline): ReactNode[] {
   for (const line of lines) {
     if (!line.trim()) { flushAll(); continue; }
 
-    const heading = HEADING.exec(line);
+    // The answer builder's section structure, rendered as structure rather than
+    // as literal "--- Summary ---" text in the middle of the prose.
+    const heading = HEADING.exec(line) || RULE_HEADING.exec(line) || SECTION.exec(line);
     if (heading) {
       flushAll();
-      blocks.push(<h3 key={`h${key++}`}>{inline(heading[1], `h${key}`)}</h3>);
+      const title = heading[1].trim();
+      unverified = UNVERIFIED.test(title);
+      blocks.push(
+        <h3 key={`h${key++}`} className={unverified ? 'is-unverified-heading' : undefined}>
+          {SECTION.test(line) ? title.replace(/:$/, '') : title}
+          {unverified && <span className="chip chip-amber">unverified</span>}
+        </h3>,
+      );
       continue;
     }
 

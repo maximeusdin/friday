@@ -22,6 +22,11 @@ pdfjs.GlobalWorkerOptions.workerSrc =
 const ZOOM_LEVELS = [50, 75, 100, 125, 150, 200];
 /** Pages kept mounted either side of the one being read. */
 const RENDER_WINDOW = 2;
+/** How far either side of a cited page to hunt for a quote that isn't on it.
+ *  Chunks span tens of pages, so the passage can be well away from the citation. */
+const LOCATE_RADIUS = 40;
+/** Misses tolerated before deciding a quote really is not on the page. */
+const QUOTE_MATCH_ATTEMPTS = 5;
 
 /**
  * Wrap a JPEG in a minimal single-page PDF (PDF 1.4, one image XObject drawn
@@ -262,6 +267,12 @@ export function EvidenceViewer({ evidence, onClose, backLabel = 'Back to Chat' }
   const scrollerRef = useRef<HTMLDivElement>(null);
   const pageEls = useRef<Map<number, HTMLDivElement>>(new Map());
   const [baseSize, setBaseSize] = useState<{ w: number; h: number } | null>(null);
+  // Where the quote actually turned out to be, when the cited page was wrong.
+  const [locatedPage, setLocatedPage] = useState<number | null>(null);
+  const [locating, setLocating] = useState(false);
+  // Retry handle + attempt count for a text layer that is still filling in.
+  const quoteRetry = useRef<number | undefined>(undefined);
+  const quoteAttempts = useRef(0);
   // True while we are scrolling the view ourselves, so the scroll handler does
   // not fight the navigation that caused it.
   const programmatic = useRef(false);
@@ -508,7 +519,7 @@ export function EvidenceViewer({ evidence, onClose, backLabel = 'Back to Chat' }
       setQuoteTier(null);
       return;
     }
-    const quotePage = evidence?.quote_page ?? evidence?.pdf_page;
+    const quotePage = locatedPage ?? evidence?.quote_page ?? evidence?.pdf_page;
     // Paint whenever the quote's page is mounted — with continuous scrolling it
     // need not be the page the toolbar currently names.
     const wrapper = quotePage != null ? pageEls.current.get(quotePage) : null;
@@ -522,16 +533,23 @@ export function EvidenceViewer({ evidence, onClose, backLabel = 'Back to Chat' }
       nodes.push({ node: text, start: full.length });
       full += text.nodeValue ?? '';
     }
-    if (!nodes.length) {
-      setQuoteTier('none');
-      return;
-    }
-
-    const match = matchQuoteInText(full, quote);
+    // react-pdf fills the text layer incrementally, and every mounted page's
+    // render callback runs this — so a miss can simply mean "the layer is not
+    // finished yet". Declaring failure on the first miss is what made a quote
+    // that was found and highlighted still report itself as unfindable: retry a
+    // few times and only then conclude the passage is not on the page.
+    const match = nodes.length ? matchQuoteInText(full, quote) : null;
     if (!match) {
-      setQuoteTier('none');
+      window.clearTimeout(quoteRetry.current);
+      if (quoteAttempts.current < QUOTE_MATCH_ATTEMPTS) {
+        quoteAttempts.current += 1;
+        quoteRetry.current = window.setTimeout(() => applyEvidenceHighlightRef.current?.(), 300);
+      } else {
+        setQuoteTier('none');
+      }
       return;
     }
+    quoteAttempts.current = 0;
     const a = locate(nodes, match.start);
     const b = locate(nodes, match.end);
     const r = window.document.createRange();
@@ -542,8 +560,11 @@ export function EvidenceViewer({ evidence, onClose, backLabel = 'Back to Chat' }
     setQuoteTier(match.tier);
     // Bring the evidence into view (center) once painted.
     r.startContainer.parentElement?.scrollIntoView({ block: 'center', inline: 'nearest' });
-  }, [evidence?.quote, evidence?.quote_page, evidence?.pdf_page, currentPage]);
+  }, [evidence?.quote, evidence?.quote_page, evidence?.pdf_page, currentPage, locatedPage]);
 
+
+  const applyEvidenceHighlightRef = useRef<(() => void) | null>(null);
+  applyEvidenceHighlightRef.current = applyEvidenceHighlight;
 
   // Re-paint when match selection or page changes (text layer may already be rendered)
   useEffect(() => {
@@ -551,10 +572,71 @@ export function EvidenceViewer({ evidence, onClose, backLabel = 'Back to Chat' }
     applyEvidenceHighlight();
   }, [applyHighlights, applyEvidenceHighlight]);
 
+  useEffect(() => () => window.clearTimeout(quoteRetry.current), []);
+
   // Reset quote tier when the evidence target changes
   useEffect(() => {
     setQuoteTier(null);
+    setLocatedPage(null);
+    quoteAttempts.current = 0;
   }, [evidence?.document_id, evidence?.quote]);
+
+  /** Page text, extracted once and cached (shared with find-in-document). */
+  const pageText = useCallback(async (p: number): Promise<string> => {
+    const cached = textCache.current.get(p);
+    if (cached !== undefined) return cached;
+    const pdf = pdfRef.current;
+    if (!pdf) return '';
+    const page = await pdf.getPage(p);
+    const tc = await page.getTextContent();
+    const t = tc.items.map((it) => ('str' in it ? it.str : '')).join('');
+    textCache.current.set(p, t);
+    return t;
+  }, []);
+
+  // When the quote is not on the page the citation named, go and find it.
+  //
+  // Chunks span many pages, and a citation is pinned to the chunk's page rather
+  // than the page the sentence is printed on — so quotes routinely sit a page or
+  // two away (a cable's footnotes are overleaf from the cable). Rather than
+  // shrugging with "approximate location", search outwards from the cited page
+  // for the passage itself.
+  useEffect(() => {
+    const quote = evidence?.quote;
+    const cited = evidence?.quote_page ?? evidence?.pdf_page;
+    if (!quote || quote.trim().length < 12 || quoteTier !== 'none') return;
+    if (locatedPage != null || !numPages || !pdfRef.current) return;
+
+    let cancelled = false;
+    setLocating(true);
+    (async () => {
+      // Nearest pages first: the answer is almost always a page or two out.
+      const order: number[] = [];
+      for (let d = 1; d <= LOCATE_RADIUS; d++) {
+        if ((cited ?? 1) - d >= 1) order.push((cited ?? 1) - d);
+        if ((cited ?? 1) + d <= numPages) order.push((cited ?? 1) + d);
+      }
+      for (const p of order) {
+        if (cancelled) return;
+        let text = '';
+        try {
+          text = await pageText(p);
+        } catch {
+          continue;
+        }
+        if (matchQuoteInText(text, quote)) {
+          if (cancelled) return;
+          quoteAttempts.current = 0;
+          setLocatedPage(p);
+          goToPage(p);
+          break;
+        }
+      }
+      if (!cancelled) setLocating(false);
+    })();
+    return () => { cancelled = true; setLocating(false); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [quoteTier, evidence?.quote, evidence?.quote_page, evidence?.pdf_page, numPages, locatedPage]);
 
   // Clear highlights on unmount / document change
   useEffect(() => () => CSS_clearHighlights(), [evidence?.document_id]);
@@ -917,9 +999,23 @@ export function EvidenceViewer({ evidence, onClose, backLabel = 'Back to Chat' }
         <div className="doc-quote">
           <span>&ldquo;{evidence.quote}&rdquo;</span>
           <span className="doc-quote-meta">
-            {quoteTier === 'exact' && <><Icon name="check" size={13} /> highlighted on this page</>}
-            {quoteTier === 'fuzzy' && <><Icon name="check" size={13} /> highlighted — approximate match</>}
-            {quoteTier === 'none' && <><Icon name="info" size={13} /> approximate location — the exact text could not be pinpointed</>}
+            {quoteTier === 'exact' && (
+              <><Icon name="check" size={13} /> highlighted on page {locatedPage ?? currentPage}</>
+            )}
+            {quoteTier === 'fuzzy' && (
+              <><Icon name="check" size={13} /> highlighted on page {locatedPage ?? currentPage} — approximate match</>
+            )}
+            {quoteTier === 'none' && locating && (
+              <><span className="spinner" style={{ width: 12, height: 12 }} /> locating the passage…</>
+            )}
+            {quoteTier === 'none' && !locating && (
+              <><Icon name="info" size={13} /> this passage isn&apos;t on the cited page and couldn&apos;t be found nearby</>
+            )}
+            {locatedPage != null && locatedPage !== (evidence.quote_page ?? evidence.pdf_page) && (
+              <span className="text-muted">
+                · the citation pointed at page {evidence.quote_page ?? evidence.pdf_page}
+              </span>
+            )}
             {evidence.why && <span className="text-muted">· {evidence.why}</span>}
           </span>
         </div>

@@ -1289,6 +1289,31 @@ input[type='radio'] {
   font-weight: 600;
 }
 
+/* Section headings the answer builder emits ("Findings:", "Members identified:",
+   "--- Summary ---"). */
+.answer-prose h3 {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+}
+
+/* Claims the backend could only partially support. Marked rather than hidden:
+   a bullet with no citation should read as weak evidence, not as a broken link. */
+.answer-prose h3.is-unverified-heading {
+  color: var(--amber);
+}
+
+.answer-prose .is-unverified {
+  border-left: 2px solid var(--amber-line);
+  padding-left: var(--s-4);
+  color: var(--ink-2);
+}
+
+.answer-prose ul.is-unverified,
+.answer-prose ol.is-unverified {
+  padding-left: calc(var(--s-4) + 1.2em);
+}
+
 /* Inline citations — subtle in flow, obviously clickable on hover. */
 .cite {
   display: inline;
