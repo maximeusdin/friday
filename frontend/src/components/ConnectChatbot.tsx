@@ -1,6 +1,7 @@
 'use client';
 
 import { useState } from 'react';
+import { Icon } from './ui/Icon';
 
 /** Public MCP endpoint for the Friday connector (mounted by the API at /mcp). */
 export const MCP_URL = process.env.NEXT_PUBLIC_MCP_URL || 'https://api.fridayarchive.org/mcp';
@@ -35,14 +36,16 @@ export function AddToClaudeButton({ onShowInstructions }: { onShowInstructions?:
   };
 
   return (
-    <div className="claude-cta-wrap">
-      <button type="button" className="claude-cta" onClick={handleClick}>
+    <div>
+      <button type="button" className="btn-secondary" onClick={handleClick}>
+        <Icon name="plug" size={15} />
         Add to Claude
       </button>
       {copied && (
-        <span className="claude-cta-copied">
-          Connector URL copied — in the Claude tab: <strong>Add custom connector</strong>, paste, <strong>Add</strong>.
-        </span>
+        <p className="text-sm text-muted" style={{ marginTop: 'var(--s-2)' }}>
+          Connector URL copied — in the Claude tab: <strong>Add custom connector</strong>, paste,{' '}
+          <strong>Add</strong>.
+        </p>
       )}
     </div>
   );
@@ -52,14 +55,15 @@ export function AddToClaudeButton({ onShowInstructions }: { onShowInstructions?:
 function McpUrlBox() {
   const [copied, setCopied] = useState(false);
   return (
-    <div className="claude-url-box">
+    <div className="url-box">
       <code>{MCP_URL}</code>
       <button
         type="button"
-        className="claude-copy-btn"
+        className="btn-secondary btn-sm"
         onClick={async () => setCopied(await copyMcpUrl())}
       >
-        {copied ? 'Copied ✓' : 'Copy'}
+        <Icon name={copied ? 'check' : 'copy'} size={14} />
+        {copied ? 'Copied' : 'Copy'}
       </button>
     </div>
   );
@@ -71,7 +75,7 @@ function McpUrlBox() {
  */
 export function ChatbotConnectBody() {
   return (
-    <>
+    <div className="prose">
       <p>
         Friday is available as a <strong>connector</strong> for AI chatbots: add it once, and
         your chatbot can search the archives, resolve codenames, and read documents directly
@@ -88,7 +92,7 @@ export function ChatbotConnectBody() {
 
       <p><strong>Claude (claude.ai — Free, Pro, or Max):</strong></p>
       <AddToClaudeButton />
-      <ol className="claude-steps">
+      <ol className="steps">
         <li>
           Open{' '}
           <a href={CLAUDE_CONNECTORS_URL} target="_blank" rel="noopener noreferrer">
@@ -107,7 +111,7 @@ export function ChatbotConnectBody() {
       </ol>
 
       <p><strong>ChatGPT (Plus, Pro, Business, or Enterprise):</strong></p>
-      <ol className="claude-steps">
+      <ol className="steps">
         <li>Open <strong>Settings &rarr; Connectors</strong>. If there is no option to add a
           custom connector, enable <strong>Developer mode</strong> first (under
           Settings &rarr; Connectors &rarr; Advanced).</li>
@@ -126,7 +130,7 @@ export function ChatbotConnectBody() {
           LM Studio, and most other MCP-capable clients.</li>
         <li>
           <strong>Claude Code:</strong> run
-          <span className="claude-url-box claude-url-box-inline"><code>claude mcp add --transport http friday {MCP_URL}</code></span>
+          <span className="url-box url-box-inline"><code>claude mcp add --transport http friday {MCP_URL}</code></span>
         </li>
       </ul>
 
@@ -140,6 +144,6 @@ export function ChatbotConnectBody() {
         cover names in the concordance, runs keyword searches, and reads the OCR text of the
         pages it finds. Every citation links back to the scanned original here on Friday.
       </p>
-    </>
+    </div>
   );
 }

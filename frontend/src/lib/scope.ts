@@ -34,3 +34,38 @@ export function scopesEqual(
   if (!a || !b) return false;
   return scopeFingerprint(a) === scopeFingerprint(b);
 }
+
+/** Total documents a scope covers, when the collection tree is known. */
+export function scopeDocumentCount(
+  scope: UserSelectedScope,
+  collections: { id: number; document_count: number }[],
+): number | null {
+  if (scope.mode === 'full_archive') {
+    return collections.reduce((n, c) => n + (c.document_count || 0), 0);
+  }
+  const ids = new Set(scope.included_collection_ids || []);
+  const fromCollections = collections
+    .filter((c) => ids.has(c.id))
+    .reduce((n, c) => n + (c.document_count || 0), 0);
+  return fromCollections + (scope.included_document_ids?.length || 0);
+}
+
+/** Short human label for a scope — "Entire archive", a collection name, or a count. */
+export function describeScope(
+  scope: UserSelectedScope | null | undefined,
+  collections: { id: number; title?: string; slug?: string }[],
+): string {
+  if (!scope || scope.mode === 'full_archive') return 'Entire archive';
+  const cols = scope.included_collection_ids || [];
+  const docs = scope.included_document_ids || [];
+  if (cols.length === 0 && docs.length === 0) return 'No sources selected';
+  const parts: string[] = [];
+  if (cols.length === 1) {
+    const c = collections.find((x) => x.id === cols[0]);
+    parts.push(c ? (c.title || c.slug || `Collection ${cols[0]}`) : `1 collection`);
+  } else if (cols.length > 1) {
+    parts.push(`${cols.length} collections`);
+  }
+  if (docs.length > 0) parts.push(`${docs.length} document${docs.length === 1 ? '' : 's'}`);
+  return parts.join(' · ');
+}

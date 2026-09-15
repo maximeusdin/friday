@@ -33,6 +33,11 @@ export interface ChatRunState {
   startedAt: number | null;
   /** scope the in-flight run was launched with. */
   runScope: UserSelectedScope | null;
+  /** The question being answered, so the thread can show it immediately rather
+   *  than waiting for the server round-trip that persists it. Deliberately NOT
+   *  cleared when the run finishes: the refetched history replaces it, and the
+   *  view drops it once the same text appears there (see Conversation). */
+  pendingText: string | null;
 }
 
 /** Shared idle snapshot — stable reference so useSyncExternalStore doesn't loop. */
@@ -44,6 +49,7 @@ export const EMPTY_RUN: ChatRunState = Object.freeze({
   sendError: null,
   startedAt: null,
   runScope: null,
+  pendingText: null,
 });
 
 const runs = new Map<number, ChatRunState>();
@@ -119,6 +125,7 @@ export function startRun(sessionId: number, text: string, opts: StartRunOptions)
     sendError: null,
     startedAt: Date.now(),
     runScope: opts.scope,
+    pendingText: opts.action === 'think_deeper' ? null : text,
   });
 
   api.sendV9MessageStreaming(
@@ -146,7 +153,7 @@ export function startRun(sessionId: number, text: string, opts: StartRunOptions)
       },
       onError: (error) => {
         if (controller.signal.aborted) return;
-        patch(sessionId, { sendError: error, isSending: false });
+        patch(sessionId, { sendError: error, isSending: false, pendingText: null });
       },
     },
     controller.signal,
@@ -174,7 +181,9 @@ export function stopRun(sessionId: number): void {
   controllers.get(sessionId)?.abort();
   controllers.delete(sessionId);
   if (runs.has(sessionId)) {
-    patch(sessionId, { isSending: false, progressSteps: [], evidenceBullets: [], startedAt: null });
+    patch(sessionId, {
+      isSending: false, progressSteps: [], evidenceBullets: [], startedAt: null, pendingText: null,
+    });
   }
 }
 

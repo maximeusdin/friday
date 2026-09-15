@@ -3,10 +3,12 @@
 import { useState, useCallback, useEffect } from 'react';
 import dynamic from 'next/dynamic';
 import { useQueryClient } from '@tanstack/react-query';
-import { SessionList } from '@/components/SessionList';
+import { SessionSidebar } from '@/components/SessionSidebar';
 import { Conversation } from '@/components/Conversation';
-import { RightPane } from '@/components/RightPane';
 import { SearchTab } from '@/components/SearchTab';
+import { AppHeader } from '@/components/AppHeader';
+import { Icon } from '@/components/ui/Icon';
+import { Toaster } from '@/components/ui/Toast';
 
 // EvidenceViewer pulls in react-pdf / pdfjs-dist, which is browser-only: pdfjs 4.x
 // calls Promise.withResolvers at module-init, so importing it during the static
@@ -15,12 +17,13 @@ const EvidenceViewer = dynamic(
   () => import('@/components/EvidenceViewer').then((m) => m.EvidenceViewer),
   { ssr: false },
 );
-import { AuthHeader } from '@/components/AuthHeader';
+
 import type { Session, EvidenceRef, UserSelectedScope, CollectionNode } from '@/types/api';
 import type { AuthUser } from '@/lib/api';
 import { api, getLoginUrl } from '@/lib/api';
-import { normalizeScope } from '@/lib/scope';
-import { useChatRun } from '@/lib/chatRunStore';
+import { titleFromQuestion } from '@/lib/format';
+
+const FULL_ARCHIVE: UserSelectedScope = { mode: 'full_archive' };
 
 export default function Home() {
   const queryClient = useQueryClient();
@@ -32,34 +35,22 @@ export default function Home() {
   // — the URLs emitted by the MCP connector, search exports, and share links.
   const [deepLinkedDoc, setDeepLinkedDoc] = useState(false);
 
-  // The active session's chat run comes from the shared store (per-session, so runs
-  // continue when you switch sessions and several can be in flight at once).
-  const activeRun = useChatRun(activeSession?.id ?? null);
-  const lastV9Response = activeRun.lastV9;
-
-  // --- Center pane tab: Chat | Search ---
   const [activeTab, setActiveTab] = useState<'chat' | 'search'>('chat');
   const [activeSearchResultSetId, setActiveSearchResultSetId] = useState<string | null>(null);
 
-  // Question queued from a splash "Try asking" card — auto-sent once the new session mounts
+  // Queued from the welcome screen: the session is created on the first question,
+  // so nobody has to name a session before they can ask anything.
   const [pendingQuestion, setPendingQuestion] = useState<string | null>(null);
-  // Query queued from a Search splash "Example queries" card — auto-run once the new session mounts
   const [pendingSearch, setPendingSearch] = useState<string | null>(null);
 
-  // --- Scope state (staged-commit model) ---
-  const [activeScope, setActiveScope] = useState<UserSelectedScope | null>(null);
-  const [activeScopeRevision, setActiveScopeRevision] = useState(0);
-  const [lastUsedScope, setLastUsedScope] = useState<UserSelectedScope | null>(null);
-  const [hasDraftChanges, setHasDraftChanges] = useState(false);
+  // Scope applies as soon as it is chosen — see ScopeControl for why there is no
+  // apply step. It is persisted to the session so it survives a reload.
+  const [activeScope, setActiveScope] = useState<UserSelectedScope>(FULL_ARCHIVE);
   const [collections, setCollections] = useState<CollectionNode[]>([]);
 
-  // --- Scope pane sizing (collapsible + draggable divider, persisted) ---
-  const SCOPE_MIN = 320;
-  const SCOPE_DEFAULT = 480;
-  const [scopeWidth, setScopeWidth] = useState(SCOPE_DEFAULT);
-  const [scopeCollapsed, setScopeCollapsed] = useState(false);
+  const [sidebarOpen, setSidebarOpen] = useState(true);
 
-  // Deep link: open the Document Viewer directly from /?document_id=…&pdf_page=….
+  // Deep link: open the document viewer directly from /?document_id=…&pdf_page=….
   // Plain window.location (not useSearchParams) so the static export needs no
   // Suspense boundary. Runs once on mount.
   useEffect(() => {
@@ -77,7 +68,7 @@ export default function Home() {
     } catch { /* ignore */ }
   }, []);
 
-  // Load collections cache once on mount (retry once after 2s on failure)
+  // Load the collections cache once on mount (retry once after 2s on failure).
   useEffect(() => {
     const load = () => api.getCollectionsTree().then(setCollections);
     load().catch(() => {
@@ -85,156 +76,107 @@ export default function Home() {
     });
   }, []);
 
-  // Restore persisted scope-pane width / collapsed state (client-only)
+  // Restore the sidebar preference; narrow viewports start with it closed so the
+  // drawer doesn't cover the conversation on first paint.
   useEffect(() => {
     try {
-      const w = Number(localStorage.getItem('friday.scopeWidth'));
-      if (w >= SCOPE_MIN) setScopeWidth(w);
-      if (localStorage.getItem('friday.scopeCollapsed') === '1') setScopeCollapsed(true);
+      const stored = localStorage.getItem('friday.sidebar');
+      if (stored) setSidebarOpen(stored === 'open');
+      else if (window.innerWidth < 900) setSidebarOpen(false);
     } catch { /* ignore */ }
   }, []);
 
-  useEffect(() => {
-    try { localStorage.setItem('friday.scopeCollapsed', scopeCollapsed ? '1' : '0'); } catch { /* ignore */ }
-  }, [scopeCollapsed]);
-
-  // Drag the divider to resize the scope pane
-  const startScopeResize = useCallback((e: React.PointerEvent) => {
-    e.preventDefault();
-    const onMove = (ev: PointerEvent) => {
-      const max = Math.min(720, window.innerWidth * 0.6);
-      const next = Math.max(SCOPE_MIN, Math.min(max, window.innerWidth - ev.clientX));
-      setScopeWidth(next);
-    };
-    const onUp = () => {
-      window.removeEventListener('pointermove', onMove);
-      window.removeEventListener('pointerup', onUp);
-      document.body.style.cursor = '';
-      document.body.style.userSelect = '';
-      setScopeWidth((w) => {
-        try { localStorage.setItem('friday.scopeWidth', String(Math.round(w))); } catch { /* ignore */ }
-        return w;
-      });
-    };
-    document.body.style.cursor = 'col-resize';
-    document.body.style.userSelect = 'none';
-    window.addEventListener('pointermove', onMove);
-    window.addEventListener('pointerup', onUp);
+  const toggleSidebar = useCallback(() => {
+    setSidebarOpen((open) => {
+      try { localStorage.setItem('friday.sidebar', open ? 'closed' : 'open'); } catch { /* ignore */ }
+      return !open;
+    });
   }, []);
 
-  // --- Session handlers ---
+  // --- Sessions ---
 
   const handleSessionSelect = async (session: Session) => {
-    // Fetch full session (scope_json, output_mode) when selecting
+    // Fetch the full session (scope_json, output_mode) when selecting.
+    let full = session;
     try {
-      const full = await api.getSession(session.id);
-      setActiveSession(full);
-    } catch {
-      setActiveSession(session);
-    }
+      full = await api.getSession(session.id);
+    } catch { /* fall back to the list row */ }
+    setActiveSession(full);
     setActiveEvidence(null);
     setActiveSearchResultSetId(null);
-    // Scope: deterministic reset
-    setActiveScope(session.scope_json || { mode: 'full_archive' });
-    setActiveScopeRevision(1); // deterministic reset, not increment
-    setLastUsedScope(null);
-    setHasDraftChanges(false);
+    setActiveScope(full.scope_json || FULL_ARCHIVE);
+    if (window.innerWidth < 900) setSidebarOpen(false);
   };
 
-  // Start a fresh session from a splash example and queue the question to auto-send.
-  const handleExampleQuestion = async (question: string) => {
-    const base = question.length > 48 ? `${question.slice(0, 48).trimEnd()}…` : question;
-    // Dedupe against the cached sessions list, mirroring SessionList's resolveLabel.
+  const handleNewSession = () => {
+    setActiveSession(null);
+    setActiveEvidence(null);
+    setActiveSearchResultSetId(null);
+    setActiveScope(FULL_ARCHIVE);
+    setActiveTab('chat');
+    if (window.innerWidth < 900) setSidebarOpen(false);
+  };
+
+  /** Create the session a question implies, keeping whatever scope was chosen first. */
+  const createSessionFor = useCallback(async (seed: string): Promise<Session | null> => {
+    const base = titleFromQuestion(seed);
     const existing = new Set(
-      ((queryClient.getQueryData(['sessions']) as Session[] | undefined) ?? []).map((s) => s.label)
+      ((queryClient.getQueryData(['sessions']) as Session[] | undefined) ?? []).map((s) => s.label),
     );
     let label = base;
     for (let n = 1; existing.has(label); n++) label = `${base} (${n})`;
     try {
       const created = await api.createSession({ label });
       queryClient.invalidateQueries({ queryKey: ['sessions'] });
-      setActiveTab('chat');
-      await handleSessionSelect(created);
-      setPendingQuestion(question);
+      setActiveSession(created);
+      setActiveEvidence(null);
+      setActiveSearchResultSetId(null);
+      if (activeScope.mode === 'custom') {
+        api.updateSessionScope(created.id, activeScope).catch(console.error);
+      }
+      return created;
     } catch (err) {
-      console.error('Failed to start session from example question', err);
+      console.error('Failed to create session', err);
+      return null;
     }
-  };
+  }, [queryClient, activeScope]);
 
-  // Start a fresh session from a Search splash example and queue the query to auto-run.
-  const handleExampleSearch = async (searchQuery: string) => {
-    const base = searchQuery.length > 48 ? `${searchQuery.slice(0, 48).trimEnd()}…` : searchQuery;
-    const existing = new Set(
-      ((queryClient.getQueryData(['sessions']) as Session[] | undefined) ?? []).map((s) => s.label)
-    );
-    let label = base;
-    for (let n = 1; existing.has(label); n++) label = `${base} (${n})`;
-    try {
-      const created = await api.createSession({ label });
-      queryClient.invalidateQueries({ queryKey: ['sessions'] });
-      setActiveTab('search');
-      await handleSessionSelect(created);
-      setPendingSearch(searchQuery);
-    } catch (err) {
-      console.error('Failed to start session from example search', err);
-    }
-  };
+  const handleStartSession = useCallback(async (question: string) => {
+    setActiveTab('chat');
+    const created = await createSessionFor(question);
+    if (created) setPendingQuestion(question);
+  }, [createSessionFor]);
+
+  const handleStartSearchSession = useCallback(async (query: string) => {
+    setActiveTab('search');
+    const created = await createSessionFor(query);
+    if (created) setPendingSearch(query);
+  }, [createSessionFor]);
 
   const handleSessionDelete = () => {
     setActiveSession(null);
     setActiveEvidence(null);
     setActiveSearchResultSetId(null);
-    setActiveScope(null);
-    setActiveScopeRevision(0);
-    setLastUsedScope(null);
-    setHasDraftChanges(false);
+    setActiveScope(FULL_ARCHIVE);
   };
 
-  // --- Scope handlers (useCallback-stable) ---
+  // --- Scope ---
 
-  const handleApplyScope = useCallback((scope: UserSelectedScope) => {
+  const handleScopeChange = useCallback((scope: UserSelectedScope) => {
     setActiveScope(scope);
-    setActiveScopeRevision(r => r + 1);
     if (activeSession?.id) {
       api.updateSessionScope(activeSession.id, scope).catch(console.error);
     }
   }, [activeSession?.id]);
 
-  const handleDraftDirtyChange = useCallback((dirty: boolean) => {
-    setHasDraftChanges(dirty);
-  }, []);
-
-  const handleEditScope = useCallback(() => {
-    // Right pane is scope-only; no tab to switch
-  }, []);
-
-  // --- V9 response handler ---
+  // --- Evidence / search ---
 
   const handleViewSearchResultSet = useCallback((resultSetId: string) => {
     setActiveTab('search');
     setActiveSearchResultSetId(resultSetId);
   }, []);
 
-  const handleSearchRun = useCallback(() => {
-    setActiveSearchResultSetId(null);
-  }, []);
-
-  // Remember the scope the active session's last answer actually ran against, so the
-  // scope bar can flag "changed since last query". Derived from the store: prefer the
-  // answer's scope_override, else the scope the run was launched with.
-  useEffect(() => {
-    const response = activeRun.lastV9;
-    if (!response) return;
-    if (response.scope_override?.run_scope) {
-      setLastUsedScope(normalizeScope({
-        mode: response.scope_override.run_scope.mode,
-        included_collection_ids: response.scope_override.run_scope.included_collection_ids,
-        included_document_ids: response.scope_override.run_scope.included_document_ids,
-      }));
-    } else if (activeRun.runScope) {
-      setLastUsedScope(normalizeScope(activeRun.runScope));
-    }
-  }, [activeRun.lastV9, activeRun.runScope]);
+  const handleSearchRun = useCallback(() => setActiveSearchResultSetId(null), []);
 
   const handleEvidenceClick = (evidence: EvidenceRef | null) => {
     setActiveEvidence(evidence);
@@ -271,173 +213,112 @@ export default function Home() {
 
   const handleCloseEvidence = () => {
     setActiveEvidence(null);
-    if (fromSearch) {
-      setActiveTab('search');
-    }
-    // Do NOT clear activeSearchResultSetId — keep results visible when returning from doc viewer
+    if (fromSearch) setActiveTab('search');
+    // Keep activeSearchResultSetId so results are still there on return.
   };
 
   return (
-    <div className="app-wrapper">
-      {/* Persistent top header */}
-      <AuthHeader user={user} onLogout={() => setUser(null)} />
+    <div className="app" data-sidebar={sidebarOpen ? 'open' : 'closed'}>
+      <AppHeader
+        user={user}
+        onLogout={() => setUser(null)}
+        sidebarOpen={sidebarOpen}
+        onToggleSidebar={toggleSidebar}
+      />
 
-      {/* Main content area (3-pane grid) */}
-      <div
-        className="app-container"
-        style={{ ['--scope-w' as string]: scopeCollapsed ? '40px' : `${scopeWidth}px` } as React.CSSProperties}
-      >
-        {/* Auth gate overlay – blocks interaction when unauthenticated.
-            Suppressed while a deep-linked document is open: the archive documents
-            are public, and citation links from Claude/exports must render for
-            visitors without an account. Closing the viewer restores the gate. */}
+      <div className="app-body">
+        {/* The archive documents are public: a deep-linked document stays readable
+            without an account, because citation links from Claude and from exports
+            must open for visitors. Closing the viewer restores the gate. */}
         {authChecked && !isAuthenticated && !(deepLinkedDoc && showingEvidence) && (
-          <div className="auth-overlay">
-            <div className="auth-overlay-card">
-              <h2>Sign in required</h2>
+          <div className="auth-gate">
+            <div className="auth-card">
+              <h2>Sign in to use Friday</h2>
               <p>
-                Friday uses secure login. You&rsquo;ll be redirected to sign in
-                and then returned here.
+                You&rsquo;ll be redirected to our secure login and returned here.
               </p>
-              <a href={getLoginUrl()} className="btn-signin">
-                Sign in
-              </a>
-              <div className="auth-note">
-                You&rsquo;ll be redirected to our secure login.
-              </div>
+              <a href={getLoginUrl()} className="btn-primary btn-lg">Sign in</a>
             </div>
           </div>
         )}
 
-        {/* Left Pane: Sessions */}
-        <div className={`pane${!isAuthenticated ? ' pane-locked' : ''}`}>
-          <div className="pane-header">Sessions</div>
-          <div className="pane-content">
-            <SessionList
-              activeSessionId={activeSession?.id}
-              onSessionSelect={handleSessionSelect}
-              onSessionDelete={handleSessionDelete}
-            />
-          </div>
-        </div>
+        <SessionSidebar
+          activeSessionId={activeSession?.id}
+          onSessionSelect={handleSessionSelect}
+          onSessionDelete={handleSessionDelete}
+          onNewSession={handleNewSession}
+        />
 
-        {/* Center Pane: Chat | Search tabs, or Document Viewer overlay */}
-        <div className="pane pane-center" style={{ position: 'relative' }}>
-          {showingEvidence && (
+        <main className="workspace">
+          {showingEvidence ? (
+            <EvidenceViewer
+              evidence={activeEvidence}
+              onClose={handleCloseEvidence}
+              backLabel={fromSearch ? 'Back to results' : 'Back to chat'}
+            />
+          ) : (
             <>
-              <div className="pane-header" style={{ position: 'relative', zIndex: 11 }}>
-                <span>Document Viewer</span>
-                <button
-                  className="btn-secondary"
-                  onClick={handleCloseEvidence}
-                  style={{ fontSize: '13px', padding: '4px 12px' }}
-                >
-                  &larr; {fromSearch ? 'Back to results' : 'Back to Chat'}
-                </button>
-              </div>
-              <div style={{ position: 'absolute', inset: 0, top: 49, zIndex: 10, background: 'var(--color-bg)', overflow: 'auto' }}>
-                <EvidenceViewer
-                  evidence={activeEvidence}
-                  onClose={handleCloseEvidence}
-                  backLabel={fromSearch ? 'Back to results' : 'Back to Chat'}
-                />
-              </div>
-            </>
-          )}
-          <div style={{ display: showingEvidence ? 'none' : 'flex', flexDirection: 'column', flex: 1, minHeight: 0, overflow: 'hidden' }}>
-            <>
-              <div className="pane-header pane-header-tabs">
-                <div className="tab-bar">
+              <div className="ws-bar">
+                <div className="segmented" role="tablist" aria-label="Chat or Search">
                   <button
                     type="button"
-                    className={`tab-btn ${activeTab === 'chat' ? 'tab-btn-active' : ''}`}
+                    role="tab"
+                    aria-selected={activeTab === 'chat'}
+                    className="segmented-item"
                     onClick={() => setActiveTab('chat')}
                   >
+                    <Icon name="message" size={15} />
                     Chat
                   </button>
                   <button
                     type="button"
-                    className={`tab-btn ${activeTab === 'search' ? 'tab-btn-active' : ''}`}
+                    role="tab"
+                    aria-selected={activeTab === 'search'}
+                    className="segmented-item"
                     onClick={() => setActiveTab('search')}
                   >
+                    <Icon name="search" size={15} />
                     Search
                   </button>
                 </div>
-                {activeTab === 'chat' && activeSession && (
-                  <span className="pane-header-label">{activeSession.label}</span>
-                )}
-                {activeTab === 'search' && (
-                  <span className="pane-header-label">Archive Search</span>
-                )}
+                <span className="ws-bar-title">
+                  {activeSession ? activeSession.label : 'New session'}
+                </span>
               </div>
+
               {activeTab === 'chat' ? (
                 <Conversation
-                session={activeSession}
-                onViewSearchResultSet={handleViewSearchResultSet}
-                onOpenSearchTab={() => setActiveTab('search')}
-                onEvidenceClick={handleEvidenceClick}
-                activeScope={activeScope}
-                lastUsedScope={lastUsedScope}
-                collections={collections}
-                hasDraftChanges={hasDraftChanges}
-                onEditScope={handleEditScope}
-                onMakeActiveScope={handleApplyScope}
-                onExampleQuestion={handleExampleQuestion}
-                pendingQuestion={pendingQuestion}
-                onPendingQuestionConsumed={() => setPendingQuestion(null)}
-              />
+                  session={activeSession}
+                  collections={collections}
+                  activeScope={activeScope}
+                  onScopeChange={handleScopeChange}
+                  onViewSearchResultSet={handleViewSearchResultSet}
+                  onOpenSearchTab={() => setActiveTab('search')}
+                  onEvidenceClick={handleEvidenceClick}
+                  onStartSession={handleStartSession}
+                  pendingQuestion={pendingQuestion}
+                  onPendingQuestionConsumed={() => setPendingQuestion(null)}
+                />
               ) : (
                 <SearchTab
                   activeScope={activeScope}
+                  onScopeChange={handleScopeChange}
+                  collections={collections}
                   sessionId={activeSession?.id ?? null}
                   onOpenPage={handleOpenPageFromSearch}
-                  externalResultSetId={activeTab === 'search' ? activeSearchResultSetId : null}
+                  externalResultSetId={activeSearchResultSetId}
                   onSearchRun={handleSearchRun}
-                  collections={collections}
-                  onExampleSearch={handleExampleSearch}
+                  onStartSession={handleStartSearchSession}
                   pendingSearchQuery={pendingSearch}
                   onPendingSearchConsumed={() => setPendingSearch(null)}
                 />
               )}
             </>
-          </div>
-        </div>
-
-        {/* Right Pane: Scope (collapsible + resizable) */}
-        <div className="pane scope-pane" style={{ borderRight: 'none', position: 'relative' }}>
-          {!scopeCollapsed && (
-            <div
-              className="scope-resize-handle"
-              onPointerDown={startScopeResize}
-              role="separator"
-              aria-orientation="vertical"
-              title="Drag to resize"
-            />
           )}
-          {scopeCollapsed ? (
-            <button
-              className="scope-rail"
-              onClick={() => setScopeCollapsed(false)}
-              title="Show scope panel"
-            >
-              <span className="scope-rail-chevron">‹</span>
-              <span className="scope-rail-label">Scope</span>
-              {hasDraftChanges && <span className="scope-rail-dot" title="Unapplied scope changes" />}
-            </button>
-          ) : (
-            <RightPane
-              v9Response={lastV9Response}
-              sessionId={activeSession?.id}
-              activeScope={activeScope}
-              onApplyScope={handleApplyScope}
-              onDraftDirtyChange={handleDraftDirtyChange}
-              activeScopeRevision={activeScopeRevision}
-              collections={collections}
-              onCollapse={() => setScopeCollapsed(true)}
-            />
-          )}
-        </div>
+        </main>
       </div>
+
+      <Toaster />
     </div>
   );
 }

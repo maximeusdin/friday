@@ -2,57 +2,13 @@
 
 import { useCallback, useEffect, useState } from 'react';
 import { api, type ConcordanceEntry, type ConcordanceSummary } from '@/lib/api';
-
-/**
- * Splash-screen card describing the Concordance Index, with actions to
- * browse it in a modal or download it as CSV.
- */
-export function ConcordanceCard() {
-  const [showIndex, setShowIndex] = useState(false);
-
-  return (
-    <div className="splash-section">
-      <h3 className="splash-section-title">Concordance Index</h3>
-      <div className="concordance-card">
-        <p className="concordance-card-text">
-          This index and concordance indexes twenty-one volumes of KGB archival material:
-          nine notebooks written by Alexander Vassiliev and twelve compilations of the Soviet
-          international telegraphic cables deciphered by the U.S. National Security Agency&apos;s
-          Venona project. Indexed are proper names, code names, and organizational titles along
-          with some geographic entities, events, diplomatic conferences, and subjects. When
-          known, code names are cross-indexed with the real name behind the code name.
-        </p>
-        <div className="concordance-card-actions">
-          <button type="button" className="btn-primary" onClick={() => setShowIndex(true)}>
-            View the index
-          </button>
-          <button
-            type="button"
-            className="btn-secondary"
-            onClick={() => window.open(api.getConcordancePdfUrl(), '_blank')}
-            title="Download the original PDF edition — the full Index and Concordance to the Vassiliev Notebooks and Venona cables, as most researchers use it"
-          >
-            Download PDF
-          </button>
-          <button
-            type="button"
-            className="btn-secondary"
-            onClick={() => window.open(api.getConcordanceExportUrl(), '_blank')}
-            title="Download the full Concordance Index as CSV"
-          >
-            Download CSV
-          </button>
-        </div>
-      </div>
-      {showIndex && <ConcordanceModal onClose={() => setShowIndex(false)} />}
-    </div>
-  );
-}
+import { Icon } from './ui/Icon';
+import { Modal } from './ui/Modal';
 
 const PAGE_SIZE = 50;
 
 /** Searchable, paginated browser over the entity/alias concordance. */
-function ConcordanceModal({ onClose }: { onClose: () => void }) {
+export function ConcordanceModal({ onClose }: { onClose: () => void }) {
   const [summary, setSummary] = useState<ConcordanceSummary | null>(null);
   const [query, setQuery] = useState('');
   const [entries, setEntries] = useState<ConcordanceEntry[]>([]);
@@ -88,84 +44,88 @@ function ConcordanceModal({ onClose }: { onClose: () => void }) {
   }, [query]);
 
   return (
-    <div className="about-overlay" onClick={onClose} role="dialog" aria-modal="true" aria-label="Concordance Index">
-      <div className="about-card concordance-modal" onClick={(e) => e.stopPropagation()}>
-        <div className="about-card-header">
-          <h2>Concordance Index</h2>
-          <button type="button" className="about-close-btn" onClick={onClose} aria-label="Close">
-            ✕
+    <Modal
+      title="Concordance index"
+      onClose={onClose}
+      bare
+      actions={
+        <>
+          <button
+            type="button"
+            className="btn-ghost btn-sm"
+            onClick={() => window.open(api.getConcordancePdfUrl(), '_blank')}
+            title="Download the original PDF edition of the index"
+          >
+            <Icon name="download" size={14} />
+            PDF
           </button>
-        </div>
-        <div className="concordance-modal-toolbar">
+          <button
+            type="button"
+            className="btn-ghost btn-sm"
+            onClick={() => window.open(api.getConcordanceExportUrl(), '_blank')}
+            title="Download the full index as CSV"
+          >
+            <Icon name="download" size={14} />
+            CSV
+          </button>
+        </>
+      }
+    >
+      <div className="conc-toolbar">
+        <label className="field" style={{ flex: 1 }}>
+          <Icon name="search" size={15} />
           <input
             type="text"
-            className="concordance-search-input"
             placeholder="Search names, aliases, codenames…"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             autoFocus
+            aria-label="Search the concordance"
           />
-          <button
-            type="button"
-            className="btn-secondary"
-            onClick={() => window.open(api.getConcordancePdfUrl(), '_blank')}
-            title="Download the original PDF edition of the index"
-          >
-            Download PDF
-          </button>
-          <button
-            type="button"
-            className="btn-secondary"
-            onClick={() => window.open(api.getConcordanceExportUrl(), '_blank')}
-          >
-            Download CSV
-          </button>
-        </div>
-        <div className="concordance-modal-meta">
-          {summary && (
-            <span>
-              {summary.entities.toLocaleString()} entities · {summary.aliases.toLocaleString()} aliases
-            </span>
-          )}
-          <span>
-            {query ? `${total.toLocaleString()} matches` : `Showing ${entries.length.toLocaleString()} of ${total.toLocaleString()}`}
-          </span>
-        </div>
-        <div className="concordance-modal-body">
-          <ConcordanceIntro />
-          {error && <div className="search-error">{error}</div>}
-          {entries.map((e) => (
-            <div key={e.id} className="concordance-entry">
-              <div className="concordance-entry-name">
-                {e.canonical_name}
-                {e.entity_type && <span className="concordance-entry-type">{e.entity_type}</span>}
-              </div>
-              {e.aliases.length > 0 && (
-                <div className="concordance-entry-aliases">
-                  {e.aliases.join(' · ')}
-                </div>
-              )}
-              {e.description && (
-                <div className="concordance-entry-desc">{e.description}</div>
-              )}
-            </div>
-          ))}
-          {isLoading && <div className="loading">Loading…</div>}
-          {!isLoading && entries.length === 0 && !error && (
-            <div className="search-results-empty"><p>No matching entries.</p></div>
-          )}
-          {!isLoading && entries.length < total && (
-            <button
-              type="button"
-              className="btn-secondary search-load-more"
-              onClick={() => load(query, entries.length, true)}
-            >
-              Load more ({(total - entries.length).toLocaleString()} remaining)
-            </button>
-          )}
-        </div>
+        </label>
+        <span className="count">
+          {query
+            ? `${total.toLocaleString()} matches`
+            : summary
+              ? `${summary.entities.toLocaleString()} entities · ${summary.aliases.toLocaleString()} aliases`
+              : ''}
+        </span>
       </div>
-    </div>
+
+      <div className="modal-body">
+        <ConcordanceIntro />
+        {error && <div className="notice notice-danger">{error}</div>}
+        {entries.map((e) => (
+          <div key={e.id} className="conc-entry">
+            <div className="conc-name">
+              {e.canonical_name}
+              {e.entity_type && <span className="chip" style={{ marginLeft: 8 }}>{e.entity_type}</span>}
+            </div>
+            {e.aliases.length > 0 && (
+              <div className="conc-aliases">
+                {e.aliases.map((a) => <span className="chip chip-accent" key={a}>{a}</span>)}
+              </div>
+            )}
+            {e.description && <div className="conc-desc">{e.description}</div>}
+          </div>
+        ))}
+        {isLoading && <div className="loading"><span className="spinner" /> Loading…</div>}
+        {!isLoading && entries.length === 0 && !error && (
+          <div className="empty-state">No matching entries.</div>
+        )}
+        {!isLoading && entries.length < total && (
+          <button
+            type="button"
+            className="btn-secondary"
+            style={{ marginTop: 'var(--s-4)' }}
+            onClick={() => load(query, entries.length, true)}
+          >
+            Load {Math.min(PAGE_SIZE, total - entries.length)} more
+            <span className="count">({(total - entries.length).toLocaleString()} left)</span>
+          </button>
+        )}
+      </div>
+    </Modal>
   );
 }
 
@@ -175,14 +135,16 @@ function ConcordanceModal({ onClose }: { onClose: () => void }) {
  */
 function ConcordanceIntro() {
   return (
-    <details className="about-section concordance-intro">
-      <summary>About this index — by John Earl Haynes</summary>
-      <div className="about-section-body">
-        <p className="concordance-intro-title">
+    <details className="conc-entry" style={{ paddingTop: 0 }}>
+      <summary style={{ cursor: 'pointer', fontSize: 'var(--text-sm)', color: 'var(--ink-2)' }}>
+        About this index — by John Earl Haynes
+      </summary>
+      <div className="prose" style={{ marginTop: 'var(--s-3)', fontSize: 'var(--text-base)' }}>
+        <p><strong>
           Index and Concordance to Alexander Vassiliev&apos;s Notebooks and Soviet Cables
           Deciphered by the National Security Agency&apos;s Venona Project
-        </p>
-        <p className="concordance-intro-byline">by John Earl Haynes · revised 17 August 2026</p>
+        </strong></p>
+        <p className="text-muted text-sm">by John Earl Haynes · revised 17 August 2026</p>
         <p>
           This index and concordance indexes twenty-one volumes of KGB archival material: nine
           notebooks written by Alexander Vassiliev and twelve compilations of the Soviet

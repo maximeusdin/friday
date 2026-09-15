@@ -1,13 +1,15 @@
 'use client';
 
-import { useState, useEffect, useRef, useCallback, useMemo, type CSSProperties } from 'react';
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { Document, Page, pdfjs } from 'react-pdf';
 import 'react-pdf/dist/Page/TextLayer.css';
 import 'react-pdf/dist/Page/AnnotationLayer.css';
 import { api } from '@/lib/api';
 import type { EvidenceRef } from '@/types/api';
-import { InfoModal } from './InfoModal';
+import { HelpModal } from './HelpModal';
+import { Icon } from './ui/Icon';
+import { Menu } from './ui/Menu';
 
 // Wire up the PDF.js worker. `pdfjs.version` is the EXACT pdfjs-dist version react-pdf uses
 // (its own bundled copy), so pinning the worker to that version can never drift from the API —
@@ -84,28 +86,17 @@ const HIGHLIGHT_SUPPORTED =
 // Documents whose searchable text was produced by AI vision transcription carry
 // transcript.status in their metadata: 'machine_unverified' until a human
 // review pass promotes it to 'reviewed'. Most documents have neither.
-const TRANSCRIPT_CHIP_BASE: CSSProperties = {
-  display: 'inline-block',
-  marginLeft: 'var(--spacing-md)',
-  padding: '1px 8px',
-  borderRadius: 999,
-  fontSize: '11px',
-  fontWeight: 500,
-  whiteSpace: 'nowrap',
-  verticalAlign: 'middle',
-};
-
-const TRANSCRIPT_CHIPS: Record<string, { label: string; tooltip: string; style: CSSProperties }> = {
+const TRANSCRIPT_CHIPS: Record<string, { label: string; tooltip: string; chipClass: string }> = {
   machine_unverified: {
     label: 'Machine transcript',
     tooltip:
       'Searchable text for this document was produced by AI vision transcription. The scan is authoritative; confirm quotations against the image.',
-    style: { ...TRANSCRIPT_CHIP_BASE, background: '#fff8e1', color: '#8a5b00', border: '1px solid #f0dfa8' },
+    chipClass: 'chip-amber',
   },
   reviewed: {
     label: 'Reviewed transcript',
     tooltip: 'Transcript reviewed against the scan. The scan remains authoritative.',
-    style: { ...TRANSCRIPT_CHIP_BASE, background: '#eef7f0', color: '#2e6b46', border: '1px solid #cfe5d6' },
+    chipClass: 'chip-green',
   },
 };
 
@@ -246,6 +237,8 @@ export function EvidenceViewer({ evidence, onClose, backLabel = 'Back to Chat' }
   const [mounted, setMounted] = useState(false);
   const [downloadingDoc, setDownloadingDoc] = useState(false);
   const [showCollections, setShowCollections] = useState(false);
+  // Typed page number, held while the field is being edited (null = show currentPage).
+  const [pageInput, setPageInput] = useState<string | null>(null);
 
   // --- Find-in-document state ---
   const [findOpen, setFindOpen] = useState(false);
@@ -322,6 +315,15 @@ export function EvidenceViewer({ evidence, onClose, backLabel = 'Back to Chat' }
     if (idx > 0) setZoom(ZOOM_LEVELS[idx - 1]);
   };
   const handleZoomReset = () => setZoom(100);
+
+  /** Jump to a typed page number, clamped to the document. */
+  const commitPageInput = () => {
+    if (pageInput == null) return;
+    const n = Number(pageInput);
+    const max = numPages ?? document?.page_count ?? Number.MAX_SAFE_INTEGER;
+    if (Number.isFinite(n) && n >= 1) setCurrentPage(Math.min(Math.round(n), max));
+    setPageInput(null);
+  };
 
   // --- Find: scan the whole document for matches (lazy + cached per page) ---
   const runScan = useCallback(async (q: string) => {
@@ -607,184 +609,203 @@ export function EvidenceViewer({ evidence, onClose, backLabel = 'Back to Chat' }
   const totalPages = numPages ?? document?.page_count;
 
   return (
-    <div className="pdf-viewer">
-      {/* Toolbar: navigation + actions */}
-      <div className="pdf-toolbar">
-        <button className="btn-back-to-chat" onClick={onClose}>
-          ← {backLabel}
+    <div className="doc">
+      {/* Toolbar: back, identity, page nav, zoom, find, overflow */}
+      <div className="doc-bar">
+        <button className="btn-ghost" onClick={onClose} title={backLabel}>
+          <Icon name="arrow-left" size={16} />
+          {backLabel}
         </button>
 
-        <div className="pdf-toolbar-separator" />
+        <div className="doc-title">
+          <span className="doc-title-main" title={document?.source_name}>
+            {document?.source_name || 'Document'}
+          </span>
+          {(document?.collection_title || document?.collection_slug) && (
+            <span className="doc-title-sub">
+              {document.collection_title || document.collection_slug}
+            </span>
+          )}
+        </div>
 
-        <button
-          className="btn-secondary"
-          onClick={() => setCurrentPage((p) => Math.max(1, p - 1))}
-          disabled={currentPage <= 1}
-        >
-          ‹ Prev
-        </button>
+        <div className="spacer" />
 
-        <span className="pdf-page-info">
-          Page {currentPage}
-          {totalPages && ` / ${totalPages}`}
-        </span>
-
-        <button
-          className="btn-secondary"
-          onClick={() => setCurrentPage((p) => p + 1)}
-          disabled={totalPages !== undefined && totalPages !== null && currentPage >= totalPages}
-        >
-          Next ›
-        </button>
-
-        <div className="pdf-toolbar-separator" />
-
-        {/* Zoom controls */}
-        <div className="zoom-controls">
-          <button className="zoom-btn" onClick={handleZoomOut} disabled={zoom <= ZOOM_LEVELS[0]} title="Zoom out">
-            −
-          </button>
-          <button className="zoom-level" onClick={handleZoomReset} title="Reset to 100%">
-            {zoom}%
-          </button>
+        {/* Page navigation — the number is typable, so page 412 is one action away. */}
+        <div className="doc-group">
           <button
-            className="zoom-btn"
-            onClick={handleZoomIn}
-            disabled={zoom >= ZOOM_LEVELS[ZOOM_LEVELS.length - 1]}
-            title="Zoom in"
+            className="icon-btn icon-btn-sm"
+            onClick={() => setCurrentPage((p) => Math.max(1, p - 1))}
+            disabled={currentPage <= 1}
+            title="Previous page"
+            aria-label="Previous page"
           >
-            +
+            <Icon name="chevron-left" size={16} />
+          </button>
+          <input
+            className="doc-page-input"
+            value={pageInput ?? currentPage}
+            onChange={(e) => setPageInput(e.target.value.replace(/[^0-9]/g, ''))}
+            onBlur={() => commitPageInput()}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') { e.preventDefault(); commitPageInput(); }
+              if (e.key === 'Escape') setPageInput(null);
+            }}
+            aria-label={`Page number, ${totalPages ? `of ${totalPages}` : ''}`}
+          />
+          <span className="doc-page-total">{totalPages ? `/ ${totalPages}` : ''}</span>
+          <button
+            className="icon-btn icon-btn-sm"
+            onClick={() => setCurrentPage((p) => p + 1)}
+            disabled={totalPages != null && currentPage >= totalPages}
+            title="Next page"
+            aria-label="Next page"
+          >
+            <Icon name="chevron-right" size={16} />
           </button>
         </div>
 
-        <div className="pdf-toolbar-separator" />
+        <div className="doc-group">
+          <button
+            className="icon-btn icon-btn-sm"
+            onClick={handleZoomOut}
+            disabled={zoom <= ZOOM_LEVELS[0]}
+            title="Zoom out"
+            aria-label="Zoom out"
+          >
+            <Icon name="zoom-out" size={16} />
+          </button>
+          <button className="doc-zoom" onClick={handleZoomReset} title="Reset to 100%">
+            {zoom}%
+          </button>
+          <button
+            className="icon-btn icon-btn-sm"
+            onClick={handleZoomIn}
+            disabled={zoom >= ZOOM_LEVELS[ZOOM_LEVELS.length - 1]}
+            title="Zoom in"
+            aria-label="Zoom in"
+          >
+            <Icon name="zoom-in" size={16} />
+          </button>
+        </div>
 
         <button
-          className={`btn-secondary${findOpen ? ' btn-active' : ''}`}
+          className={`icon-btn${findOpen ? ' is-on' : ''}`}
           onClick={() => (findOpen ? closeFind() : openFind())}
           title="Find in document (Ctrl+F)"
+          aria-label="Find in document"
         >
-          ⌕ Find
+          <Icon name="search" size={17} />
         </button>
 
-        <div className="flex-1" />
-
-        <button
-          className="btn-secondary"
-          onClick={handleDownloadPage}
-          disabled={!numPages}
-          title="Download the current page as a PDF"
-        >
-          ↓ Page
-        </button>
-
-        <button
-          className="btn-secondary"
-          onClick={handleDownloadDocument}
-          disabled={downloadingDoc}
-          title={`Download the entire document (PDF) — opens at page ${currentPage} in most PDF readers`}
-        >
-          {downloadingDoc ? '… Document' : '↓ Document'}
-        </button>
-
-        <button
-          className="btn-secondary"
-          onClick={handleOpenNewTab}
-          title="Open PDF in new tab and return to chat"
-        >
-          ↗ Open in New Tab
-        </button>
+        <Menu
+          label="Document actions"
+          align="end"
+          items={[
+            {
+              label: 'Download this page',
+              icon: <Icon name="download" size={16} />,
+              onSelect: () => { void handleDownloadPage(); },
+            },
+            {
+              label: downloadingDoc ? 'Preparing…' : 'Download the document',
+              icon: <Icon name="download" size={16} />,
+              onSelect: () => { void handleDownloadDocument(); },
+            },
+            {
+              label: 'Open PDF in a new tab',
+              icon: <Icon name="external" size={16} />,
+              onSelect: handleOpenNewTab,
+              separated: true,
+            },
+            {
+              label: 'Browse this collection',
+              icon: <Icon name="library" size={16} />,
+              onSelect: () => setShowCollections(true),
+            },
+          ]}
+          trigger={(props) => (
+            <button className="icon-btn" {...props} aria-label="Document actions" title="More">
+              <Icon name="more" size={18} />
+            </button>
+          )}
+        />
       </div>
 
       {/* Docked find bar — sits in the toolbar area, never overlaps the page */}
       {findOpen && (
-        <div className="pdf-find-bar">
-          <span className="pdf-find-icon">⌕</span>
-          <input
-            ref={findInputRef}
-            type="text"
-            className="pdf-find-input"
-            placeholder="Find in document…"
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter') {
-                e.preventDefault();
-                gotoMatch(e.shiftKey ? -1 : 1);
-              } else if (e.key === 'Escape') {
-                closeFind();
-              }
-            }}
-          />
-          <span className="pdf-find-count">
+        <div className="doc-find">
+          <label className="field" style={{ flex: '1 1 auto', maxWidth: '22rem' }}>
+            <Icon name="search" size={15} />
+            <input
+              ref={findInputRef}
+              type="text"
+              placeholder="Find in this document…"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  e.preventDefault();
+                  gotoMatch(e.shiftKey ? -1 : 1);
+                } else if (e.key === 'Escape') {
+                  closeFind();
+                }
+              }}
+              aria-label="Find in document"
+            />
+          </label>
+          <span className="doc-find-count">
             {searching
               ? 'Searching…'
               : query.trim()
                 ? matches.length
-                  ? `${activeMatchIdx + 1} / ${matches.length}`
+                  ? `${activeMatchIdx + 1} of ${matches.length}`
                   : 'No matches'
                 : ''}
           </span>
           <button
-            className="pdf-find-nav"
+            className="icon-btn icon-btn-sm"
             onClick={() => gotoMatch(-1)}
             disabled={!matches.length}
             title="Previous match (Shift+Enter)"
+            aria-label="Previous match"
           >
-            ◀
+            <Icon name="chevron-up" size={16} />
           </button>
           <button
-            className="pdf-find-nav"
+            className="icon-btn icon-btn-sm"
             onClick={() => gotoMatch(1)}
             disabled={!matches.length}
             title="Next match (Enter)"
+            aria-label="Next match"
           >
-            ▶
+            <Icon name="chevron-down" size={16} />
           </button>
-          <button className="pdf-find-close" onClick={closeFind} title="Close (Esc)">
-            ✕
+          <div className="spacer" />
+          <button className="icon-btn icon-btn-sm" onClick={closeFind} title="Close (Esc)" aria-label="Close find">
+            <Icon name="close" size={16} />
           </button>
         </div>
       )}
 
-      {/* Document info */}
-      {document && (
-        <div
-          style={{
-            padding: 'var(--spacing-sm) var(--spacing-md)',
-            background: 'var(--color-bg-secondary)',
-            borderBottom: '1px solid var(--color-border)',
-            fontSize: '12px',
-          }}
-        >
-          <strong>{document.source_name}</strong>
-          {(document.collection_title || document.collection_slug) && (
-            <span className="text-muted"> · {document.collection_title || document.collection_slug}</span>
-          )}
+      {/* Provenance strip: transcript status and the witness index, when present */}
+      {document && (transcriptChipFor(document.metadata) || (witnesses && witnesses.length > 0)) && (
+        <div className="doc-info">
           {(() => {
             const chip = transcriptChipFor(document.metadata);
             return chip ? (
-              <span style={chip.style} title={chip.tooltip}>
+              <span className={`chip ${chip.chipClass}`} title={chip.tooltip}>
                 {chip.label}
               </span>
             ) : null;
           })()}
-          <button
-            className="btn-secondary"
-            onClick={() => setShowCollections(true)}
-            style={{ marginLeft: 'var(--spacing-md)', fontSize: '12px', padding: '2px 8px' }}
-            title="Browse this document's collection and download any or all of its files"
-          >
-            Browse &amp; download collection
-          </button>
           {witnesses && witnesses.length > 0 && (
             <button
-              className="btn-secondary"
+              className="btn-link"
               onClick={() => setShowWitnesses((v) => !v)}
-              style={{ marginLeft: 'var(--spacing-md)', fontSize: '12px', padding: '2px 8px' }}
               title="Jump to a witness's testimony"
             >
-              {showWitnesses ? '▾' : '▸'} Witnesses ({witnesses.length})
+              <Icon name={showWitnesses ? 'chevron-down' : 'chevron-right'} size={14} />
+              Witnesses ({witnesses.length})
             </button>
           )}
         </div>
@@ -792,90 +813,56 @@ export function EvidenceViewer({ evidence, onClose, backLabel = 'Back to Chat' }
 
       {/* Witness index: jump to where each witness's testimony begins */}
       {witnesses && witnesses.length > 0 && showWitnesses && (
-        <div
-          style={{
-            maxHeight: 220,
-            overflowY: 'auto',
-            padding: 'var(--spacing-sm) var(--spacing-md)',
-            background: 'var(--color-bg-secondary)',
-            borderBottom: '1px solid var(--color-border)',
-            fontSize: '12px',
-          }}
-        >
+        <div className="doc-witnesses">
           {witnesses.map((w) => (
             <button
               key={w.appearance_seq}
+              className={`doc-witness${w.start_page <= currentPage && currentPage <= w.end_page ? ' is-current' : ''}`}
               onClick={() => {
                 setCurrentPage(w.start_page);
                 setShowWitnesses(false);
               }}
-              style={{
-                display: 'flex',
-                justifyContent: 'space-between',
-                gap: 'var(--spacing-md)',
-                width: '100%',
-                textAlign: 'left',
-                background:
-                  w.start_page <= currentPage && currentPage <= w.end_page
-                    ? 'var(--color-highlight)'
-                    : 'transparent',
-                border: 'none',
-                borderRadius: 4,
-                padding: '4px 6px',
-                cursor: 'pointer',
-                color: 'inherit',
-              }}
               title={`Pages ${w.start_page}–${w.end_page}`}
             >
-              <span>
+              <span className="truncate">
                 <strong>{w.witness_name}</strong>
                 {w.testimony_date && <span className="text-muted"> · {w.testimony_date}</span>}
                 {w.examiner && <span className="text-muted"> · examined by {w.examiner}</span>}
               </span>
-              <span className="text-muted" style={{ whiteSpace: 'nowrap' }}>
-                pp. {w.start_page}–{w.end_page}
-              </span>
+              <span className="count">pp. {w.start_page}–{w.end_page}</span>
             </button>
           ))}
         </div>
       )}
 
-      {/* Quote preview (if available) */}
+      {/* The cited passage, verbatim, with how confidently it was located */}
       {evidence.quote && (
-        <div
-          style={{
-            padding: 'var(--spacing-md)',
-            background: 'var(--color-highlight)',
-            borderBottom: '1px solid var(--color-border)',
-            fontSize: '13px',
-            fontStyle: 'italic',
-          }}
-        >
-          &ldquo;{evidence.quote}&rdquo;
-          {quoteTier && (
-            <span className={`quote-hl-badge quote-hl-${quoteTier}`} style={{ fontStyle: 'normal' }}>
-              {quoteTier === 'exact' && '● highlighted on page'}
-              {quoteTier === 'fuzzy' && '● highlighted (approximate match)'}
-              {quoteTier === 'none' && '≈ approximate location — exact text could not be pinpointed on this page'}
-            </span>
-          )}
-          {evidence.why && <div className="text-sm text-muted mt-sm">Relevance: {evidence.why}</div>}
+        <div className="doc-quote">
+          <span>&ldquo;{evidence.quote}&rdquo;</span>
+          <span className="doc-quote-meta">
+            {quoteTier === 'exact' && <><Icon name="check" size={13} /> highlighted on this page</>}
+            {quoteTier === 'fuzzy' && <><Icon name="check" size={13} /> highlighted — approximate match</>}
+            {quoteTier === 'none' && <><Icon name="info" size={13} /> approximate location — the exact text could not be pinpointed</>}
+            {evidence.why && <span className="text-muted">· {evidence.why}</span>}
+          </span>
         </div>
       )}
 
       {/* PDF render: react-pdf, single page at a time (bounded memory for large docs) */}
-      <div className="pdf-container">
+      <div className="doc-canvas">
         {!mounted || docLoading ? (
-          <div className="loading">Loading document...</div>
+          <div className="loading"><span className="spinner" /> Loading document…</div>
         ) : loadError ? (
           <div className="empty-state">
-            <p>PDF file missing</p>
-            <p className="text-sm text-muted">{loadError}</p>
+            <strong>PDF file missing</strong>
+            <span>{loadError}</span>
             {document && (
               <div className="card" style={{ textAlign: 'left', maxWidth: 520 }}>
                 <div className="text-sm"><strong>Document</strong>: {document.source_name}</div>
                 {(document.collection_title || document.collection_slug) && (
-                  <div className="text-sm text-muted">Collection: {document.collection_title || document.collection_slug}</div>
+                  <div className="text-sm text-muted">
+                    Collection: {document.collection_title || document.collection_slug}
+                  </div>
                 )}
                 {document.source_ref && (
                   <div className="text-sm text-muted">source_ref: {document.source_ref}</div>
@@ -889,15 +876,16 @@ export function EvidenceViewer({ evidence, onClose, backLabel = 'Back to Chat' }
               className="btn-secondary"
               style={{ textDecoration: 'none' }}
             >
-              Try opening PDF directly ↗
+              Try opening the PDF directly
+              <Icon name="external" size={14} />
             </a>
           </div>
         ) : (
-          <div className="pdf-page-scroll" ref={pageWrapRef}>
+          <div className="doc-page" ref={pageWrapRef}>
             <Document
               file={fileProp}
-              loading={<div className="loading">Loading document...</div>}
-              error={<div className="loading">Could not load PDF.</div>}
+              loading={<div className="loading"><span className="spinner" /> Loading document…</div>}
+              error={<div className="loading">Could not load this PDF.</div>}
               onLoadSuccess={(pdf) => {
                 pdfRef.current = pdf;
                 setNumPages(pdf.numPages);
@@ -915,14 +903,15 @@ export function EvidenceViewer({ evidence, onClose, backLabel = 'Back to Chat' }
                   applyHighlights();
                   applyEvidenceHighlight();
                 }}
-                loading={<div className="loading">Rendering page…</div>}
+                loading={<div className="loading"><span className="spinner" /> Rendering page…</div>}
               />
             </Document>
           </div>
         )}
       </div>
+
       {showCollections && (
-        <InfoModal
+        <HelpModal
           section="collections"
           initialCollectionId={document?.collection_id}
           onClose={() => setShowCollections(false)}

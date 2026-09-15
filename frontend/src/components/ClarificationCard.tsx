@@ -62,16 +62,14 @@ export function ClarificationCard({ clarification, onSubmit, disabled }: Props) 
   };
 
   return (
-    <div className="card" style={{ borderColor: 'var(--color-accent)', margin: 'var(--spacing-md)' }}>
-      <div className="text-sm" style={{ fontWeight: 600, marginBottom: 'var(--spacing-sm)' }}>
-        A couple of quick questions to get this right:
-      </div>
+    <div className="choices">
+      <div className="choices-title">A couple of quick questions to get this right</div>
 
       {questions.map((q) => {
         const a = answers[q.id] || { option_ids: [], free_text: '' };
         return (
-          <div key={q.id} style={{ marginBottom: 'var(--spacing-md)' }}>
-            <div className="text-sm" style={{ marginBottom: '6px' }}>{q.question}</div>
+          <div key={q.id} style={{ marginBottom: 'var(--s-3)' }}>
+            <div className="text-sm" style={{ marginBottom: 'var(--s-2)', fontWeight: 500 }}>{q.question}</div>
 
             {q.kind === 'free_text' ? (
               <textarea
@@ -128,12 +126,12 @@ export function ClarificationCard({ clarification, onSubmit, disabled }: Props) 
         );
       })}
 
-      <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+      <div style={{ display: 'flex', gap: 'var(--s-2)', alignItems: 'center' }}>
         <button className="btn-primary" onClick={handleSubmit} disabled={disabled || !ready}>
           Continue
         </button>
         <button className="btn-secondary" onClick={() => onSubmit([])} disabled={disabled}>
-          Skip — just answer
+          Skip and answer anyway
         </button>
       </div>
     </div>

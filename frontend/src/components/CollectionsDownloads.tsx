@@ -9,6 +9,7 @@
  * one-click links to zips pre-built on S3 by scripts/build_collection_zips.py.
  */
 import { useEffect, useRef, useState } from 'react';
+import { Icon } from './ui/Icon';
 import { api } from '@/lib/api';
 import type { CollectionNode, CollectionZipsResponse, DocumentNode } from '@/types/api';
 import {
@@ -151,26 +152,26 @@ export function CollectionsDownloadsBody({ initialCollectionId }: { initialColle
 
   return (
     <>
-      <p className="about-collections-hint">
-        Click a collection to browse its files. Download a single file, tick a set of files and
-        use <strong>Download selected</strong> (they arrive as one zip), or grab an entire
-        collection with its <strong>↓ zip</strong> link.
+      <p className="help-lede">
+        Open a collection to browse its files. Tick any set of files and use{' '}
+        <strong>Download selected</strong> — they arrive as one zip — or take a whole collection
+        (or the entire archive) with its download link.
       </p>
 
       {zips?.complete && (
-        <div className="dl-complete-row">
-          <span>
-            <strong>Entire archive</strong>
-            <span className="about-collection-count"> · {zips.complete.num_files} files</span>
-          </span>
-          <a className="col-zip-link" href={api.resolveArchiveAssetUrl(zips.complete.url)}>
-            ↓ Download all · {formatBytes(zips.complete.zip_bytes)}
+        <div className="card flex items-center gap-sm" style={{ marginBottom: 'var(--s-4)' }}>
+          <strong>Entire archive</strong>
+          <span className="count">{zips.complete.num_files} files</span>
+          <div className="spacer" />
+          <a className="btn-secondary" href={api.resolveArchiveAssetUrl(zips.complete.url)} style={{ textDecoration: 'none' }}>
+            <Icon name="download" size={15} />
+            Download all · {formatBytes(zips.complete.zip_bytes)}
           </a>
         </div>
       )}
 
-      {collectionsError && <div className="search-error">{collectionsError}</div>}
-      {!collections && !collectionsError && <div className="loading">Loading collections…</div>}
+      {collectionsError && <div className="notice notice-danger">{collectionsError}</div>}
+      {!collections && !collectionsError && <div className="loading"><span className="spinner" /> Loading collections…</div>}
 
       {collections?.map((col) => {
         const docs = docsByCollection[col.id];
@@ -179,38 +180,41 @@ export function CollectionsDownloadsBody({ initialCollectionId }: { initialColle
         const docList = Array.isArray(docs) ? docs : null;
         const allChecked = !!docList && docList.length > 0 && docList.every((d) => selected.has(d.id));
         return (
-          <div key={col.id} className="about-collection">
-            <div className="about-collection-header">
+          <div key={col.id} className="coll">
+            <div className="flex items-center">
               <button
                 type="button"
-                className="about-collection-row"
+                className="coll-row"
                 onClick={() => toggleCollection(col.id)}
                 aria-expanded={isOpen}
               >
-                <span className="about-collection-chevron">{isOpen ? '▼' : '▶'}</span>
-                <span className="about-collection-name">{col.title || col.slug}</span>
+                <Icon name={isOpen ? 'chevron-down' : 'chevron-right'} size={15} />
+                <span className="coll-name">{col.title || col.slug}</span>
                 {col.document_count != null && (
-                  <span className="about-collection-count">
+                  <span className="count">
                     {col.document_count} file{col.document_count === 1 ? '' : 's'}
                   </span>
                 )}
               </button>
               {zip && (
                 <a
-                  className="col-zip-link"
+                  className="btn-ghost btn-sm"
                   href={api.resolveArchiveAssetUrl(zip.url)}
+                  style={{ textDecoration: 'none', flexShrink: 0 }}
                   title={`Download all ${zip.num_files} files of this collection as one zip`}
                 >
-                  ↓ {formatBytes(zip.zip_bytes)}
+                  <Icon name="download" size={14} />
+                  {formatBytes(zip.zip_bytes)}
                 </a>
               )}
             </div>
             {isOpen && (
-              <div className="about-collection-detail">
-                <div className="dl-files-header">
-                  <span className="about-collection-files-label">Files</span>
+              <div className="coll-detail">
+                <div className="flex items-center gap-sm" style={{ marginBottom: 'var(--s-2)' }}>
+                  <span className="eyebrow">Files</span>
+                  <div className="spacer" />
                   {docList && docList.length > 0 && (
-                    <label className="dl-select-all">
+                    <label className="switch">
                       <input
                         type="checkbox"
                         checked={allChecked}
@@ -221,29 +225,29 @@ export function CollectionsDownloadsBody({ initialCollectionId }: { initialColle
                     </label>
                   )}
                 </div>
-                {docs === 'loading' && <div className="loading">Loading files…</div>}
-                {docs === 'error' && <div className="search-error">Failed to load files.</div>}
+                {docs === 'loading' && <div className="loading"><span className="spinner" /> Loading files…</div>}
+                {docs === 'error' && <div className="notice notice-danger">Failed to load files.</div>}
                 {docList && (
                   docList.length > 0 ? (
-                    <div className="about-collection-files-scroll">
-                      <table className="about-collection-files-table">
+                    <div className="files-scroll">
+                      <table className="files-table">
                         <thead>
                           <tr>
-                            <th className="files-table-check" />
+                            <th className="files-check" />
                             <th>#</th>
                             <th>File</th>
-                            <th className="files-table-size">Size</th>
+                            <th className="files-size">Size</th>
                           </tr>
                         </thead>
                         <tbody>
                           {docList.map((d, i) => (
                             <tr
                               key={d.id}
-                              className={selected.has(d.id) ? 'dl-row-selected' : undefined}
+                              className={selected.has(d.id) ? 'is-selected' : undefined}
                               onClick={() => { if (!busy) toggleDoc(col, d); }}
                               style={{ cursor: busy ? undefined : 'pointer' }}
                             >
-                              <td className="files-table-check">
+                              <td className="files-check">
                                 <input
                                   type="checkbox"
                                   checked={selected.has(d.id)}
@@ -253,16 +257,16 @@ export function CollectionsDownloadsBody({ initialCollectionId }: { initialColle
                                   aria-label={`Select ${d.source_name}`}
                                 />
                               </td>
-                              <td className="files-table-num">{i + 1}</td>
+                              <td className="files-num">{i + 1}</td>
                               <td>{d.source_name || `Document #${d.id}`}</td>
-                              <td className="files-table-size">{formatBytes(d.size_bytes)}</td>
+                              <td className="files-size">{formatBytes(d.size_bytes)}</td>
                             </tr>
                           ))}
                         </tbody>
                       </table>
                     </div>
                   ) : (
-                    <div className="about-collection-files-empty">No documents.</div>
+                    <div className="empty-state">No documents.</div>
                   )
                 )}
               </div>
@@ -275,8 +279,8 @@ export function CollectionsDownloadsBody({ initialCollectionId }: { initialColle
         <div className="dl-bar">
           {dl.status === 'running' ? (
             <>
-              <div className="dl-bar-status">
-                <div className="dl-progress-track">
+              <div className="dl-bar-status flex items-center gap-sm" style={{ flex: 1, minWidth: 0 }}>
+                <div className="dl-progress">
                   <div
                     className="dl-progress-fill"
                     style={{
@@ -286,7 +290,7 @@ export function CollectionsDownloadsBody({ initialCollectionId }: { initialColle
                     }}
                   />
                 </div>
-                <span className="dl-bar-text">
+                <span className="text-sm text-muted truncate">
                   {dl.progress.filesDone}/{dl.progress.filesTotal} files
                   {dl.progress.bytesTotal > 0 && (
                     <> · {formatBytes(dl.progress.bytesDone)} of {formatBytes(dl.progress.bytesTotal)}</>
@@ -294,16 +298,16 @@ export function CollectionsDownloadsBody({ initialCollectionId }: { initialColle
                   {dl.progress.currentFile && <> · {dl.progress.currentFile}</>}
                 </span>
               </div>
-              <button type="button" className="dl-bar-btn" onClick={cancelDownload}>Cancel</button>
+              <button type="button" className="btn-secondary btn-sm" onClick={cancelDownload}>Cancel</button>
             </>
           ) : (
             <>
-              <span className="dl-bar-text">
+              <span className="text-sm" style={{ flex: 1, minWidth: 0 }}>
                 {dl.status === 'error' ? (
-                  <span className="dl-bar-error">{dl.message}</span>
+                  <span style={{ color: 'var(--red)' }}>{dl.message}</span>
                 ) : dl.status === 'done' ? (
                   dl.skipped.length > 0 ? (
-                    <span className="dl-bar-error" title={dl.skipped.map((s) => `${s.name}: ${s.reason}`).join('\n')}>
+                    <span style={{ color: 'var(--red)' }} title={dl.skipped.map((s) => `${s.name}: ${s.reason}`).join('\n')}>
                       Downloaded {dl.files} of {dl.files + dl.skipped.length} files — {dl.skipped.length} skipped
                       (listed in the zip&apos;s _SKIPPED FILES.txt)
                     </span>
@@ -319,12 +323,13 @@ export function CollectionsDownloadsBody({ initialCollectionId }: { initialColle
               </span>
               {selected.size > 0 && (
                 <>
-                  <button type="button" className="dl-bar-btn dl-bar-btn-primary" onClick={startDownload}>
+                  <button type="button" className="btn-primary btn-sm" onClick={startDownload}>
+                    <Icon name="download" size={14} />
                     Download selected
                   </button>
                   <button
                     type="button"
-                    className="dl-bar-btn"
+                    className="btn-secondary btn-sm"
                     onClick={() => { setSelected(new Map()); setDl({ status: 'idle' }); }}
                   >
                     Clear

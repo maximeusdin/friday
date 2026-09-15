@@ -2,6 +2,7 @@
 
 import type { SearchPageHitItem } from '@/lib/api';
 import type { EvidenceRef } from '@/types/api';
+import { Icon } from './ui/Icon';
 
 interface SearchResultsListProps {
   items: SearchPageHitItem[];
@@ -9,28 +10,17 @@ interface SearchResultsListProps {
   onOpenPage: (evidence: EvidenceRef, resultSetId: string) => void;
   resultSetId: string;
   isLoading?: boolean;
-  /** Render hidden (removed) rows grayed out with a Restore control. */
+  /** Render hidden (removed) rows greyed out with a Restore control. */
   showHidden?: boolean;
-  /** When provided, each row shows a remove (✕) / restore control. */
+  /** When provided, each row gets a remove / restore control. */
   onSetItemHidden?: (item: SearchPageHitItem, hidden: boolean) => void;
 }
 
 export function SearchResultsList({
-  items,
-  totalHits,
-  onOpenPage,
-  resultSetId,
-  isLoading,
-  showHidden,
-  onSetItemHidden,
+  items, totalHits, onOpenPage, resultSetId, isLoading, showHidden, onSetItemHidden,
 }: SearchResultsListProps) {
   if (isLoading) {
-    return (
-      <div className="search-results-loading">
-        <div className="search-progress-spinner" />
-        <p>Loading results…</p>
-      </div>
-    );
+    return <div className="loading"><span className="spinner" /> Loading results…</div>;
   }
 
   const visibleItems = items.filter((it) => !it.hidden);
@@ -42,8 +32,10 @@ export function SearchResultsList({
 
   if (displayItems.length === 0) {
     return (
-      <div className="search-results-empty">
-        <p>{items.length === 0 ? 'No matching pages found.' : 'All results in this search have been removed.'}</p>
+      <div className="empty-state">
+        {items.length === 0
+          ? 'No matching pages found.'
+          : 'Every result in this search has been removed.'}
       </div>
     );
   }
@@ -56,7 +48,7 @@ export function SearchResultsList({
         chunk_id: item.evidence_ref.chunk_id,
         quote: item.evidence_ref.quote,
       },
-      resultSetId
+      resultSetId,
     );
   };
 
@@ -64,99 +56,65 @@ export function SearchResultsList({
     item.collection.title || item.collection.slug || 'Unknown';
 
   return (
-    <div className="search-results-list">
+    <div className="hit-list">
       {displayItems.map((item, idx) => {
         if (!item.hidden) visibleNum += 1;
         const num = item.hidden ? null : visibleNum;
         return (
           <div
             key={`${item.document.id}-${item.page.id}-${idx}`}
-            className={`search-result-row${item.hidden ? ' search-result-row-hidden' : ''}`}
+            className={`hit${item.hidden ? ' is-hidden' : ''}`}
           >
-            <div className="search-result-header">
-              <span className="search-result-num">{num != null ? `${num}.` : '—'}</span>
-              <button
-                type="button"
-                className="search-result-collection-link"
-                onClick={(e) => {
-                  e.stopPropagation();
+            <span className="hit-num">{num != null ? num : '—'}</span>
+
+            <div
+              className="hit-main"
+              role="button"
+              tabIndex={0}
+              onClick={() => handleOpen(item)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' || e.key === ' ') {
+                  e.preventDefault();
                   handleOpen(item);
-                }}
-                title={`Open page ${item.page.pdf_page} in ${collectionName(item)}`}
-              >
+                }
+              }}
+              title={`Open page ${item.page.pdf_page} in ${collectionName(item)}`}
+            >
+              <span className="hit-title">
                 {collectionName(item)}
-              </button>
-              <span className="search-result-meta">
-                <span className="search-result-page">p. {item.page.pdf_page}</span>
-                {item.hidden && <span className="search-result-removed-label">removed</span>}
-                {onSetItemHidden && (
-                  item.hidden ? (
-                    <button
-                      type="button"
-                      className="search-result-restore"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        onSetItemHidden(item, false);
-                      }}
-                      title="Restore this result"
-                      aria-label="Restore result"
-                    >
-                      Restore
-                    </button>
-                  ) : (
-                    <button
-                      type="button"
-                      className="search-result-remove"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        onSetItemHidden(item, true);
-                      }}
-                      title="Remove this result from the search (restorable)"
-                      aria-label={`Remove result ${num}`}
-                    >
-                      ✕
-                    </button>
-                  )
-                )}
+                <span className="count">page {item.page.pdf_page}</span>
+                {item.hidden && <span className="chip">removed</span>}
+              </span>
+              <span className="hit-snippet">
+                {item.snippet || `View page ${item.page.pdf_page}`}
               </span>
             </div>
-            {item.snippet ? (
-              <div
-                className="search-result-snippet"
-                role="button"
-                tabIndex={0}
-                onClick={() => handleOpen(item)}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter' || e.key === ' ') {
-                    e.preventDefault();
-                    handleOpen(item);
-                  }
-                }}
-              >
-                {item.snippet}
-              </div>
-            ) : (
-              <div
-                className="search-result-snippet search-result-snippet-empty"
-                role="button"
-                tabIndex={0}
-                onClick={() => handleOpen(item)}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter' || e.key === ' ') {
-                    e.preventDefault();
-                    handleOpen(item);
-                  }
-                }}
-              >
-                View page {item.page.pdf_page}
-              </div>
+
+            {onSetItemHidden && (
+              <span className="hit-actions">
+                <button
+                  type="button"
+                  className="icon-btn icon-btn-sm"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onSetItemHidden(item, !item.hidden);
+                  }}
+                  title={item.hidden ? 'Restore this result' : 'Remove this result from the search (reversible)'}
+                  aria-label={item.hidden ? 'Restore result' : `Remove result ${num}`}
+                >
+                  <Icon name={item.hidden ? 'restore' : 'close'} size={15} />
+                </button>
+              </span>
             )}
           </div>
         );
       })}
-      <div className="search-results-footer">
-        Showing {visibleItems.length} of {totalHits} page hits
-        {hiddenCount > 0 && ` · ${hiddenCount} removed`}
+
+      <div className="hit-foot">
+        <span>
+          Showing {visibleItems.length.toLocaleString()} of {totalHits.toLocaleString()} page hits
+          {hiddenCount > 0 && ` · ${hiddenCount} removed`}
+        </span>
       </div>
     </div>
   );

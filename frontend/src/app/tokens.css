@@ -1,0 +1,146 @@
+/* =============================================================================
+   Friday — design tokens
+   -----------------------------------------------------------------------------
+   The single source of truth for colour, type, space, motion and layout.
+   Components never hard-code a value that exists here; restyling the product
+   (including a future dark theme) means editing this file, not the components.
+   ========================================================================== */
+
+:root {
+  /* --- Neutrals -------------------------------------------------------------
+     A warm grey ramp. The archive is paper: the background carries a trace of
+     it so scanned pages and white cards sit *on* something rather than
+     disappearing into a pure-white void. */
+  --paper:        #faf9f7;
+  --surface:      #ffffff;
+  --surface-2:    #f3f1ed;
+  --surface-3:    #eae7e1;
+  --line:         #e3dfd7;
+  --line-2:       #d2ccc2;
+
+  --ink:          #16181b;
+  --ink-2:        #494e55;
+  --ink-3:        #7c818a;
+  --ink-inverse:  #ffffff;
+
+  /* --- Accent: archive teal-navy -------------------------------------------
+     Deep enough to read as institutional rather than consumer-blue, and it
+     holds up against the warm paper. */
+  --accent:       #17475c;
+  --accent-hover: #0e3344;
+  --accent-soft:  #e8eff3;
+  --accent-soft-2:#d6e5ec;
+  --accent-line:  #bdd3de;
+
+  /* --- Semantic -------------------------------------------------------------
+     Muted on purpose: a research tool should not shout in primary colours. */
+  --amber:        #9a6413;
+  --amber-soft:   #fbf1de;
+  --amber-line:   #ecd9ae;
+  --green:        #2c6b4f;
+  --green-soft:   #e7f0eb;
+  --red:          #9c332b;
+  --red-soft:     #f8e9e7;
+  --red-line:     #e8cbc7;
+  --mark:         #fff1c2;
+
+  /* --- Typography -----------------------------------------------------------
+     UI runs on the system sans. Anything that is *read* rather than operated —
+     answers, document prose, long-form help — runs on a serif stack that is
+     already present on every platform, so the archival voice costs no webfont
+     download and no layout shift. */
+  --font-ui:   -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto,
+               "Helvetica Neue", Arial, sans-serif;
+  --font-read: "Iowan Old Style", "Palatino Linotype", Palatino, "Book Antiqua",
+               Charter, Georgia, "Times New Roman", serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+
+  --text-2xs:   0.6875rem;  /* 11 — counts, chip meta */
+  --text-xs:    0.75rem;    /* 12 — meta rows, table cells */
+  --text-sm:    0.8125rem;  /* 13 — dense UI, buttons */
+  --text-base:  0.875rem;   /* 14 — default UI */
+  --text-md:    0.9375rem;  /* 15 — inputs, list items */
+  --text-lg:    1.0625rem;  /* 17 — answer body */
+  --title-xs:   1rem;
+  --title-sm:   1.1875rem;
+  --title-md:   1.5rem;
+  --title-lg:   2.125rem;
+
+  --leading-tight:  1.25;
+  --leading-normal: 1.5;
+  --leading-read:   1.65;
+
+  --weight-normal: 400;
+  --weight-medium: 500;
+  --weight-semi:   600;
+
+  /* Optimal line length for prose. Applied to answers and help copy so text
+     never runs the full width of a wide monitor. */
+  --measure: 68ch;
+
+  /* --- Space (4px base) ---------------------------------------------------- */
+  --s-1:  0.25rem;
+  --s-2:  0.5rem;
+  --s-3:  0.75rem;
+  --s-4:  1rem;
+  --s-5:  1.25rem;
+  --s-6:  1.5rem;
+  --s-8:  2rem;
+  --s-10: 2.5rem;
+  --s-12: 3rem;
+  --s-16: 4rem;
+
+  /* --- Radius -------------------------------------------------------------- */
+  --r-sm:   6px;
+  --r-md:   9px;
+  --r-lg:   14px;
+  --r-full: 999px;
+
+  /* --- Elevation ------------------------------------------------------------
+     Three steps only: resting card, floating layer, modal. */
+  --shadow-1: 0 1px 2px rgba(22, 24, 27, 0.05);
+  --shadow-2: 0 4px 6px -2px rgba(22, 24, 27, 0.06),
+              0 12px 28px -6px rgba(22, 24, 27, 0.16);
+  --shadow-3: 0 10px 20px -8px rgba(22, 24, 27, 0.14),
+              0 32px 64px -16px rgba(22, 24, 27, 0.28);
+
+  /* --- Motion -------------------------------------------------------------- */
+  --ease:  cubic-bezier(0.2, 0.6, 0.2, 1);
+  --dur-1: 110ms;
+  --dur-2: 190ms;
+
+  /* --- Layout ---------------------------------------------------------------
+     Every structural dimension is a variable so the responsive rules (and a
+     future mobile layout) change one value instead of hunting through rules. */
+  --h-header:     3.25rem;  /* 52 */
+  --h-toolbar:    2.875rem; /* 46 */
+  --w-sidebar:    16.5rem;  /* 264 */
+  --w-sidebar-collapsed: 0rem;
+  --control-h:    2.125rem; /* 34 — standard button/input height */
+  --control-h-lg: 2.625rem; /* 42 — composer, primary CTAs */
+  --z-sticky:  10;
+  --z-popover: 60;
+  --z-modal:   80;
+  --z-toast:   90;
+
+  /* Focus ring — one definition, used by every interactive element. */
+  --ring: 0 0 0 2px var(--paper), 0 0 0 4px var(--accent-soft-2);
+
+  color-scheme: light;
+}
+
+/* Touch pointers get larger hit targets without changing a single component.
+   This is the hook the mobile layout will build on. */
+@media (pointer: coarse) {
+  :root {
+    --control-h:    2.75rem; /* 44 */
+    --control-h-lg: 3rem;    /* 48 */
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --dur-1: 0ms;
+    --dur-2: 0ms;
+  }
+}

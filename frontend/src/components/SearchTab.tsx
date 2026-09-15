@@ -1,10 +1,13 @@
 'use client';
 
-import { useState, useCallback, useEffect } from 'react';
+import { useState, useCallback, useEffect, useRef } from 'react';
 import { api, type SearchCreateRequest, type SearchPageHitItem, type SearchResultSetResponse } from '@/lib/api';
 import { SearchResultsList } from './SearchResultsList';
-import type { EvidenceRef } from '@/types/api';
-import type { UserSelectedScope, CollectionNode } from '@/types/api';
+import type { EvidenceRef, UserSelectedScope, CollectionNode } from '@/types/api';
+import { ScopeControl } from './ScopeControl';
+import { Icon } from './ui/Icon';
+import { Popover } from './ui/Popover';
+import { plural } from '@/lib/format';
 
 const INITIAL_LIMIT = 100;
 const FETCH_MORE_BATCH = 100;
@@ -25,23 +28,26 @@ export interface SearchResultBlock {
 
 interface SearchTabProps {
   activeScope: UserSelectedScope | null;
+  onScopeChange: (scope: UserSelectedScope) => void;
+  collections?: CollectionNode[];
   sessionId: number | null;
   onOpenPage: (evidence: EvidenceRef, resultSetId: string) => void;
-  /** When set (e.g. from Chat "View in Search tab"), load this result set. */
+  /** When set (e.g. from Chat "Open it in Search"), load this result set. */
   externalResultSetId?: string | null;
-  /** Called when user runs a new search (clears external focus). */
+  /** Called when the user runs a new search (clears external focus). */
   onSearchRun?: () => void;
-  /** Collection nodes for scope display */
-  collections?: CollectionNode[];
-  /** Splash example clicked with no session — parent creates a session then queues the query. */
-  onExampleSearch?: (query: string) => void;
-  /** Query queued from a splash example; auto-run once a session is active. */
+  /** Searched with no session open — the parent creates one, then queues the query. */
+  onStartSession: (query: string) => void;
+  /** Query queued from the parent; auto-run once a session is active. */
   pendingSearchQuery?: string | null;
-  /** Called after the queued query has been consumed. */
   onPendingSearchConsumed?: () => void;
 }
 
-export function SearchTab({ activeScope, sessionId, onOpenPage, externalResultSetId, onSearchRun, collections = [], onExampleSearch, pendingSearchQuery, onPendingSearchConsumed }: SearchTabProps) {
+export function SearchTab({
+  activeScope, onScopeChange, collections = [], sessionId, onOpenPage,
+  externalResultSetId, onSearchRun, onStartSession,
+  pendingSearchQuery, onPendingSearchConsumed,
+}: SearchTabProps) {
   const [query, setQuery] = useState('');
   const [aliasExpand, setAliasExpand] = useState(true);
   const [fuzzyMode, setFuzzyMode] = useState(false);
@@ -50,8 +56,13 @@ export function SearchTab({ activeScope, sessionId, onOpenPage, externalResultSe
   const [searchHistory, setSearchHistory] = useState<SearchResultBlock[]>([]);
   const [activeResultSetId, setActiveResultSetId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [showInstructions, setShowInstructions] = useState(true);
   const [showChatTabs, setShowChatTabs] = useState(false);
+  const [syntaxOpen, setSyntaxOpen] = useState(false);
+  const syntaxRef = useRef<HTMLButtonElement>(null);
+
+  const scopeEmpty = activeScope?.mode === 'custom'
+    && (activeScope.included_collection_ids?.length ?? 0) === 0
+    && (activeScope.included_document_ids?.length ?? 0) === 0;
 
   const scopeForRequest = useCallback((): SearchCreateRequest['scope'] => {
     if (!activeScope) return { mode: 'full_archive' };
@@ -62,20 +73,6 @@ export function SearchTab({ activeScope, sessionId, onOpenPage, externalResultSe
       included_document_ids: activeScope.included_document_ids,
     };
   }, [activeScope]);
-
-  const scopeLabel = useCallback((): string => {
-    if (!activeScope) return 'Full archive';
-    if (activeScope.mode === 'full_archive') return 'Full archive';
-    const collIds = activeScope.included_collection_ids ?? [];
-    if (collIds.length === 0) return 'No collections selected';
-    const titles = collIds
-      .map((id) => {
-        const c = collections.find((col) => col.id === id);
-        return c?.title || c?.slug || `Collection ${id}`;
-      })
-      .slice(0, 3);
-    return collIds.length > 3 ? `${titles.join(', ')} +${collIds.length - 3} more` : titles.join(', ');
-  }, [activeScope, collections]);
 
   const runSearchWith = useCallback(async (rawQuery: string) => {
     const searchQuery = rawQuery.trim();
@@ -92,7 +89,7 @@ export function SearchTab({ activeScope, sessionId, onOpenPage, externalResultSe
         unit: 'page',
         sort: 'canonical',
         alias_expand: aliasExpand,
-        fuzzy_progressive: fuzzyMode,  // Exact first, then expand-fuzzy in background
+        fuzzy_progressive: fuzzyMode,  // exact first, then expand-fuzzy in the background
       };
       const res = await api.createSearchResultSet(req);
       onSearchRun?.();
@@ -111,7 +108,7 @@ export function SearchTab({ activeScope, sessionId, onOpenPage, externalResultSe
       setActiveResultSetId(res.result_set_id);
       setIsSearching(false);
 
-      // Progressive fuzzy: expand in background, then refetch and update block
+      // Progressive fuzzy: expand in the background, then refetch and update the block.
       if (res.fuzzy_pending && res.result_set_id) {
         setIsExpandingFuzzy(true);
         try {
@@ -148,7 +145,15 @@ export function SearchTab({ activeScope, sessionId, onOpenPage, externalResultSe
     }
   }, [aliasExpand, fuzzyMode, sessionId, scopeForRequest, onSearchRun]);
 
-  const runSearch = useCallback(() => { void runSearchWith(query); }, [runSearchWith, query]);
+  const runSearch = useCallback(() => {
+    const q = query.trim();
+    if (!q || scopeEmpty) return;
+    if (!sessionId) {
+      onStartSession(q);
+      return;
+    }
+    void runSearchWith(q);
+  }, [runSearchWith, query, sessionId, onStartSession, scopeEmpty]);
 
   // Reload the session's saved searches when the session changes (search history is
   // persisted server-side, so it survives reloads and session switches — like chat).
@@ -162,7 +167,6 @@ export function SearchTab({ activeScope, sessionId, onOpenPage, externalResultSe
       try {
         const summaries = await api.listSearchResultSets(sessionId);
         if (cancelled || summaries.length === 0) return;
-        // Load each result set's metadata + first page of hits, preserving chronological order.
         const blocks = await Promise.all(
           summaries.map(async (s): Promise<SearchResultBlock | null> => {
             try {
@@ -183,13 +187,13 @@ export function SearchTab({ activeScope, sessionId, onOpenPage, externalResultSe
             } catch {
               return null;
             }
-          })
+          }),
         );
         if (cancelled) return;
         const loaded = blocks.filter((b): b is SearchResultBlock => b !== null);
         setSearchHistory(loaded);
-        // Most recent search is the active tab on reload — preferring the
-        // researcher's own searches over Chat's so chat sets don't steal focus.
+        // The most recent search is the active tab on reload — preferring the
+        // researcher's own searches so Chat's don't steal focus.
         const lastUser = [...loaded].reverse().find((b) => b.origin !== 'chat');
         const fallback = loaded[loaded.length - 1];
         if (fallback) setActiveResultSetId((lastUser ?? fallback).resultSetId);
@@ -200,7 +204,7 @@ export function SearchTab({ activeScope, sessionId, onOpenPage, externalResultSe
     return () => { cancelled = true; };
   }, [sessionId]);
 
-  // Auto-run a query queued from a splash example once the new session is active.
+  // Auto-run a query queued while the session was being created.
   useEffect(() => {
     if (!sessionId || !pendingSearchQuery) return;
     const q = pendingSearchQuery;
@@ -210,7 +214,7 @@ export function SearchTab({ activeScope, sessionId, onOpenPage, externalResultSe
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionId, pendingSearchQuery]);
 
-  // When externalResultSetId is set (e.g. from Chat "View in Search tab"), load that result set and append
+  // Load a result set opened from Chat and append it to this session's tabs.
   useEffect(() => {
     if (!externalResultSetId) return;
     let cancelled = false;
@@ -255,11 +259,11 @@ export function SearchTab({ activeScope, sessionId, onOpenPage, externalResultSe
     const block = searchHistory.find((b) => b.resultSetId === resultSetId);
     if (!block?.nextCursor) return;
     try {
-      // Prefetch snippets for next batch (best-effort; items API works without it)
+      // Prefetch snippets for the next batch (best-effort; the items API works without it).
       try {
         await api.fetchMoreSearchSnippets(resultSetId, FETCH_MORE_BATCH);
       } catch {
-        // Snippet fetch can fail; still fetch items
+        /* snippet fetch can fail; still fetch items */
       }
       const data = await api.getSearchResultSetItems(resultSetId, {
         cursor: block.nextCursor,
@@ -294,10 +298,10 @@ export function SearchTab({ activeScope, sessionId, onOpenPage, externalResultSe
     window.open(api.getSearchResultSetExportUrl(resultSetId, 'csv'), '_blank');
   }, []);
 
-  // Close a search tab (deletes the saved search server-side)
+  // Close a search tab (deletes the saved search server-side).
   const handleCloseTab = useCallback(async (resultSetId: string) => {
     const block = searchHistory.find((b) => b.resultSetId === resultSetId);
-    if (!window.confirm(`Delete the search "${block?.query ?? ''}" and its results?`)) return;
+    if (!window.confirm(`Delete the search “${block?.query ?? ''}” and its results?`)) return;
     try {
       await api.deleteSearchResultSet(resultSetId);
     } catch (e) {
@@ -310,14 +314,13 @@ export function SearchTab({ activeScope, sessionId, onOpenPage, externalResultSe
       setActiveResultSetId((cur) => {
         if (cur !== resultSetId) return cur;
         if (next.length === 0) return null;
-        // Activate the neighbor to the left (or the new first tab)
         return next[Math.max(0, idx - 1)].resultSetId;
       });
       return next;
     });
   }, [searchHistory]);
 
-  // Hide or restore a single hit (persists server-side, reversible; numbering skips hidden rows)
+  // Hide or restore a single hit (persists server-side, reversible; numbering skips hidden rows).
   const handleSetItemHidden = useCallback(async (resultSetId: string, item: SearchPageHitItem, hidden: boolean) => {
     try {
       await api.setSearchResultItemHidden(resultSetId, item.document.id, item.page.id, hidden);
@@ -335,8 +338,7 @@ export function SearchTab({ activeScope, sessionId, onOpenPage, externalResultSe
         items: b.items.map((it) =>
           it.document.id === item.document.id && it.page.id === item.page.id
             ? { ...it, hidden }
-            : it
-        ),
+            : it),
       };
       return next;
     });
@@ -352,293 +354,301 @@ export function SearchTab({ activeScope, sessionId, onOpenPage, externalResultSe
     });
   }, []);
 
-  // Require session (like Chat)
-  if (!sessionId) {
-    return (
-      <div className="pane-content splash-content">
-        <div className="splash-hero">
-          <div className="splash-badge">Archive Search</div>
-          <h2 className="splash-title">Search</h2>
-          <p className="splash-tagline">Boolean search across Cold War archives.</p>
-          <p className="splash-subtitle">
-            Create or select a session in the sidebar to begin. Search and Chat share the same session — your searches and conversations persist together.
-          </p>
-        </div>
-        <div className="splash-section splash-examples">
-          <h3 className="splash-section-title">Example queries</h3>
-          <div className="splash-example-grid">
-            {['"Harry Dexter White"', 'Rosenberg OR Hiss', 'Soviet AND agent'].map((q, i) => (
-              <button
-                key={i}
-                type="button"
-                className="splash-example-card"
-                onClick={() => onExampleSearch?.(q)}
-                title="Start a new session and run this search"
-              >
-                <span className="splash-example-icon">&#x1F50E;</span>
-                <span className="splash-example-text">{q}</span>
-              </button>
-            ))}
-          </div>
-        </div>
-      </div>
-    );
-  }
+  const userBlocks = searchHistory.filter((b) => b.origin !== 'chat');
+  const chatBlocks = searchHistory.filter((b) => b.origin === 'chat');
+  const activeIsChat = chatBlocks.some((b) => b.resultSetId === activeResultSetId);
+
+  const renderChip = (block: SearchResultBlock, isChat: boolean) => (
+    <div
+      key={block.resultSetId}
+      className={
+        `search-chip${isChat ? ' search-chip-chat' : ''}`
+        + `${block.resultSetId === activeResultSetId ? ' is-active' : ''}`
+      }
+    >
+      <button
+        type="button"
+        role="tab"
+        aria-selected={block.resultSetId === activeResultSetId}
+        className="search-chip-label"
+        onClick={() => setActiveResultSetId(block.resultSetId)}
+        title={
+          isChat
+            ? `Chat ran this search${block.originQuery ? ` while answering: “${block.originQuery}”` : ''} — ${block.totalHits} hits`
+            : `${block.query} — ${block.totalHits} hits`
+        }
+      >
+        {isChat && <Icon name="spark" size={12} />}
+        {block.query}
+      </button>
+      <button
+        type="button"
+        className="search-chip-close"
+        onClick={() => handleCloseTab(block.resultSetId)}
+        aria-label={`Delete search: ${block.query}`}
+        title="Delete this search"
+      >
+        <Icon name="close" size={13} />
+      </button>
+    </div>
+  );
 
   return (
-    <div className="search-tab">
-      {/* Instructions (collapsible) */}
-      <div className="search-instructions">
-        <button
-          type="button"
-          className="search-instructions-toggle"
-          onClick={() => setShowInstructions((s) => !s)}
-          aria-expanded={showInstructions}
-        >
-          {showInstructions ? '▼' : '▶'} How to search
-        </button>
-        {showInstructions && (
-          <div className="search-instructions-content">
-            <p><strong>Boolean operators</strong> (exact mode only): <code>AND</code>, <code>OR</code>, <code>NOT</code>, parentheses.</p>
-            <ul>
-              <li><code>Harry AND White</code> — both terms must appear</li>
-              <li><code>Rosenberg OR Hiss</code> — either term</li>
-              <li><code>Soviet NOT Rosenberg</code> — exclude term</li>
-              <li><code>&quot;Harry Dexter White&quot;</code> — exact phrase (use quotes)</li>
-              <li><code>(Rosenberg OR Hiss) AND Soviet</code> — combine with parentheses</li>
-            </ul>
-            <p><strong>Fuzzy matching</strong> (toggle below): Off by default. Turn <strong>On</strong> to handle OCR errors and typos. Ignores boolean operators.</p>
-            <p><strong>Alias expansion</strong> (toggle below): Expands names to known aliases and codenames. Venona/Vassiliev only when enabled.</p>
-            <p className="search-instructions-note">Scope from the right panel applies to Search — narrow collections to speed up queries.</p>
-          </div>
-        )}
-      </div>
-
-      {/* Query bar */}
-      <div className="search-query-bar">
-        <input
-          type="text"
-          className="search-query-input"
-          placeholder='e.g. "Harry Dexter White" OR (Rosenberg AND Soviet)'
-          value={query}
-          onChange={(e) => setQuery(e.target.value)}
-          onKeyDown={(e) => e.key === 'Enter' && runSearch()}
-        />
-        <div className="search-toggles">
-          <label className="search-toggle-slider">
-            <span className="search-toggle-label">Fuzzy</span>
+    <div className="search">
+      <div className="search-head">
+        <div className="search-head-inner">
+          <div className="search-bar">
+            <label className="field">
+              <Icon name="search" size={16} />
+              <input
+                type="text"
+                placeholder='"Harry Dexter White" OR (Rosenberg AND Soviet)'
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                onKeyDown={(e) => e.key === 'Enter' && runSearch()}
+                aria-label="Search query"
+              />
+            </label>
             <button
               type="button"
-              role="switch"
-              aria-checked={fuzzyMode}
-              aria-label={`Fuzzy matching ${fuzzyMode ? 'on' : 'off'}`}
-              className={`search-slider ${fuzzyMode ? 'search-slider-on' : ''}`}
-              onClick={() => setFuzzyMode((v) => !v)}
-              title="Fuzzy: handles OCR/typos"
+              className="btn-primary btn-lg"
+              onClick={runSearch}
+              disabled={isSearching || !query.trim() || scopeEmpty}
             >
-              <span className="search-slider-knob" />
-            </button>
-          </label>
-          <label className="search-toggle-slider">
-            <span className="search-toggle-label">Aliases</span>
-            <button
-              type="button"
-              role="switch"
-              aria-checked={aliasExpand}
-              aria-label={`Alias expansion ${aliasExpand ? 'on' : 'off'}`}
-              className={`search-slider ${aliasExpand ? 'search-slider-on' : ''}`}
-              onClick={() => setAliasExpand((v) => !v)}
-              title="Expand aliases (codename lookup)"
-            >
-              <span className="search-slider-knob" />
-            </button>
-          </label>
-        </div>
-        <button
-          type="button"
-          className="btn-primary search-btn"
-          onClick={runSearch}
-          disabled={isSearching || !query.trim()}
-        >
-          {isSearching ? 'Searching…' : 'Search'}
-        </button>
-      </div>
-
-      {/* Scope indicator */}
-      <div className="search-scope-bar">
-        <span className="search-scope-label">Scope:</span>
-        <span className="search-scope-value">{scopeLabel()}</span>
-      </div>
-
-      {/* Progress indicator */}
-      {isSearching && (
-        <div className="search-progress">
-          <div className="search-progress-spinner" />
-          <span>Searching collections… Full archive may take 10–60 seconds.</span>
-        </div>
-      )}
-      {isExpandingFuzzy && !isSearching && (
-        <div className="search-progress">
-          <div className="search-progress-spinner" />
-          <span>Loading fuzzy matches… (exact results shown above)</span>
-        </div>
-      )}
-
-      {error && (
-        <div className="search-error">{error}</div>
-      )}
-
-      {/* Search tabs — researcher searches and Chat's searches, separated but equal:
-          clicking a Chat chip opens it exactly like your own, so you can pick up
-          where the investigation left off. */}
-      {searchHistory.length > 0 && (() => {
-        const userBlocks = searchHistory.filter((b) => b.origin !== 'chat');
-        const chatBlocks = searchHistory.filter((b) => b.origin === 'chat');
-        const activeIsChat = chatBlocks.some((b) => b.resultSetId === activeResultSetId);
-        const renderChip = (block: SearchResultBlock, isChat: boolean) => (
-          <div
-            key={block.resultSetId}
-            className={
-              `search-tab-chip${isChat ? ' search-tab-chip-chat' : ''}` +
-              `${block.resultSetId === activeResultSetId ? ' search-tab-chip-active' : ''}`
-            }
-          >
-            <button
-              type="button"
-              role="tab"
-              aria-selected={block.resultSetId === activeResultSetId}
-              className="search-tab-chip-label"
-              onClick={() => setActiveResultSetId(block.resultSetId)}
-              title={
-                isChat
-                  ? `Chat ran this search${block.originQuery ? ` while answering: “${block.originQuery}”` : ''} — ${block.totalHits} hits`
-                  : `${block.query} — ${block.totalHits} hits`
-              }
-            >
-              {isChat && <span className="search-tab-chip-spark" aria-hidden>⚡</span>}
-              {block.query}
-            </button>
-            <button
-              type="button"
-              className="search-tab-chip-close"
-              onClick={() => handleCloseTab(block.resultSetId)}
-              title="Delete this search"
-              aria-label={`Delete search: ${block.query}`}
-            >
-              ✕
+              {isSearching ? <span className="spinner" /> : <Icon name="search" size={16} />}
+              {isSearching ? 'Searching…' : 'Search'}
             </button>
           </div>
-        );
-        return (
-          <div className="search-tabs" role="tablist" aria-label="Searches in this session">
-            {userBlocks.map((b) => renderChip(b, false))}
-            {chatBlocks.length > 0 && (
-              <>
-                <button
-                  type="button"
-                  className={`search-tabs-chat-toggle${activeIsChat ? ' search-tabs-chat-toggle-active' : ''}`}
-                  onClick={() => setShowChatTabs((v) => !v)}
-                  aria-expanded={showChatTabs || activeIsChat}
-                  title="Searches the Chat assistant ran while answering your questions — open any of them to continue where it left off"
-                >
-                  {showChatTabs || activeIsChat ? '▾' : '▸'} ⚡ Chat&apos;s searches ({chatBlocks.length})
-                </button>
-                {(showChatTabs || activeIsChat) && chatBlocks.map((b) => renderChip(b, true))}
-              </>
-            )}
-          </div>
-        );
-      })()}
 
-      <div className="search-results-container">
-        {searchHistory.filter((block) => block.resultSetId === activeResultSetId).map((block) => (
-          <div key={block.resultSetId} className="search-result-block">
-            {block.notice && (
-              <div className="search-notice" style={{
-                margin: '0 0 8px', padding: '6px 10px', borderRadius: 6,
-                background: 'var(--surface-hover, #f3f4f6)', color: 'var(--text-secondary, #555)',
-                fontSize: 13, lineHeight: 1.4,
-              }}>
-                {block.notice}
-              </div>
-            )}
-            <div className="search-coverage-panel">
-              <div className="search-coverage-stats">
-                {block.resultSet.is_exhaustive === false && (
-                  <span className="search-approximate-label">Approximate matches</span>
-                )}
-                <span className="search-block-query">&quot;{block.query}&quot;</span>
-                <span>Total page hits: {block.totalHits}</span>
-                {(() => {
-                  const cov = block.resultSet.coverage_json as { collections_searched?: number; collections_total?: number } | undefined;
-                  return cov?.collections_searched != null ? (
-                    <span>Collections: {cov.collections_searched}/{cov.collections_total ?? '?'}</span>
-                  ) : null;
-                })()}
-              </div>
-              {(() => {
-                const terms = block.resultSet.expanded_terms_json as Record<string, string[]> | undefined;
-                if (!terms || Object.keys(terms).length === 0) return null;
-                const text = Object.entries(terms)
-                  .map(([term, aliases]) => `${term} → ${(aliases ?? []).slice(0, 5).join(', ')}${(aliases ?? []).length > 5 ? '…' : ''}`)
-                  .join('; ');
-                return (
-                  <div className="search-expanded-terms">
-                    Expanded: {text}
-                  </div>
-                );
-              })()}
-              {(() => {
-                const cov = block.resultSet.coverage_json as { collections?: { id: number; title: string; hits: number }[] } | undefined;
-                return cov?.collections && cov.collections.length > 0 ? (
-                  <div className="search-coverage-breakdown">
-                    {cov.collections.map((c) => (
-                      <span key={c.id} className="search-coverage-item">
-                        {c.title}: {c.hits} pages
-                      </span>
-                    ))}
-                  </div>
-                ) : null;
-              })()}
-              <button type="button" className="btn-secondary" onClick={() => handleExport(block.resultSetId)}>
-                Export CSV
-              </button>
-            </div>
-            {(() => {
-              const hiddenCount = block.items.filter((it) => it.hidden).length;
-              if (hiddenCount === 0) return null;
-              return (
-                <button
-                  type="button"
-                  className="search-show-hidden-toggle"
-                  onClick={() => toggleShowHidden(block.resultSetId)}
-                >
-                  {block.showHidden ? 'Hide removed results' : `Show removed results (${hiddenCount})`}
-                </button>
-              );
-            })()}
-            <SearchResultsList
-              items={block.items}
-              totalHits={block.totalHits}
-              onOpenPage={onOpenPage}
-              resultSetId={block.resultSetId}
-              isLoading={false}
-              showHidden={!!block.showHidden}
-              onSetItemHidden={(item, hidden) => handleSetItemHidden(block.resultSetId, item, hidden)}
+          <div className="search-opts">
+            <ScopeControl
+              scope={activeScope}
+              collections={collections}
+              onChange={onScopeChange}
+              placement="bottom"
             />
-            {block.totalHits > block.items.length && block.nextCursor != null && (
+            <Toggle label="Fuzzy" hint="Tolerate OCR errors and typos" on={fuzzyMode} onToggle={() => setFuzzyMode((v) => !v)} />
+            <Toggle label="Aliases" hint="Expand names to known cover names" on={aliasExpand} onToggle={() => setAliasExpand((v) => !v)} />
+            <div className="spacer" />
+            <button
+              ref={syntaxRef}
+              type="button"
+              className="btn-link"
+              onClick={() => setSyntaxOpen((v) => !v)}
+              aria-expanded={syntaxOpen}
+            >
+              <Icon name="help" size={14} />
+              Syntax
+            </button>
+            <Popover
+              anchorRef={syntaxRef}
+              open={syntaxOpen}
+              onClose={() => setSyntaxOpen(false)}
+              placement="bottom"
+              align="end"
+              label="Search syntax"
+            >
+              <div className="popover-head"><span className="popover-title">Search syntax</span></div>
+              <div className="popover-body" style={{ padding: 'var(--s-4)', maxWidth: '26rem' }}>
+                <div className="prose" style={{ fontSize: 'var(--text-base)' }}>
+                  <ul>
+                    <li><code>Harry AND White</code> — both terms must appear</li>
+                    <li><code>Rosenberg OR Hiss</code> — either term</li>
+                    <li><code>Soviet NOT Rosenberg</code> — exclude a term</li>
+                    <li><code>&quot;Harry Dexter White&quot;</code> — exact phrase</li>
+                    <li><code>(Rosenberg OR Hiss) AND Soviet</code> — group with parentheses</li>
+                  </ul>
+                  <p>
+                    Boolean operators work in exact mode only. <strong>Fuzzy</strong> handles OCR
+                    errors and typos but ignores operators. <strong>Aliases</strong> expands names
+                    to known cover names and codenames.
+                  </p>
+                </div>
+              </div>
+            </Popover>
+          </div>
+        </div>
+      </div>
+
+      {(userBlocks.length > 0 || chatBlocks.length > 0) && (
+        <div className="search-tabs" role="tablist" aria-label="Searches in this session">
+          {userBlocks.map((b) => renderChip(b, false))}
+          {chatBlocks.length > 0 && (
+            <>
               <button
                 type="button"
-                className="btn-secondary search-load-more"
-                onClick={() => loadMore(block.resultSetId)}
-                disabled={block.isFetchingMore}
+                className="search-chip-more"
+                onClick={() => setShowChatTabs((v) => !v)}
+                aria-expanded={showChatTabs || activeIsChat}
+                title="Searches Chat ran while answering your questions — open any of them to continue where it left off"
               >
-                {block.isFetchingMore ? 'Loading…' : `Load more (${block.totalHits - block.items.length} remaining)`}
+                <Icon name="spark" size={12} />
+                From Chat
+                <span className="count">{chatBlocks.length}</span>
+                <Icon name={showChatTabs || activeIsChat ? 'chevron-up' : 'chevron-down'} size={12} />
               </button>
-            )}
-          </div>
-        ))}
+              {(showChatTabs || activeIsChat) && chatBlocks.map((b) => renderChip(b, true))}
+            </>
+          )}
+        </div>
+      )}
+
+      <div className="search-body">
+        <div className="search-body-inner">
+          {error && <div className="notice notice-danger"><Icon name="info" size={16} />{error}</div>}
+
+          {isSearching && (
+            <div className="loading">
+              <span className="spinner" />
+              Searching collections — the entire archive can take 10–60 seconds.
+            </div>
+          )}
+          {isExpandingFuzzy && !isSearching && (
+            <div className="loading">
+              <span className="spinner" />
+              Loading fuzzy matches — exact results are shown below.
+            </div>
+          )}
+
+          {!isSearching && searchHistory.length === 0 && (
+            <div className="empty-state">
+              <Icon name="search" size={22} />
+              <p>
+                Search returns every page that matches your terms, numbered so you can work
+                through them and pick up where you left off.
+              </p>
+              <div className="suggestions" style={{ justifyContent: 'center' }}>
+                {['"Harry Dexter White"', 'Rosenberg OR Hiss', 'Silvermaster AND film'].map((q) => (
+                  <button
+                    key={q}
+                    type="button"
+                    className="suggestion"
+                    onClick={() => { setQuery(q); if (sessionId) void runSearchWith(q); else onStartSession(q); }}
+                  >
+                    {q}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {searchHistory.filter((block) => block.resultSetId === activeResultSetId).map((block) => {
+            const coverage = block.resultSet.coverage_json as {
+              collections_searched?: number;
+              collections_total?: number;
+              collections?: { id: number; title: string; hits: number }[];
+            } | undefined;
+            const terms = block.resultSet.expanded_terms_json as Record<string, string[]> | undefined;
+            const hiddenCount = block.items.filter((it) => it.hidden).length;
+
+            return (
+              <div key={block.resultSetId}>
+                {block.notice && (
+                  <div className="notice" style={{ marginBottom: 'var(--s-3)' }}>
+                    <Icon name="info" size={16} />{block.notice}
+                  </div>
+                )}
+
+                <div className="search-meta">
+                  <span className="search-meta-figure">{block.totalHits.toLocaleString()}</span>
+                  <span>page {block.totalHits === 1 ? 'hit' : 'hits'} for “{block.query}”</span>
+                  {block.resultSet.is_exhaustive === false && (
+                    <span className="chip chip-amber">approximate</span>
+                  )}
+                  {coverage?.collections_searched != null && (
+                    <span className="count">
+                      {coverage.collections_searched}/{coverage.collections_total ?? '?'} collections
+                    </span>
+                  )}
+                  <div className="spacer" />
+                  {hiddenCount > 0 && (
+                    <button
+                      type="button"
+                      className="btn-link"
+                      onClick={() => toggleShowHidden(block.resultSetId)}
+                    >
+                      <Icon name={block.showHidden ? 'eye-off' : 'restore'} size={14} />
+                      {block.showHidden ? 'Hide removed' : `Show ${hiddenCount} removed`}
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    className="btn-secondary btn-sm"
+                    onClick={() => handleExport(block.resultSetId)}
+                  >
+                    <Icon name="download" size={14} />
+                    CSV
+                  </button>
+
+                  {(terms && Object.keys(terms).length > 0) || coverage?.collections?.length ? (
+                    <div className="search-meta-detail">
+                      {terms && Object.entries(terms).map(([term, aliases]) => (
+                        <span key={term}>
+                          {term} → {(aliases ?? []).slice(0, 5).join(', ')}
+                          {(aliases ?? []).length > 5 ? '…' : ''}
+                        </span>
+                      ))}
+                      {coverage?.collections?.map((c) => (
+                        <span key={c.id}>{c.title}: {plural(c.hits, 'page')}</span>
+                      ))}
+                    </div>
+                  ) : null}
+                </div>
+
+                <SearchResultsList
+                  items={block.items}
+                  totalHits={block.totalHits}
+                  onOpenPage={onOpenPage}
+                  resultSetId={block.resultSetId}
+                  isLoading={false}
+                  showHidden={!!block.showHidden}
+                  onSetItemHidden={(item, hidden) => handleSetItemHidden(block.resultSetId, item, hidden)}
+                />
+
+                {block.totalHits > block.items.length && block.nextCursor != null && (
+                  <button
+                    type="button"
+                    className="btn-secondary"
+                    style={{ marginTop: 'var(--s-3)' }}
+                    onClick={() => loadMore(block.resultSetId)}
+                    disabled={block.isFetchingMore}
+                  >
+                    {block.isFetchingMore ? <span className="spinner" /> : <Icon name="chevron-down" size={14} />}
+                    {block.isFetchingMore
+                      ? 'Loading…'
+                      : `Load more (${(block.totalHits - block.items.length).toLocaleString()} remaining)`}
+                  </button>
+                )}
+              </div>
+            );
+          })}
+        </div>
       </div>
     </div>
+  );
+}
+
+function Toggle({
+  label, hint, on, onToggle,
+}: {
+  label: string;
+  hint: string;
+  on: boolean;
+  onToggle: () => void;
+}) {
+  return (
+    <span className="switch" title={hint}>
+      <button
+        type="button"
+        role="switch"
+        aria-checked={on}
+        aria-label={`${label}: ${on ? 'on' : 'off'}`}
+        className="switch-track"
+        onClick={onToggle}
+      >
+        <span className="switch-knob" />
+      </button>
+      <span style={{ color: on ? 'var(--ink)' : undefined }}>{label}</span>
+    </span>
   );
 }
