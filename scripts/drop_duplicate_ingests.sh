@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Drop the 26 duplicate re-ingests found by the 2026-09-15 corpus sweep:
-# DB rows (migration 0078) -> S3 objects -> collection zip rebuilds.
+# DB rows (migration 0079) -> S3 objects -> collection zip rebuilds.
 #
 # 23 solo documents (the zero-padded/unpadded double ingest of 2026-02-01/02),
 # rosenberg 'Julius 48' (a copy of 47), harry_gold '65-57449-13_Part2' (a copy of
 # Part1) and one re-downloaded fbi_hiskey fragment. See
-# docs/DUPLICATE_DOCUMENTS_2026-09-15.md and the header of migration 0078.
+# docs/DUPLICATE_DOCUMENTS_2026-09-15.md and the header of migration 0079.
 #
 # Unlike the ethel drop, data/raw/solo is EMPTY locally and ocr_cache/solo holds
 # nothing, so a solo document restored from S3 would have to be OCR'd again. The S3
@@ -53,15 +53,15 @@ DROPPED_OBJECTS=(
 )
 
 echo "=== 0/4 dry run (read-only) — every guard must pass"
-python scripts/dryrun_0078.py
+python scripts/dryrun_0079.py
 
 echo
 echo "=== before"
 for c in $COLLECTIONS; do python scripts/check_collection.py "$c" || true; done
 
 echo
-echo "=== 1/4 DB rows (migration 0078)"
-python scripts/apply_sql.py migrations/0078_drop_duplicate_ingests.sql
+echo "=== 1/4 DB rows (migration 0079)"
+python scripts/apply_sql.py migrations/0079_drop_duplicate_ingests.sql
 
 echo
 echo "=== 2/4 collection zips"

@@ -1,4 +1,11 @@
--- 0078_drop_duplicate_ingests.sql
+-- 0079_drop_duplicate_ingests.sql
+--
+-- APPLIED TO PROD 2026-09-15. Verified after: solo 124->101, rosenberg 188->187,
+-- harry_gold 105->104, fbi_hiskey 63->62; pages 151,468->147,496; 0 leftover pages
+-- and 0 orphaned search_result_page_hits rows for the dropped documents.
+-- Written and run as 0078; renumbered to 0079 because 0078_pages_tsv_simple.sql
+-- (the page-attribution fix retrieval/search_executor.py refers to by number)
+-- had already claimed 0078. Both ran against prod on the same day.
 -- Remove 26 documents that are redundant re-ingests of a document already in the
 -- same collection. Measured 2026-09-15 (scripts/sweep_duplicate_documents.py,
 -- check_aligned_duplicates.py, rank_duplicate_keep_drop.py). Follows 0077.

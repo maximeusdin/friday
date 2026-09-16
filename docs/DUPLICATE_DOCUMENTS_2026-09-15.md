@@ -13,7 +13,7 @@ prod; nothing has been written.
 * **Bentley cannot be fixed by deleting anything.** The omnibus and the per-volume
   PDFs overlap ~79% *in both directions*. Dropping the omnibus loses 415 pages that
   exist nowhere else; dropping the volumes loses 416. It needs search-time dedup.
-* **26 documents are safe to drop** (3,972 pages, 1,320 chunks) — migration `0078`.
+* **26 documents are safe to drop** (3,972 pages, 1,320 chunks) — migration `0079`.
 * **Two source-data bugs found that a delete does not fix** — see "Not duplication".
 
 ## 1. Why the original key under-reports
@@ -63,7 +63,7 @@ Note `solo` at 0.5% by the exact key. The minhash sweep puts it at **3,669 redun
 pages** — the exact key missed almost all of it, because the two solo ingests were
 OCR'd separately.
 
-## 3. Confirmed duplicates — drop these (migration 0078)
+## 3. Confirmed duplicates — drop these (migration 0079)
 
 ### solo: the zero-padded / unpadded double ingest — 23 documents, 3,714 pages
 
@@ -108,6 +108,16 @@ at offset +12.
 ## 4. Real overlap, but NOT safe to delete
 
 ### elizabeth_bentley — the omnibus is not redundant
+
+> **Note added 2026-09-15, after the drop.** A `"pleurisy"` search still showed 20 hits
+> at pages 483/485/489/491/495. That is *not* corpus duplication: the database holds
+> exactly 10 pages containing the word (doc 1061 pp. 484/490/496/502/508, doc 1080 pp.
+> 75/81/87/93/99). Each real match was being emitted twice, at its chunk's first and
+> last page rather than the page carrying the term. That is the page-attribution bug
+> fixed in `retrieval/search_executor.py` + `migrations/0078_pages_tsv_simple.sql`, and
+> it needs an **API deploy** — the column is in prod, the code is not. Corpus-level
+> Bentley dedup, below, is a separate and still-open question.
+
 
 `scripts/check_omnibus_coverage.py --hub 1061 --collection elizabeth_bentley`:
 
@@ -195,13 +205,24 @@ Three things worth flagging:
 **0 rows** for these chunks, as do `result_set_chunks`, `result_set_match_traces`,
 `focus_spans` and `document_witnesses`. No chunk spans a page outside the target set.
 
-## 7. Running it
+## 7. Running it — DONE 2026-09-15
+
+Applied to prod on 2026-09-15. Verified after: solo 124→101, rosenberg 188→187,
+harry_gold 105→104, fbi_hiskey 63→62; `pages` 151,468→147,496; 0 leftover pages and
+0 orphaned `search_result_page_hits` rows. The S3 source PDFs were **not** deleted —
+that step is still available via `--s3` and is the rollback path for the 23 solo files.
+
+Numbering note: written and run as `0078`, renumbered to `0079` because
+`0078_pages_tsv_simple.sql` — the column behind the search page-attribution fix, which
+`retrieval/search_executor.py` names by number — had already taken 0078. Both ran
+against prod the same day.
+
 
 ```bash
 bash scripts/drop_duplicate_ingests.sh
 ```
 
-Order: read-only dry run → migration `0078` → collection zip rebuild. The S3 objects
+Order: read-only dry run → migration `0079` → collection zip rebuild. The S3 objects
 are **not** deleted unless you pass `--s3`, because `data/raw/solo` is empty locally
 and `ocr_cache/solo` holds nothing — S3 is the only rollback path for the 23 solo
 documents, and restoring one would otherwise mean paying for OCR again.
@@ -209,7 +230,7 @@ documents, and restoring one would otherwise mean paying for OCR again.
 Verify first, on its own — it writes nothing:
 
 ```bash
-DATABASE_URL="$(aws secretsmanager get-secret-value --region us-west-1 --secret-id friday/DATABASE_URL --query SecretString --output text)" python scripts/dryrun_0078.py
+DATABASE_URL="$(aws secretsmanager get-secret-value --region us-west-1 --secret-id friday/DATABASE_URL --query SecretString --output text)" python scripts/dryrun_0079.py
 ```
 
 Expected after: solo 124 → 101, rosenberg 188 → 187, harry_gold 105 → 104,
@@ -227,6 +248,6 @@ fbi_hiskey 63 → 62.
 | `compare_duplicate_candidates.py` | per-pair containment both ways + a keep/drop verdict |
 | `rank_duplicate_keep_drop.py` | which copy to keep, on legible characters recovered |
 | `preflight_drop_documents.py` | dependants of a delete, by FK rule; flags NO-FK orphans |
-| `dryrun_0078.py` | read-only rehearsal of every guard in migration 0078 |
+| `dryrun_0079.py` | read-only rehearsal of every guard in migration 0079 |
 
 All read-only.

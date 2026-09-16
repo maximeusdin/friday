@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read-only dry run of migrations/0078_drop_duplicate_ingests.sql.
+"""Read-only dry run of migrations/0079_drop_duplicate_ingests.sql.
 
 Runs every guard the migration asserts, as a plain SELECT, and reports exactly what
 the migration would delete. Executes no INSERT/UPDATE/DELETE and opens no write
@@ -8,7 +8,7 @@ transaction, so it is safe against prod.
 Resolves the migration relative to this file, so it can be run from any directory.
 
 Usage:
-  DATABASE_URL=... python scripts/dryrun_0078.py
+  DATABASE_URL=... python scripts/dryrun_0079.py
 """
 import os
 import re
@@ -17,7 +17,7 @@ from pathlib import Path
 
 import psycopg2
 
-MIGRATION = Path(__file__).resolve().parent.parent / "migrations" / "0078_drop_duplicate_ingests.sql"
+MIGRATION = Path(__file__).resolve().parent.parent / "migrations" / "0079_drop_duplicate_ingests.sql"
 
 PAIRS_RE = re.compile(r"^\s*\(\s*(\d+),\s*(\d+)\)[,;]?\s*--", re.M)
 
