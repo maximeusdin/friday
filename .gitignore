@@ -23,3 +23,5 @@ Thumbs.db
 # Data (adjust later)
 data_raw/
 data_processed/
+# Local AWS credentials for deploys (deploy_all.sh points at this). Never commit.
+.aws/
