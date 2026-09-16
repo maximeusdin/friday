@@ -115,7 +115,7 @@ function HowToBody() {
       <h3>Reading the answers</h3>
       <p>
         Findings with a source are grounded in the page they cite. Anything under an{' '}
-        <em>unverified</em> heading did not pass citation checks, so treat it as a lead and click
+        <em>unverified</em> heading did not pass citation checks, so treat it as a lead and follow it
         through to the sources. When Friday says it found no evidence, that is a statement about
         the search, not proof the fact is absent from the archive. Try again with more specific
         names or details, or use <em>Think deeper</em> to push the investigation further.

@@ -1321,7 +1321,11 @@ input[type='radio'] {
 
 /* Inline citations — subtle in flow, obviously clickable on hover. */
 .cite {
-  display: inline;
+  display: inline-block;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  vertical-align: baseline;
   padding: 0.05em 0.35em;
   margin: 0 0.1em;
   border: 1px solid var(--accent-line);
@@ -1440,11 +1444,16 @@ input[type='radio'] {
 }
 
 /* Real archive filenames are long; truncate in the row, full name on hover. */
+.finding-source {
+  max-width: 100%;
+  min-width: 0;
+}
+
 .finding-source-name {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  max-width: 28rem;
+  max-width: min(28rem, 100%);
 }
 
 /* --- Answer footer --------------------------------------------------------- */
@@ -1462,6 +1471,17 @@ input[type='radio'] {
 
 .answer-foot-sep {
   color: var(--line-2);
+}
+
+.answer-foot-item {
+  display: inline-flex;
+  align-items: baseline;
+  gap: var(--s-3);
+  max-width: 100%;
+}
+
+.answer-foot-item > .answer-foot-sep {
+  flex: 0 0 auto;
 }
 
 .answer-foot .btn-link {
@@ -1734,6 +1754,7 @@ input[type='radio'] {
   width: min(28rem, calc(100vw - 2rem));
 }
 
+/* Desktop mode cards */
 .scope-modes {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -1779,46 +1800,157 @@ input[type='radio'] {
   color: var(--ink-3);
 }
 
+/* Phone: one switch instead of two cards */
+.scope-switch-row {
+  display: flex;
+  align-items: center;
+  gap: var(--s-3);
+  padding: var(--s-3) var(--s-4);
+  border-bottom: 1px solid var(--line);
+  cursor: pointer;
+}
+
+.scope-switch-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.scope-switch-title {
+  font-size: var(--text-md);
+  font-weight: var(--weight-semi);
+  color: var(--ink);
+}
+
+.scope-switch-desc {
+  font-size: var(--text-xs);
+  color: var(--ink-3);
+}
+
+.switch-track-lg {
+  width: 3.125rem;
+  height: 1.875rem;
+}
+
+.switch-track-lg .switch-knob {
+  width: 1.625rem;
+  height: 1.625rem;
+}
+
+.switch-track-lg[aria-checked='true'] .switch-knob {
+  transform: translateX(1.25rem);
+}
+
 .scope-search {
   padding: var(--s-3) var(--s-3) var(--s-2);
 }
 
-.scope-summary {
+.scope-recent-row {
   display: flex;
   align-items: center;
   gap: var(--s-2);
+  flex-wrap: wrap;
   padding: 0 var(--s-3) var(--s-2);
-  font-size: var(--text-xs);
-  color: var(--ink-2);
 }
 
-.scope-tree {
+/* The list */
+.scope-list {
   padding: 0 var(--s-2) var(--s-3);
+  transition: opacity var(--dur-2) var(--ease);
+}
+
+/* Entire-archive is on: the list is there to tap into, but should not read
+   as an active selection of nothing. */
+.scope-list.is-quiet {
+  opacity: 0.55;
+}
+
+.scope-section + .scope-section {
+  margin-top: var(--s-2);
+}
+
+.scope-section-title {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  display: flex;
+  align-items: baseline;
+  gap: var(--s-2);
+  padding: var(--s-2) var(--s-2) var(--s-1);
+  background: var(--surface);
+  font-size: var(--text-2xs);
+  font-weight: var(--weight-semi);
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--ink-3);
 }
 
 .scope-row {
   display: flex;
   align-items: center;
-  gap: var(--s-2);
+  gap: var(--s-3);
   width: 100%;
-  padding: var(--s-1) var(--s-2);
+  padding: var(--s-2) var(--s-2);
   border-radius: var(--r-sm);
   cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
 }
 
 .scope-row:hover {
   background: var(--surface-2);
 }
 
+.scope-row-small {
+  padding-top: var(--s-1);
+  padding-bottom: var(--s-1);
+  font-size: var(--text-xs);
+}
+
+.scope-row-strong .scope-row-label {
+  font-weight: var(--weight-semi);
+}
+
+/* Drawn check: shows "some files" as a dash, and sizes for a finger. */
+.scope-check {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.25rem;
+  height: 1.25rem;
+  border: 1.5px solid var(--line-2);
+  border-radius: var(--r-sm);
+  background: var(--surface);
+  color: var(--ink-inverse);
+  transition: background var(--dur-1) var(--ease), border-color var(--dur-1) var(--ease);
+}
+
+.scope-check[data-state='on'],
+.scope-check[data-state='partial'] {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+.scope-row-small .scope-check {
+  width: 1rem;
+  height: 1rem;
+}
+
+/* Names get two lines before they ellipsize: the row is the tap target, so a
+   taller row costs nothing, and "CINRAD (Communist Infiltration of the
+   Radiation Laboratory)" is worth reading in full. */
 .scope-row-label {
   flex: 1 1 auto;
   min-width: 0;
   font-size: var(--text-sm);
   color: var(--ink);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
   overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  cursor: pointer;
+  line-height: 1.3;
 }
 
 .scope-row-count {
@@ -1828,54 +1960,20 @@ input[type='radio'] {
   font-variant-numeric: tabular-nums;
 }
 
-.scope-expand {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 1.125rem;
-  height: 1.125rem;
+.scope-drill {
   flex: 0 0 auto;
-  border-radius: var(--r-sm);
   color: var(--ink-3);
-  transition: transform var(--dur-1) var(--ease), background var(--dur-1) var(--ease);
+  transition: transform var(--dur-1) var(--ease);
 }
 
-.scope-expand:hover {
-  background: var(--surface-3);
-  color: var(--ink);
-}
-
-.scope-expand[aria-expanded='true'] {
+.scope-drill.is-open {
   transform: rotate(90deg);
 }
 
 .scope-docs {
-  padding-left: calc(var(--s-6) + var(--s-2));
-  border-left: 1px solid var(--line);
   margin-left: calc(var(--s-4) + 2px);
-}
-
-.scope-doc-row {
-  display: flex;
-  align-items: center;
-  gap: var(--s-2);
-  padding: 2px var(--s-2);
-  border-radius: var(--r-sm);
-  font-size: var(--text-xs);
-}
-
-.scope-doc-row:hover {
-  background: var(--surface-2);
-}
-
-.scope-doc-label {
-  flex: 1 1 auto;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  color: var(--ink-2);
-  cursor: pointer;
+  padding-left: var(--s-3);
+  border-left: 1px solid var(--line);
 }
 
 .scope-doc-open {
@@ -1884,28 +1982,37 @@ input[type='radio'] {
   opacity: 0;
 }
 
-.scope-doc-row:hover .scope-doc-open {
+.scope-row:hover .scope-doc-open {
   opacity: 1;
 }
 
-.scope-recent {
-  display: flex;
+/* The summary may take two lines; the controls beside it never drop below it. */
+.scope-foot {
+  flex-wrap: nowrap;
   align-items: center;
-  gap: var(--s-2);
-  flex-wrap: wrap;
 }
 
-/* Tri-state checkbox: "some documents in this collection" */
-.scope-check {
-  position: relative;
-  display: inline-flex;
+.scope-summary-text {
+  flex: 1 1 auto;
+  font-size: var(--text-xs);
+  color: var(--ink-2);
+  min-width: 0;
+}
+
+.scope-foot .btn-primary,
+.scope-foot .btn-link {
   flex: 0 0 auto;
 }
 
-.scope-check input:indeterminate + .scope-check-mark,
-.scope-check-mark[data-indeterminate='true'] {
-  background: var(--accent);
-  border-color: var(--accent);
+/* The drill-in title is a collection name, often long: give it two lines
+   before it ellipsizes rather than cutting it at one. */
+.scope-drill-title {
+  min-width: 0;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  line-height: 1.3;
 }
 
 /* =============================================================================
@@ -2297,7 +2404,7 @@ mark {
   white-space: nowrap;
 }
 
-.hit-snippet {
+.hit.is-hidden .hit-snippet {
   text-decoration: line-through;
   text-decoration-color: var(--line-2);
 }
@@ -2406,6 +2513,36 @@ mark {
 .doc-zoom:hover {
   background: var(--surface);
   border-radius: var(--r-sm);
+}
+
+/* Collection on one line, file name on the next. Each gets the full width, so
+   a long FBI serial number is readable instead of two half-names side by side. */
+.doc-subbar {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: var(--s-1) var(--s-3);
+  background: var(--surface);
+  border-bottom: 1px solid var(--line);
+  font-size: var(--text-2xs);
+  line-height: 1.35;
+  color: var(--ink-3);
+  overflow: hidden;
+}
+
+.doc-subbar-coll {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--ink-2);
+  font-weight: var(--weight-medium);
+}
+
+.doc-subbar-file {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .doc-find {
@@ -2630,6 +2767,23 @@ mark {
   margin: 0 0 0 var(--s-1);
   padding: 1px var(--s-2);
   vertical-align: middle;
+  max-width: 100%;
+}
+
+/* On a phone a long command or URL wraps rather than scrolling off the edge:
+   it has to be readable, and selectable, without a sideways swipe. */
+@media (max-width: 679px) {
+  .url-box code {
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    overflow-x: visible;
+  }
+
+  .url-box-inline {
+    display: flex;
+    margin: var(--s-2) 0 0;
+    padding: var(--s-2) var(--s-3);
+  }
 }
 
 .steps {
@@ -2669,6 +2823,12 @@ mark {
   font-size: var(--text-base);
   font-weight: var(--weight-medium);
   color: var(--ink);
+}
+
+/* "11 files" is one unit: the name may wrap, the count never does. */
+.coll-row .count {
+  flex: 0 0 auto;
+  white-space: nowrap;
 }
 
 .coll-detail {
@@ -3005,10 +3165,35 @@ html[data-touch='true'] .cite {
   }
 }
 
+/* Under 680px the strip wraps into pills instead of scrolling, so the last
+   section is never a half-word peeking in from the right edge. */
+@media (max-width: 679px) {
+  .modal-nav {
+    flex-wrap: wrap;
+    overflow-x: visible;
+    padding: var(--s-2) var(--s-3);
+  }
+
+  .modal-nav-item {
+    padding: 6px 12px;
+    border-radius: var(--r-full);
+    font-size: var(--text-sm);
+    border: 1px solid transparent;
+  }
+
+  .modal-nav-item[aria-current='true'] {
+    border-color: var(--line);
+  }
+}
+
 /* --- Phone -------------------------------------------------------------------- */
 
 @media (max-width: 679px) {
   .phone-only { display: inline-flex; }
+
+  /* A wrapped footer row with dots ends or starts a line on a stray dot;
+     under 680px the gap alone separates the items. */
+  .answer-foot-sep { display: none; }
 
   /* Header: wordmark, new session, guide, account. The bottom bar has Sessions. */
   .hdr {
@@ -3154,12 +3339,36 @@ html[data-touch='true'] .cite {
     background: var(--line-2);
   }
 
-  .scope-picker {
-    width: 100%;
+  /* The picker is a screen on a phone: fixed height so filtering does not
+     make the sheet jump, and the summary stays pinned at the bottom. */
+  .popover.scope-picker[data-sheet='true'] {
+    width: 100% !important;
+    height: calc(92dvh - env(safe-area-inset-top, 0px));
+    max-height: none;
   }
 
-  .scope-modes {
-    grid-template-columns: 1fr;
+  .scope-row {
+    padding-top: var(--s-2);
+    padding-bottom: var(--s-2);
+  }
+
+  .scope-row-label {
+    font-size: var(--text-md);
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+
+  .scope-check {
+    width: 1.5rem;
+    height: 1.5rem;
+  }
+
+  .scope-doc-open {
+    opacity: 1;
+  }
+
+  .scope-foot .btn-link {
+    font-size: var(--text-sm);
   }
 
   .toast-wrap {
@@ -3186,16 +3395,17 @@ html[data-touch='true'] .cite {
     display: none;
   }
 
+  /* Nothing scrolls sideways on a phone: controls wrap onto a second row, and
+     past searches wrap into rows, so no word is ever cut at the screen edge. */
   .search-opts {
-    gap: var(--s-3);
-    overflow-x: auto;
-    flex-wrap: nowrap;
-    padding-bottom: 2px;
-    scrollbar-width: none;
+    gap: var(--s-2) var(--s-3);
+    flex-wrap: wrap;
   }
 
-  .search-opts::-webkit-scrollbar {
-    display: none;
+  .search-opts .scope-chip {
+    flex: 1 1 100%;
+    max-width: none;
+    justify-content: flex-start;
   }
 
   .search-opts .spacer {
@@ -3203,20 +3413,13 @@ html[data-touch='true'] .cite {
   }
 
   .search-tabs {
-    /* A scrolling flex item may shrink below its content; pin it. */
     flex: 0 0 auto;
-    flex-wrap: nowrap;
-    overflow-x: auto;
+    flex-wrap: wrap;
     padding: var(--s-2) var(--s-3) var(--s-2);
-    scrollbar-width: none;
-  }
-
-  .search-tabs::-webkit-scrollbar {
-    display: none;
   }
 
   .search-chip {
-    flex: 0 0 auto;
+    max-width: 100%;
   }
 
   .search-body {
@@ -3244,7 +3447,7 @@ html[data-touch='true'] .cite {
   }
 
   .doc-bar .btn-ghost .btn-label,
-  .doc-title-sub,
+  .doc-title,
   .doc-group-zoom {
     display: none;
   }
@@ -3343,10 +3546,6 @@ html[data-touch='true'] .cite {
      "/ 108" total moves into the typed-page tooltip; the number itself stays. */
   .doc-bar {
     gap: 2px;
-  }
-
-  .doc-bar .doc-title {
-    min-width: 2rem;
   }
 
   .doc-page-total {

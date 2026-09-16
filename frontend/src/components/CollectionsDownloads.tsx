@@ -153,7 +153,7 @@ export function CollectionsDownloadsBody({ initialCollectionId }: { initialColle
   return (
     <>
       <p className="help-lede">
-        Open a collection to see its files. Tick the ones you want and click{' '}
+        Open a collection to see its files. Tick the ones you want and choose{' '}
         <strong>Download selected</strong>; they arrive as a single zip. To take everything at
         once, use the download link on a collection or on the whole archive.
       </p>

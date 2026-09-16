@@ -174,6 +174,32 @@ Still not verified, because it needs touch injection that `simctl` cannot do
 Each is a known WebKit or Android behaviour with a known fix, not a design
 unknown. Do them on a phone before calling this done.
 
+## 4a. The phone scope sheet, and the cut-off sweep
+
+Added after the four stages, once the sheet had been used on a real phone.
+
+The scope picker on a phone is no longer a tree. It reads like a settings
+screen: one large **Entire archive** switch at the top; below it the
+collections in named sections (FBI files, Hearings and testimony, Decrypts
+and notebooks, Security service files, Other collections), each a whole-row
+tap with a drawn tri-state check; and a chevron that drills into one
+collection's files on its own screen, with a back arrow in the header. Files
+picked one at a time are listed by name in a **Selected files** section at
+the top, each with its own remove control, so nothing chosen is ever
+invisible. The same sections and rows are used on desktop; only the switch
+and the drill-in are phone-specific.
+
+A sweep for text spilling or cutting off, at 375px and 320px, over chat,
+search, the viewer, the scope sheet, the drawer, the account menu and every
+help section, found and fixed: search snippets struck through on every hit
+(a selector that had lost its `.is-hidden` prefix, on desktop too); the help
+tab strip cutting a tab in half (now wrapped pills under 680px); long
+commands and URLs in the connector section running off the edge (they wrap
+now); the viewer sub-bar showing two half-names (collection and file name
+now stack); file counts in the downloads list breaking across lines; the
+drill-in title clipped at one line; and a dangling separator dot at the end
+of a wrapped answer footer (the dots are gone under 680px).
+
 ## 5. Things that were decided along the way
 
 1. **Is the phone for reading or for research?** If reading, Stage 1 and 2 are

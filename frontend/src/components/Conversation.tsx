@@ -562,22 +562,24 @@ function ChatTurn({
         {(meta || message.v6_stats) && !isStreaming && (
           <div className="answer-foot">
             {meta?.intent && <span>{INTENT_LABEL[meta.intent] ?? meta.intent}</span>}
+            {/* Each dot travels with the item after it, so a wrapped row never
+                ends on a dangling separator. */}
             {meta && meta.elapsed_ms > 0 && (
-              <>
+              <span className="answer-foot-item">
                 <span className="answer-foot-sep">·</span>
                 <span>{duration(meta.elapsed_ms)}</span>
-              </>
+              </span>
             )}
             {(meta?.cited_chunk_ids?.length ?? 0) > 0 && (
-              <>
+              <span className="answer-foot-item">
                 <span className="answer-foot-sep">·</span>
                 <span>{plural(meta!.cited_chunk_ids.length, 'citation')}</span>
-              </>
+              </span>
             )}
             {runScope && (
               <>
-                <span className="answer-foot-sep">·</span>
-                <span title={meta?.expansion_info?.reason || undefined}>
+                <span className="answer-foot-item" title={meta?.expansion_info?.reason || undefined}>
+                  <span className="answer-foot-sep">·</span>
                   searched {describeScope(
                     {
                       mode: runScope.mode as 'full_archive' | 'custom',

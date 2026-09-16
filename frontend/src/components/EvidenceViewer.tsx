@@ -290,6 +290,9 @@ export function EvidenceViewer({ evidence, onClose, backLabel = 'Back to Chat' }
   // True while we are scrolling the view ourselves, so the scroll handler does
   // not fight the navigation that caused it.
   const programmatic = useRef(false);
+  // Which evidence target we have already centred on. The quote highlight is
+  // repainted continuously as pages mount; centring is a once-per-target event.
+  const autoScrolledFor = useRef<string | null>(null);
   const findInputRef = useRef<HTMLInputElement>(null);
 
   // react-pdf touches browser-only APIs; defer rendering until mounted so the
@@ -705,8 +708,22 @@ export function EvidenceViewer({ evidence, onClose, backLabel = 'Back to Chat' }
     const HL = (window as unknown as { Highlight: new (...r: Range[]) => unknown }).Highlight;
     css.highlights.set('pdf-evidence', new HL(r));
     setQuoteTier(match.tier);
-    // Bring the evidence into view (center) once painted.
-    r.startContainer.parentElement?.scrollIntoView({ block: 'center', inline: 'nearest' });
+    // Bring the evidence into view (center) the first time we paint *this*
+    // target -- and only then. This callback re-runs as the reader scrolls,
+    // because currentPage is a dependency (the quote must stay painted as pages
+    // mount and unmount around it). Centring on every re-run is what pinned the
+    // viewer to the cited page: scrolling by hand moved currentPage, which
+    // repainted, which scrolled straight back. Explicit navigation still moves
+    // the viewport, via goToPage.
+    const target = `${evidence?.document_id ?? ''}|${quotePage ?? ''}|${quote.slice(0, 80)}`;
+    if (autoScrolledFor.current !== target) {
+      autoScrolledFor.current = target;
+      // Centring scrolls the scroller, so claim it the way scrollToPage does or
+      // the scroll handler reads our own movement as the reader's.
+      programmatic.current = true;
+      r.startContainer.parentElement?.scrollIntoView({ block: 'center', inline: 'nearest' });
+      window.setTimeout(() => { programmatic.current = false; }, 400);
+    }
   }, [evidence?.quote, evidence?.quote_page, evidence?.pdf_page, currentPage, locatedPage]);
 
 
@@ -1048,6 +1065,17 @@ export function EvidenceViewer({ evidence, onClose, backLabel = 'Back to Chat' }
           )}
         />
       </div>
+
+      {/* Phones: the toolbar has no room for a filename, so it gets a line of
+          its own, collection first because that is the part a reader recognises. */}
+      {layout.isPhone && document && (
+        <div className="doc-subbar" title={document.source_name}>
+          {(document.collection_title || document.collection_slug) && (
+            <span className="doc-subbar-coll">{document.collection_title || document.collection_slug}</span>
+          )}
+          <span className="doc-subbar-file">{document.source_name}</span>
+        </div>
+      )}
 
       {/* Docked find bar — sits in the toolbar area, never overlaps the page */}
       {findOpen && (
