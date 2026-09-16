@@ -148,18 +148,31 @@ points), 768x1024, 320x568 and 1440x900:
   hit into the viewer, the downloads and concordance sheets.
 - No horizontal overflow on any surface at 320px.
 
-Not verified, because it needs a real device or an iOS simulator (this Mac
-has only the Xcode command-line tools, and the simulator needs full Xcode):
+Verified afterwards in the iOS Simulator (iPhone 17, iOS 27, Mobile Safari),
+driven through `xcrun simctl` with screenshots:
 
-- iOS Safari specifics: `100dvh` with the toolbars, the software keyboard
-  resizing the visual viewport, safe-area insets on a notched phone, and
-  whether `touch-action: pan-x pan-y` fully suppresses page pinch inside the
-  viewer on iOS 16 and 17.
-- Real pinch feel: gesture inertia and the moment of the sharp re-render.
+- The welcome screen, header, bottom tab bar and composer at the real
+  viewport, with the header clearing the status bar and Dynamic Island.
+- `100dvh` with the software keyboard up: the composer sits directly above the
+  keyboard and the tab bar stays visible; the page does not zoom into inputs.
+- The document viewer via a deep link: fit-to-width scanned pages, continuous
+  scroll across a page boundary, the compact toolbar, no tab bar while reading.
+- Two defects found and fixed there (`5355fa6`): the composer auto-focused on
+  load and raised the keyboard, because the layout hook still held the
+  server's desktop snapshot during hydration; and the header had no top
+  safe-area padding.
+
+Still not verified, because it needs touch injection that `simctl` cannot do
+(the native simulator tool in Claude Code, or a hand on a real phone):
+
+- A real two-finger pinch and double-tap in the viewer, including whether
+  `touch-action: pan-x pan-y` fully suppresses Safari's page zoom inside it.
+- The edge-swipe back gesture closing the viewer and the drawer.
+- Tapping the composer: that the thread stays anchored as the keyboard rises.
 - Android Chrome's URL bar collapsing during scroll.
 
-Do those on a phone before calling this done. Everything in the list is a
-known WebKit or Android behaviour with a known fix, not a design unknown.
+Each is a known WebKit or Android behaviour with a known fix, not a design
+unknown. Do them on a phone before calling this done.
 
 ## 5. Things that were decided along the way
 
