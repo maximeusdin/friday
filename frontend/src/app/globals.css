@@ -930,8 +930,10 @@ input[type='radio'] {
   display: flex;
   align-items: center;
   gap: var(--s-2);
-  height: var(--h-header);
-  padding: 0 var(--s-3) 0 var(--s-2);
+  /* viewport-fit=cover runs the page under the status bar and Dynamic Island;
+     the inset keeps the header's controls below them. Zero on desktop. */
+  height: calc(var(--h-header) + env(safe-area-inset-top, 0px));
+  padding: env(safe-area-inset-top, 0px) var(--s-3) 0 var(--s-2);
   background: var(--surface);
   border-bottom: 1px solid var(--line);
   z-index: var(--z-sticky);
@@ -3044,6 +3046,10 @@ html[data-touch='true'] .cite {
   /* The drawer is the full width bar a thumb expects. */
   .sidebar {
     width: min(22rem, 88vw);
+  }
+
+  .modal {
+    max-height: calc(92dvh - env(safe-area-inset-top, 0px));
   }
 
   /* Thread + composer */

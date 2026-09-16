@@ -18,7 +18,7 @@ import { ScopeControl } from './ScopeControl';
 import { Welcome } from './Welcome';
 import { Icon } from './ui/Icon';
 import { toast } from './ui/Toast';
-import { useLayout } from '@/lib/useLayout';
+import { useLayout, currentLayout } from '@/lib/useLayout';
 
 /** Shown when the backend reports a step without saying what it is doing.
  *  One honest line beats a rotating set of invented ones: the elapsed timer
@@ -158,9 +158,13 @@ export function Conversation({
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, isSending]);
 
-  // Starting a new session puts the cursor where the work begins.
+  // Starting a new session puts the cursor where the work begins. Not on touch:
+  // focusing a field raises the keyboard over half the screen, and iOS Safari
+  // then scrolls the page to it, so the welcome screen opened half-hidden.
+  // Read the layout live: during hydration the hook still holds the server's
+  // desktop snapshot, and this effect fires before the real value lands.
   useEffect(() => {
-    if (!session) inputRef.current?.focus();
+    if (!session && !currentLayout().touch) inputRef.current?.focus();
   }, [session, newSessionNonce]);
 
   // Auto-grow the composer up to the max height the stylesheet allows.

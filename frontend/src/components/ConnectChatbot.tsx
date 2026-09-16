@@ -6,7 +6,12 @@ import { Icon } from './ui/Icon';
 /** Public MCP endpoint for the Friday connector (mounted by the API at /mcp). */
 export const MCP_URL = process.env.NEXT_PUBLIC_MCP_URL || 'https://api.fridayarchive.org/mcp';
 
-const CLAUDE_CONNECTORS_URL = 'https://claude.ai/settings/connectors';
+/**
+ * Claude's connector page (Customize → Connectors). The `modal` query opens the
+ * "Add custom connector" dialog directly. Connectors moved here from
+ * Settings → Connectors in 2026; the old path now just redirects.
+ */
+const CLAUDE_CONNECTORS_URL = 'https://claude.ai/customize/connectors?modal=add-custom-connector';
 
 async function copyMcpUrl(): Promise<boolean> {
   try {
@@ -20,9 +25,9 @@ async function copyMcpUrl(): Promise<boolean> {
 /**
  * One-click "Add to Claude" CTA.
  *
- * Claude has no deep link that installs a connector directly, so one click does
+ * Claude has no deep link that installs a connector outright, so one click does
  * the next best thing: copy the connector URL to the clipboard and open Claude's
- * connector settings in a new tab. `onShowInstructions` (optional) opens the
+ * "Add custom connector" dialog in a new tab. `onShowInstructions` (optional) opens the
  * instructions so they're waiting when the user returns to this tab.
  */
 export function AddToClaudeButton({ onShowInstructions }: { onShowInstructions?: () => void }) {
@@ -43,8 +48,8 @@ export function AddToClaudeButton({ onShowInstructions }: { onShowInstructions?:
       </button>
       {copied && (
         <p className="text-sm text-muted" style={{ marginTop: 'var(--s-2)' }}>
-          URL copied. In the Claude tab, choose <strong>Add custom connector</strong>, paste it,
-          then click <strong>Add</strong>.
+          URL copied. In the Claude tab, name the connector <strong>Friday</strong>, paste the
+          URL into <strong>MCP server URL</strong>, then click <strong>Continue</strong>.
         </p>
       )}
     </div>
@@ -95,18 +100,20 @@ export function ChatbotConnectBody() {
         <li>
           Open{' '}
           <a href={CLAUDE_CONNECTORS_URL} target="_blank" rel="noopener noreferrer">
-            claude.ai &rarr; Settings &rarr; Connectors
+            claude.ai &rarr; Customize &rarr; Connectors
           </a>{' '}
-          (the Add to Claude button above copies the URL and opens that page for you).
+          and click <strong>Add</strong> (the Add to Claude button above copies the URL and
+          opens that dialog for you).
         </li>
-        <li>Click <strong>Add custom connector</strong>, paste the URL, and click <strong>Add</strong>. No login or API key is required.</li>
+        <li>Name the connector <strong>Friday</strong>, paste the URL into <strong>MCP server
+          URL</strong>, and click <strong>Continue</strong>. No login or API key is required.</li>
         <li>In any chat, open the <strong>+</strong> (tools) menu near the message box and make
           sure the Friday connector is enabled. For deep dives, use <strong>Research</strong> mode
           with Friday enabled as a source.</li>
-        <li><strong>Claude Desktop and mobile:</strong> same steps, under Settings &rarr;
-          Connectors &rarr; Add custom connector. On <strong>Team or Enterprise</strong>, an admin
+        <li><strong>Claude Desktop and mobile:</strong> same steps, under Customize &rarr;
+          Connectors &rarr; Add. On <strong>Team or Enterprise</strong>, an admin
           adds the connector first (Admin settings &rarr; Connectors), then members enable it
-          under Settings &rarr; Connectors.</li>
+          under Customize &rarr; Connectors.</li>
       </ol>
 
       <p><strong>ChatGPT (Plus, Pro, Business, or Enterprise):</strong></p>
