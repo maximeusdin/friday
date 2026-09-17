@@ -349,7 +349,7 @@ def prime_workspace(
     from retrieval.agent.tools import hybrid_search_tool, lexical_exact_tool
     from retrieval.agent.v11_tools import fetch_chunks
     from retrieval.agent.v9_workspace import (
-        merge_catalog_hits, merge_fetched_chunks, build_chunk_doc_map,
+        merge_catalog_hits, merge_fetched_chunks, build_chunk_doc_map, bullet_document_locators,
         merge_evidence_summary_update, build_alias_context_for_summarizer,
     )
     from retrieval.agent.v9_summarize import summarize_delta_chunks
@@ -671,7 +671,9 @@ def prime_workspace(
                                   f"Primed {len(all_bullets)} evidence bullets", {
                                       "bullets": [{"text": b.text, "tags": b.tags,
                                                    "chunk_ids": b.supporting_chunk_ids,
-                                                   "doc_ids": b.doc_ids} for b in all_bullets],
+                                                   "doc_ids": b.doc_ids,
+                                                   **bullet_document_locators(b, cdm)}
+                                                  for b in all_bullets],
                                       "total_bullet_count": len(all_bullets),
                                   })
         except Exception as e:

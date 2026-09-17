@@ -113,6 +113,7 @@ from retrieval.agent.v9_workspace import (
     apply_pin_suggestions,
     merge_evidence_summary_update,
     build_chunk_doc_map,
+    bullet_document_locators,
     expand_query_with_aliases,
     link_chunks_to_entities,
     build_alias_context_for_summarizer,
@@ -1377,6 +1378,7 @@ def _run_think_deeper(
                                     "doc_ids": b_doc_ids,
                                     "pages": [_parse_page(chunk_to_page.get(cid)) for cid in cids],
                                     "source_names": [doc_names.get(did, "") for did in b_doc_ids],
+                                    **bullet_document_locators(b, chunk_doc_map),
                                 }
                                 if getattr(b, "support_quote", "") and getattr(b, "quote_chunk_id", None):
                                     from retrieval.agent.v11_runner import _lookup_quote_page

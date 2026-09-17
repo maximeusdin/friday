@@ -70,6 +70,7 @@ from retrieval.agent.v9_workspace import (
     apply_pin_suggestions,
     merge_evidence_summary_update,
     build_chunk_doc_map,
+    bullet_document_locators,
     link_chunks_to_entities,
     build_alias_context_for_summarizer,
     resolve_surfaced_alias,
@@ -1688,6 +1689,7 @@ def _execute_tool(
                                         "doc_ids": b.doc_ids,
                                         "pages": [chunk_to_page.get(cid) for cid in b.supporting_chunk_ids],
                                         "source_names": [doc_names.get(did, "") for did in (b.doc_ids or [])],
+                                        **bullet_document_locators(b, cdm),
                                     }
                                     for b in ev_update.bullets
                                 ],

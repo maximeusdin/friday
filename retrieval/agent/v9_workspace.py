@@ -983,6 +983,25 @@ def build_chunk_doc_map(workspace: ResearchWorkspace) -> Dict[int, int]:
     return {c.chunk_id: c.doc_id for c in workspace.fulltext_chunks if c.doc_id is not None}
 
 
+def bullet_document_locators(
+    bullet: EvidenceBullet,
+    chunk_doc_map: Dict[int, int],
+) -> Dict[str, Any]:
+    """Document of each supporting chunk (aligned with supporting_chunk_ids) and of the
+    support quote, for the evidence_update payload.
+
+    bullet.doc_ids is a sorted set, so doc_ids[0] need not be the document of the quote
+    or of supporting_chunk_ids[0]; the viewer opens a bullet from these instead, so the
+    document and page it shows always come from the same chunk. Unknown documents are None.
+    """
+    out: Dict[str, Any] = {
+        "chunk_doc_ids": [chunk_doc_map.get(cid) for cid in bullet.supporting_chunk_ids],
+    }
+    if bullet.support_quote and bullet.quote_chunk_id is not None:
+        out["quote_doc_id"] = chunk_doc_map.get(bullet.quote_chunk_id)
+    return out
+
+
 def merge_evidence_summary_update(
     workspace: ResearchWorkspace,
     update: EvidenceSummaryUpdate,

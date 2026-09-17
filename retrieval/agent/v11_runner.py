@@ -53,6 +53,7 @@ from retrieval.agent.v9_workspace import (
     apply_pin_suggestions,
     merge_evidence_summary_update,
     build_chunk_doc_map,
+    bullet_document_locators,
     link_chunks_to_entities,
     build_alias_context_for_summarizer,
 )
@@ -553,7 +554,7 @@ def _execute_tool(
                             f"Discovered {len(ev_update.bullets)} new evidence bullets",
                             {
                                 "bullets": [
-                                    _bullet_payload(conn, b, chunk_to_page, doc_names)
+                                    _bullet_payload(conn, b, chunk_to_page, doc_names, cdm)
                                     for b in ev_update.bullets
                                 ],
                                 "open_questions": ev_update.open_questions,
@@ -633,7 +634,7 @@ def _execute_tool(
                             f"Discovered {len(ev_update.bullets)} new evidence bullets",
                             {
                                 "bullets": [
-                                    _bullet_payload(conn, b, chunk_to_page, doc_names)
+                                    _bullet_payload(conn, b, chunk_to_page, doc_names, cdm)
                                     for b in ev_update.bullets
                                 ],
                                 "open_questions": ev_update.open_questions,
@@ -836,9 +837,13 @@ def _lookup_quote_page(conn, chunk_id: int, quote: str) -> Optional[int]:
 
 
 def _bullet_payload(conn, b, chunk_to_page: Dict[int, Optional[int]],
-                    doc_names: Dict[int, str]) -> Dict[str, Any]:
+                    doc_names: Dict[int, str],
+                    chunk_doc_map: Dict[int, int]) -> Dict[str, Any]:
     """Serialize an EvidenceBullet for the evidence_update SSE payload, including the
-    verbatim support quote + its exact PDF page (for on-page highlighting)."""
+    verbatim support quote + its exact PDF page (for on-page highlighting).
+
+    chunk_doc_ids (aligned with chunk_ids/pages) and quote_doc_id say which document
+    each page belongs to; doc_ids is a sorted set and cannot be indexed alongside them."""
     payload: Dict[str, Any] = {
         "text": b.text,
         "tags": b.tags,
@@ -846,6 +851,7 @@ def _bullet_payload(conn, b, chunk_to_page: Dict[int, Optional[int]],
         "doc_ids": b.doc_ids,
         "pages": [chunk_to_page.get(cid) for cid in b.supporting_chunk_ids],
         "source_names": [doc_names.get(did, "") for did in (b.doc_ids or [])],
+        **bullet_document_locators(b, chunk_doc_map),
     }
     if getattr(b, "support_quote", "") and getattr(b, "quote_chunk_id", None):
         payload["quote"] = b.support_quote

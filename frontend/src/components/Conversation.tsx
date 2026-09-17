@@ -619,6 +619,54 @@ function ChatTurn({
 // Findings (evidence bullets)
 // =============================================================================
 
+/**
+ * Where a finding's source link opens. The document and page always come from the
+ * same chunk: the quote's chunk when its document is known, else the first supporting
+ * chunk with a known document. doc_ids is a sorted set, so doc_ids[0] need not be the
+ * document of the quote or of pages[0]; it is used only for older payloads that carry
+ * no per-chunk documents.
+ */
+function bulletEvidence(bullet: V9EvidenceBullet): EvidenceRef | null {
+  const chunkIds = bullet.chunk_ids ?? [];
+  if (chunkIds.length === 0) return null;
+  const chunkDocs = bullet.chunk_doc_ids;
+
+  if (bullet.quote_chunk_id != null) {
+    const qi = chunkIds.indexOf(bullet.quote_chunk_id);
+    const quoteDoc = bullet.quote_doc_id ?? (qi >= 0 ? chunkDocs?.[qi] : null);
+    if (quoteDoc != null) {
+      return {
+        document_id: quoteDoc,
+        // Open the quote's exact page when known (multi-page chunks).
+        pdf_page: bullet.quote_page ?? (qi >= 0 ? bullet.pages?.[qi] : null) ?? 1,
+        chunk_id: bullet.quote_chunk_id,
+        quote: bullet.quote,
+        quote_page: bullet.quote_page ?? undefined,
+      };
+    }
+  }
+
+  if (chunkDocs) {
+    for (let i = 0; i < chunkIds.length; i++) {
+      const doc = chunkDocs[i];
+      if (doc != null) {
+        return { document_id: doc, pdf_page: bullet.pages?.[i] ?? 1, chunk_id: chunkIds[i] };
+      }
+    }
+    return null;
+  }
+
+  // Older payload: correct for single-document bullets, a best guess otherwise.
+  if (!bullet.doc_ids?.length) return null;
+  return {
+    document_id: bullet.doc_ids[0],
+    pdf_page: bullet.quote_page ?? bullet.pages?.[0] ?? 1,
+    chunk_id: bullet.quote_chunk_id ?? chunkIds[0],
+    quote: bullet.quote,
+    quote_page: bullet.quote_page ?? undefined,
+  };
+}
+
 function Findings({
   bullets, onEvidenceClick, streaming,
 }: {
@@ -644,28 +692,26 @@ function Findings({
       </button>
       {open && (
         <div className="findings-list">
-          {bullets.map((bullet, i) => (
-            <div className="finding" key={i}>
-              <span className="finding-marker" />
-              <div className="finding-body">
-                <span>{sanitizeBulletText(bullet.text)}</span>
-                {bullet.doc_ids?.length > 0 && bullet.chunk_ids?.length > 0 && onEvidenceClick && (
-                  <SourceLink
-                    documentId={bullet.doc_ids[0]}
-                    name={bullet.source_names?.[0]}
-                    onClick={() => onEvidenceClick({
-                      document_id: bullet.doc_ids[0],
-                      // Open the quote's exact page when known (multi-page chunks).
-                      pdf_page: bullet.quote_page ?? bullet.pages?.[0] ?? 1,
-                      chunk_id: bullet.quote_chunk_id ?? bullet.chunk_ids[0],
-                      quote: bullet.quote,
-                      quote_page: bullet.quote_page ?? undefined,
-                    })}
-                  />
-                )}
+          {bullets.map((bullet, i) => {
+            const target = onEvidenceClick ? bulletEvidence(bullet) : null;
+            // source_names is aligned with doc_ids, not with chunk_ids.
+            const nameIndex = target ? (bullet.doc_ids ?? []).indexOf(target.document_id) : -1;
+            return (
+              <div className="finding" key={i}>
+                <span className="finding-marker" />
+                <div className="finding-body">
+                  <span>{sanitizeBulletText(bullet.text)}</span>
+                  {target && onEvidenceClick && (
+                    <SourceLink
+                      documentId={target.document_id}
+                      name={nameIndex >= 0 ? bullet.source_names?.[nameIndex] : undefined}
+                      onClick={() => onEvidenceClick(target)}
+                    />
+                  )}
+                </div>
               </div>
-            </div>
-          ))}
+            );
+          })}
         </div>
       )}
     </div>

@@ -101,6 +101,7 @@ from retrieval.agent.v9_workspace import (
     merge_evidence_summary_update,
     apply_pin_suggestions,
     build_chunk_doc_map,
+    bullet_document_locators,
     enforce_pin_cap,
 )
 from retrieval.agent.v9_summarize import summarize_delta_chunks
@@ -2069,6 +2070,7 @@ def _tool_fetch_chunks(
                                         "tags": b.tags,
                                         "chunk_ids": b.supporting_chunk_ids,
                                         "doc_ids": b.doc_ids,
+                                        **bullet_document_locators(b, cdm),
                                     }
                                     for b in ev_update.bullets
                                 ],

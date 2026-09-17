@@ -597,13 +597,19 @@ export interface V9EvidenceBullet {
   text: string;
   tags: string[];
   chunk_ids: number[];
+  /** Sorted set of the supporting chunks' documents: doc_ids[0] need not match chunk_ids[0]. */
   doc_ids: number[];
-  pages?: number[];
+  /** PDF page of each supporting chunk (aligned with chunk_ids). */
+  pages?: (number | null)[];
+  /** Document of each supporting chunk (aligned with chunk_ids). Absent on older payloads. */
+  chunk_doc_ids?: (number | null)[];
   /** Document source names (one per doc_id) for display. */
   source_names?: string[];
   /** Verbatim supporting passage (validated server-side) for on-page highlighting. */
   quote?: string;
   quote_chunk_id?: number;
+  /** Document of quote_chunk_id. Absent on older payloads. */
+  quote_doc_id?: number | null;
   /** PDF page the quote sits on (exact, from the chunk→page span table). */
   quote_page?: number | null;
 }
